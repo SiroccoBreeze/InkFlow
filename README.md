@@ -14,8 +14,11 @@ SQLite（WAL）只作为派生索引与全文搜索加速器。
 
 ```bash
 npm install
-npm run dev          # http://localhost:3000
+cp .env.example .env                 # 并填写 INKFLOW_INIT_KEY（见下方「首次初始化」）
+npm run dev                          # http://localhost:3000
 ```
+
+> 首次启动必须先配置 `INKFLOW_INIT_KEY`，否则登录页无法创建账号。详见下一节。
 
 ## ✅ 质量校验
 
@@ -28,28 +31,111 @@ npm run release      # 生成 release/ 生产部署包（含敏感数据自检�
 
 ## 🔐 首次初始化（SEC-006）
 
-系统**没有**任何默认密码或固定恢复码。首次创建主理人账号必须提供一次性初始化密钥：
+系统**没有**任何默认密码、默认账号或固定恢复码。第一次使用时必须由你自己完成初始化，
+设置专属密码。**不配置初始化密钥，登录页会一直停在「登录」而无法创建账号。**
 
-1. 在服务器环境（或 `.env`，切勿提交到 Git）配置：
+### 完整步骤
 
-   ```bash
-   openssl rand -hex 32          # 生成随机密钥
-   export INKFLOW_INIT_KEY="<粘贴上面生成的 64 位十六进制字符串>"
-   ```
+**第 1 步：生成并配置一次性初始化密钥**
 
-2. 启动服务后打开 http://localhost:3000 ，在初始化向导中填写该密钥与主理人密码。
-3. 初始化成功后：
-   - 服务端写入一次性标记 `system_settings.owner_initialized=1`；
-   - **初始化入口永久关闭**，任何重复请求返回 `403 ALREADY_INITIALIZED`；
-   - 系统生成一次性应急恢复密钥 `INK-XXXX-XXXX-XXXX-XXXX`，请离线保存。
-4. 完成后建议**从环境变量中删除 `INKFLOW_INIT_KEY`** 并重启服务。
+密钥至少 24 个字符，推荐直接生成 64 位十六进制串：
 
-行为矩阵：
+```bash
+openssl rand -hex 32          # 输出示例：3f9a...（64 个字符）
+```
+
+写入 `.env`（该文件已被 `.gitignore` 忽略，切勿提交）或导出为环境变量：
+
+```bash
+# 方式 A：写入 .env
+cp .env.example .env
+# 编辑 .env，把这一行填空：
+#   INKFLOW_INIT_KEY=<粘贴上面生成的随机串>
+
+# 方式 B：当前终端临时导出
+export INKFLOW_INIT_KEY="<粘贴上面生成的随机串>"
+```
+
+> ⚠️ 新版 `.env.example` 里 `INKFLOW_INIT_KEY=` 默认是**空值**。直接复制而不填写，
+> 初始化入口会保持关闭。
+
+**第 2 步：启动（或重启）服务**
+
+```bash
+npm run dev            # 开发模式
+# 或
+npm run build && npm start   # 生产模式
+
+# 发布包部署时：在 release/ 目录下执行
+npm start
+```
+
+> `.env` 只在进程启动时读取一次。改完 `.env` **必须重启**才生效。
+
+**第 3 步：在页面上完成初始化**
+
+打开 http://localhost:3000 —— 若 `canInitialize` 为真，页面会**自动进入「初始化主理人账号」向导**
+（不需要手动切换）。在向导中填写：
+
+| 字段 | 说明 |
+| --- | --- |
+| 初始化密钥 | 第 1 步生成的那串（只用于这次初始化） |
+| 主理人账号名称 | 默认 `owner`，可自定义 |
+| 联系邮箱 | 选填 |
+| 设置密码 | **由你自己指定**，至少 6 位 |
+| 确认密码 | 与上面一致 |
+| 图形验证码 | 页面显示的 4 位字符 |
+
+**第 4 步：保存一次性应急恢复密钥**
+
+初始化成功后页面会显示 `INK-XXXX-XXXX-XXXX-XXXX` 格式的恢复密钥，**仅展示这一次**。
+它是忘记密码时唯一的找回凭据，请离线抄录或保存到密码管理器。
+
+**第 5 步（推荐）：关闭初始化入口**
+
+初始化成功后，服务端已写入一次性标记 `system_settings.owner_initialized=1`，
+初始化入口**永久关闭**，任何重复请求都返回 `403 ALREADY_INITIALIZED`。
+
+此时可以把 `INKFLOW_INIT_KEY` 从 `.env` / 环境变量中删除并重启服务，进一步缩小暴露面：
+
+```bash
+# 从 .env 中删除该行，或在启动时不传该变量
+```
+
+### 常见问题
+
+**登录页只有「账号 / 密码」，没有初始化入口？**
+
+说明服务端没有可用的初始化密钥。先用接口确认：
+
+```bash
+curl http://localhost:3000/api/v1/auth/status
+# {"data":{"isInitialized":false,"canInitialize":false}}   ← 密钥未配置或过短
+# {"data":{"isInitialized":false,"canInitialize":true}}    ← 可以初始化
+```
+
+`canInitialize:false` 且 `isInitialized:false` 时，按第 1、2 步配置密钥并重启即可。
+
+**提示「服务端尚未配置初始化密钥（INKFLOW_INIT_KEY）」？**
+
+同上：`.env` 中的值为空，或密钥长度不足 24 个字符。
+
+**已经初始化过，但忘了密码？**
+
+用第 4 步保存的恢复密钥在「忘记密码」中重置；每次重置都会签发一个新的恢复密钥。
+
+**已经有旧数据库（例如早期版本创建的账号），还需要初始化吗？**
+
+不需要。只要 `users` 表中存在 owner，`isInitialized` 即为 `true`，直接用原密码登录。
+但如果旧库只有 `-wal` / `-shm` 而没有主库文件，启动时会新建空库，此时仍需要重新初始化。
+
+### 行为矩阵
 
 | 场景 | 结果 |
 | --- | --- |
 | 未配置 `INKFLOW_INIT_KEY` | `/auth/init` 返回 `403 INIT_DISABLED`，`/auth/status` 的 `canInitialize=false` |
-| 未携带密钥 | `401 INVALID_INIT_KEY` |
+| 密钥长度不足 24 字符 | 视为未配置（同上） |
+| 初始化请求未携带密钥 | `401 INVALID_INIT_KEY` |
 | 密钥错误 | `403 INVALID_INIT_KEY` |
 | 密钥正确（首次） | `201` 创建主理人 + 会话 + 恢复码 |
 | 已初始化后再次请求 | `403 ALREADY_INITIALIZED`（不论密钥是否正确） |
