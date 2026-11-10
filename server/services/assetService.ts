@@ -4,9 +4,40 @@ import fsSync from 'node:fs';
 import crypto from 'node:crypto';
 import { getDatabase, generateId } from '../db/sqlite';
 import { fileStorage } from './fileStorageService';
+import { extractAssetReferences } from './documentService';
 
-const STORAGE_ROOT = fileStorage.getStorageRoot();
-const ASSETS_DIR = path.join(STORAGE_ROOT, 'assets');
+// Resolved lazily so INKFLOW_DATA_DIR is always honoured (tests / multi-instance deployments)
+function getStorageRoot(): string {
+  return fileStorage.getStorageRoot();
+}
+
+function getAssetsDir(): string {
+  return path.join(getStorageRoot(), 'assets');
+}
+
+/** Resolves a DB `storage_path` and guarantees it stays inside the storage root. */
+function resolveAssetPath(relativeStoragePath: string): string | null {
+  return fileStorage.resolveWithinStorage(relativeStoragePath);
+}
+
+/**
+ * Resolves symlinks and re-checks containment, so a symlink planted inside
+ * storage/assets/ can never be used to read files outside the storage root.
+ */
+async function resolveAssetRealPath(relativeStoragePath: string): Promise<string | null> {
+  const resolved = resolveAssetPath(relativeStoragePath);
+  if (!resolved) return null;
+  try {
+    const rootReal = await fs.realpath(getStorageRoot());
+    const fileReal = await fs.realpath(resolved);
+    if (fileReal !== rootReal && !fileReal.startsWith(rootReal + path.sep)) {
+      return null;
+    }
+    return fileReal;
+  } catch {
+    return null;
+  }
+}
 
 export interface AssetRecord {
   id: string;
@@ -21,10 +52,12 @@ export interface AssetRecord {
 }
 
 export class AssetService {
-  constructor() {
-    if (!fsSync.existsSync(ASSETS_DIR)) {
-      fsSync.mkdirSync(ASSETS_DIR, { recursive: true });
+  private ensureAssetsDir(): string {
+    const assetsDir = getAssetsDir();
+    if (!fsSync.existsSync(assetsDir)) {
+      fsSync.mkdirSync(assetsDir, { recursive: true });
     }
+    return assetsDir;
   }
 
   // Upload and persist asset to physical storage/assets/ & SQLite
@@ -35,17 +68,20 @@ export class AssetService {
     ownerId: string;
   }): Promise<AssetRecord> {
     const db = getDatabase();
+    const assetsDir = this.ensureAssetsDir();
     const assetId = generateId('ast');
     const ext = path.extname(params.originalName) || this.getExtensionFromMime(params.mimeType);
-    const diskFileName = `${assetId}${ext}`;
-    const targetFilePath = path.join(ASSETS_DIR, diskFileName);
+    // Only keep a conservative extension; never let the original name influence the path beyond that.
+    const safeExt = /^\.[A-Za-z0-9]{1,10}$/.test(ext) ? ext.toLowerCase() : '';
+    const diskFileName = `${assetId}${safeExt}`;
+    const targetFilePath = path.join(assetsDir, diskFileName);
 
     // Calculate sha256 checksum
     const checksum = crypto.createHash('sha256').update(params.buffer).digest('hex');
 
     // Physical disk write
-    await fs.writeFile(targetFilePath, params.buffer);
-    const relativeStoragePath = path.relative(STORAGE_ROOT, targetFilePath);
+    await fs.writeFile(targetFilePath, params.buffer, { flag: 'wx' });
+    const relativeStoragePath = path.relative(getStorageRoot(), targetFilePath);
 
     const now = new Date().toISOString();
     const size = params.buffer.length;
@@ -57,7 +93,7 @@ export class AssetService {
     `).run(
       assetId,
       params.ownerId,
-      params.originalName,
+      path.basename(params.originalName),
       relativeStoragePath,
       params.mimeType || 'application/octet-stream',
       size,
@@ -84,8 +120,12 @@ export class AssetService {
     const record = db.prepare('SELECT * FROM assets WHERE id = ?').get(id) as any;
     if (!record) return null;
 
-    const fullPath = path.join(STORAGE_ROOT, record.storage_path);
+    const fullPath = await resolveAssetRealPath(record.storage_path);
+    if (!fullPath) return null;
+
     try {
+      const stat = await fs.lstat(fullPath);
+      if (!stat.isFile()) return null;
       const buffer = await fs.readFile(fullPath);
       return { record, buffer };
     } catch {
@@ -96,37 +136,45 @@ export class AssetService {
   // List all uploaded assets, reconciling physical files in storage/assets/
   public listAssets(ownerId?: string): AssetRecord[] {
     const db = getDatabase();
+    const assetsDir = getAssetsDir();
 
     // Auto-reconcile physical files in storage/assets/ with SQLite assets table
     try {
-      if (fsSync.existsSync(ASSETS_DIR)) {
-        const diskFiles = fsSync.readdirSync(ASSETS_DIR);
+      if (fsSync.existsSync(assetsDir)) {
+        const diskFiles = fsSync.readdirSync(assetsDir);
         const existingRows = db.prepare('SELECT id, storage_path FROM assets').all() as any[];
         const existingFilenames = new Set(existingRows.map(r => path.basename(r.storage_path)));
 
-        for (const file of diskFiles) {
-          if (!existingFilenames.has(file)) {
-            const filePath = path.join(ASSETS_DIR, file);
-            const stat = fsSync.statSync(filePath);
-            const ext = path.extname(file).toLowerCase();
-            const id = path.parse(file).name;
-            const mimeType = this.getMimeFromExtension(ext);
-            const relativeStoragePath = path.relative(STORAGE_ROOT, filePath);
-            const now = new Date(stat.mtimeMs).toISOString();
+        // Only reconcile against a real owner so FOREIGN KEY constraints stay satisfiable
+        const ownerRow = db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('owner') as any;
+        const reconcileOwnerId = ownerRow?.id;
 
-            db.prepare(`
-              INSERT OR REPLACE INTO assets (id, owner_id, filename, storage_path, mime_type, size, checksum, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `).run(
-              id,
-              'usr_owner_default',
-              file,
-              relativeStoragePath,
-              mimeType,
-              stat.size,
-              '',
-              now
-            );
+        if (reconcileOwnerId) {
+          for (const file of diskFiles) {
+            if (!existingFilenames.has(file)) {
+              const filePath = path.join(assetsDir, file);
+              const stat = fsSync.statSync(filePath);
+              if (!stat.isFile()) continue;
+              const ext = path.extname(file).toLowerCase();
+              const id = path.parse(file).name;
+              const mimeType = this.getMimeFromExtension(ext);
+              const relativeStoragePath = path.relative(getStorageRoot(), filePath);
+              const now = new Date(stat.mtimeMs).toISOString();
+
+              db.prepare(`
+                INSERT OR REPLACE INTO assets (id, owner_id, filename, storage_path, mime_type, size, checksum, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              `).run(
+                id,
+                reconcileOwnerId,
+                file,
+                relativeStoragePath,
+                mimeType,
+                stat.size,
+                '',
+                now
+              );
+            }
           }
         }
       }
@@ -157,26 +205,30 @@ export class AssetService {
     // 1. Check SQLite record
     const record = db.prepare('SELECT * FROM assets WHERE id = ?').get(id) as any;
     if (record) {
-      const fullPath = path.join(STORAGE_ROOT, record.storage_path);
-      try {
-        await fs.unlink(fullPath);
-        deleted = true;
-      } catch {}
+      const fullPath = resolveAssetPath(record.storage_path);
+      if (fullPath) {
+        try {
+          await fs.unlink(fullPath);
+          deleted = true;
+        } catch {}
+      }
+      db.prepare('DELETE FROM document_assets WHERE asset_id = ?').run(id);
       db.prepare('DELETE FROM assets WHERE id = ?').run(id);
       deleted = true;
     }
 
-    // 2. Also search physical ASSETS_DIR for any file starting with or matching id
+    // 2. Also remove any physical file whose exact basename matches the asset ID
+    //    (never substring matching, which could delete unrelated assets).
     try {
-      if (fsSync.existsSync(ASSETS_DIR)) {
-        const files = await fs.readdir(ASSETS_DIR);
+      const assetsDir = getAssetsDir();
+      if (fsSync.existsSync(assetsDir)) {
+        const files = await fs.readdir(assetsDir);
         for (const file of files) {
-          if (file.includes(id) || path.parse(file).name === id) {
+          if (path.parse(file).name === id) {
             try {
-              await fs.unlink(path.join(ASSETS_DIR, file));
+              await fs.unlink(path.join(assetsDir, file));
               deleted = true;
             } catch {}
-            db.prepare('DELETE FROM assets WHERE id = ? OR storage_path LIKE ?').run(id, `%${file}%`);
           }
         }
       }
@@ -188,64 +240,59 @@ export class AssetService {
   // Cleanup any assets that are not referenced by any document Markdown
   public async cleanupUnreferencedAssets(): Promise<{ cleanedCount: number; freedBytes: number; deletedIds: string[] }> {
     const db = getDatabase();
-    const diskDocIds = await fileStorage.listAllDiskDocumentIds();
 
-    // Read all markdown content across all existing disk docs
-    const allMarkdownTexts: string[] = [];
+    // Build the set of asset IDs explicitly referenced by every document on disk.
+    const referencedIds = new Set<string>();
+    const diskDocIds = await fileStorage.listAllDiskDocumentIds();
     for (const docId of diskDocIds) {
       const md = await fileStorage.readDocumentMarkdown(docId);
-      if (md) allMarkdownTexts.push(md);
+      if (!md) continue;
+      for (const id of extractAssetReferences(md)) referencedIds.add(id);
     }
 
-    // Also include markdown content stored in SQLite database
+    // Include the authoritative association table as a second source of truth.
     try {
-      const dbDocs = db.prepare('SELECT raw_markdown FROM documents').all() as any[];
-      for (const d of dbDocs) {
-        if (d.raw_markdown) allMarkdownTexts.push(d.raw_markdown);
-      }
+      const rows = db.prepare('SELECT DISTINCT asset_id FROM document_assets').all() as any[];
+      for (const r of rows) if (r.asset_id) referencedIds.add(r.asset_id);
     } catch {}
 
-    const mergedAllMarkdown = allMarkdownTexts.join('\n');
-
-    // Get all assets in database
     const allAssets = db.prepare('SELECT * FROM assets').all() as any[];
     let cleanedCount = 0;
     let freedBytes = 0;
     const deletedIds: string[] = [];
 
     for (const asset of allAssets) {
-      // Check if asset ID or URL or filename appears in any markdown
-      const isReferenced =
-        mergedAllMarkdown.includes(asset.id) ||
-        mergedAllMarkdown.includes(`/api/v1/assets/file/${asset.id}`) ||
-        mergedAllMarkdown.includes(asset.filename) ||
-        mergedAllMarkdown.includes(path.basename(asset.storage_path));
+      if (referencedIds.has(asset.id)) continue;
 
-      if (!isReferenced) {
-        // Physical delete
-        const fullPath = path.join(STORAGE_ROOT, asset.storage_path);
+      const fullPath = resolveAssetPath(asset.storage_path);
+      if (fullPath) {
         try {
           const stat = await fs.stat(fullPath);
           freedBytes += stat.size;
           await fs.unlink(fullPath);
         } catch {}
-
-        db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
-        cleanedCount++;
-        deletedIds.push(asset.id);
       }
+
+      db.prepare('DELETE FROM document_assets WHERE asset_id = ?').run(asset.id);
+      db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
+      cleanedCount++;
+      deletedIds.push(asset.id);
     }
 
     // Also clean any unindexed orphan files inside storage/assets/
     try {
-      const files = await fs.readdir(ASSETS_DIR);
+      const assetsDir = getAssetsDir();
+      const files = await fs.readdir(assetsDir);
       const remainingAssets = db.prepare('SELECT storage_path FROM assets').all() as any[];
       const indexedPaths = new Set(remainingAssets.map(a => path.basename(a.storage_path)));
       for (const file of files) {
         if (!indexedPaths.has(file)) {
-          const filePath = path.join(ASSETS_DIR, file);
+          const filePath = path.join(assetsDir, file);
           try {
             const stat = await fs.stat(filePath);
+            if (!stat.isFile()) continue;
+            // Preserve files that are still explicitly referenced by Markdown
+            if (referencedIds.has(path.parse(file).name)) continue;
             freedBytes += stat.size;
             await fs.unlink(filePath);
             cleanedCount++;

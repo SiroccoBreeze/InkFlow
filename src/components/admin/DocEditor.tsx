@@ -37,7 +37,7 @@ import {
   FileText,
   Image as ImageIcon,
 } from 'lucide-react';
-import { Attachment, Category, DocVisibility, KnowledgeDoc } from '../../types';
+import { Attachment, Category, DocStatus, DocVisibility, KnowledgeDoc } from '../../types';
 import { storage } from '../../services/storage';
 import { apiClient } from '../../services/apiClient';
 import {
@@ -93,7 +93,15 @@ export const DocEditor: React.FC<DocEditorProps> = ({
   const [visibility, setVisibility] = useState<DocVisibility>(
     ((parsedInitial.visibility && ['public', 'private', 'unlisted'].includes(parsedInitial.visibility))
       ? parsedInitial.visibility
-      : initialDoc?.visibility || 'public') as DocVisibility
+      : initialDoc?.visibility || 'private') as DocVisibility
+  );  // New documents start as unpublished drafts; publishing requires an explicit owner action.
+  // Existing documents keep their current state (legacy docs without a status were published).
+  const [status, setStatus] = useState<DocStatus>(
+    ((parsedInitial.status && ['draft', 'published', 'archived'].includes(parsedInitial.status))
+      ? parsedInitial.status
+      : initialDoc
+        ? initialDoc.status || 'published'
+        : 'draft') as DocStatus
   );
   const [author, setAuthor] = useState<string>(
     parsedInitial.author || initialDoc?.author || 'Hecker'
@@ -154,6 +162,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
     category: string;
     tags: string[];
     visibility: DocVisibility;
+    status: DocStatus;
     author: string;
   }): string => {
     const tagsStr = `[${meta.tags.map(t => `"${t.replace(/"/g, '\\"')}"`).join(', ')}]`;
@@ -163,6 +172,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
       `category: "${meta.category}"`,
       `tags: ${tagsStr}`,
       `visibility: "${meta.visibility}"`,
+      `status: "${meta.status}"`,
       `author: "${meta.author || 'Hecker'}"`,
       '---',
     ].join('\n');
@@ -186,6 +196,9 @@ export const DocEditor: React.FC<DocEditorProps> = ({
       }
       if (frontmatter.visibility && ['public', 'private', 'unlisted'].includes(frontmatter.visibility)) {
         setVisibility(frontmatter.visibility as DocVisibility);
+      }
+      if (frontmatter.status && ['draft', 'published', 'archived'].includes(frontmatter.status)) {
+        setStatus(frontmatter.status as DocStatus);
       }
       if (frontmatter.author && typeof frontmatter.author === 'string') {
         setAuthor(frontmatter.author);
@@ -288,6 +301,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
         category,
         tags: selectedTags,
         visibility,
+        status,
         author: author.trim() || 'Hecker',
       }),
       '',
@@ -303,6 +317,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
         category,
         tags: selectedTags,
         visibility,
+        status,
         author: author.trim() || 'Hecker',
         unlistedKey: visibility === 'unlisted' ? unlistedKey : undefined,
         pinned,
@@ -552,6 +567,21 @@ export const DocEditor: React.FC<DocEditorProps> = ({
                 {copiedShareLink ? <Check className="w-3 h-3 text-emerald-600" /> : <Share2 className="w-3 h-3" />}
               </button>
             )}
+          </div>
+
+          {/* Publish Status Capsule — anonymous visitors only ever see published documents */}
+          <div className="flex items-center gap-1.5 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg px-2.5 py-1 text-neutral-700 dark:text-neutral-300">
+            <FileText className="w-3.5 h-3.5 text-sky-500" />
+            <span className="text-neutral-400 text-[11px]">状态:</span>
+            <select
+              value={status}
+              onChange={e => setStatus(e.target.value as DocStatus)}
+              className="bg-transparent font-medium outline-none text-neutral-900 dark:text-neutral-100 cursor-pointer"
+            >
+              <option value="draft" className="bg-white dark:bg-neutral-900">草稿 (仅自己可见)</option>
+              <option value="published" className="bg-white dark:bg-neutral-900">已发布</option>
+              <option value="archived" className="bg-white dark:bg-neutral-900">已归档</option>
+            </select>
           </div>
 
           {/* Author Capsule */}
@@ -1191,6 +1221,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
             if (frontmatter.category) setCategory(frontmatter.category);
             if (Array.isArray(frontmatter.tags)) setSelectedTags(frontmatter.tags);
             if (frontmatter.visibility) setVisibility(frontmatter.visibility as DocVisibility);
+            if (frontmatter.status) setStatus(frontmatter.status as DocStatus);
             if (frontmatter.author) setAuthor(frontmatter.author);
             setRawMarkdown(body.trimStart());
             setShowVersionModal(false);

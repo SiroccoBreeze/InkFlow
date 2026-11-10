@@ -5,6 +5,8 @@
 
 export type DocVisibility = 'public' | 'private' | 'unlisted';
 
+export type DocStatus = 'draft' | 'published' | 'archived';
+
 export type UserRole = 'owner' | 'contributor' | 'reader';
 
 export interface Attachment {
@@ -36,6 +38,8 @@ export interface KnowledgeDoc {
   category: string;
   tags: string[];
   visibility: DocVisibility;
+  /** 'draft' documents are never exposed publicly, even when visibility is 'public'. */
+  status?: DocStatus;
   unlistedKey?: string; // Unguessable token for unlisted sharing
   author: string;
   createdAt: string;

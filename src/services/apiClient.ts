@@ -80,10 +80,10 @@ class ApiClient {
 
   // --- Auth API ---
   public async getAuthStatus() {
-    return this.request<{ isInitialized: boolean }>('/auth/status');
+    return this.request<{ isInitialized: boolean; canInitialize: boolean }>('/auth/status');
   }
 
-  public async initOwner(params: { username?: string; password: string; email?: string }) {
+  public async initOwner(params: { initKey: string; username?: string; password: string; email?: string }) {
     const res = await this.request<{ user: any; token: string; recoveryCode: string; message: string }>('/auth/init', {
       method: 'POST',
       body: JSON.stringify(params),

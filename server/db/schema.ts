@@ -60,8 +60,9 @@ CREATE TABLE IF NOT EXISTS documents (
   category_id TEXT,
   category_name TEXT NOT NULL DEFAULT '未分类',
   file_path TEXT NOT NULL,
-  visibility TEXT NOT NULL CHECK(visibility IN ('public', 'private', 'unlisted')),
-  status TEXT NOT NULL DEFAULT 'published' CHECK(status IN ('draft', 'published', 'archived')),
+  -- Secure defaults: a new document is a private draft until the owner explicitly publishes it.
+  visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('public', 'private', 'unlisted')),
+  status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'published', 'archived')),
   content_hash TEXT NOT NULL,
   word_count INTEGER NOT NULL DEFAULT 0,
   reading_time INTEGER NOT NULL DEFAULT 1,
@@ -127,7 +128,20 @@ CREATE TABLE IF NOT EXISTS assets (
   FOREIGN KEY (owner_id) REFERENCES users(id)
 );
 
--- 10. SQLite FTS5 Full-Text Search Virtual Table
+-- 10. Document ↔ Asset Reference Association
+-- Authoritative index of which asset is referenced by which document. Populated from
+-- the parsed Markdown of each document only (never from filename substring guessing).
+CREATE TABLE IF NOT EXISTS document_assets (
+  document_id TEXT NOT NULL,
+  asset_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (document_id, asset_id),
+  FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+  FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_document_assets_asset ON document_assets (asset_id);
+
+-- 11. SQLite FTS5 Full-Text Search Virtual Table
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   document_id UNINDEXED,
   title,
@@ -137,7 +151,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   tokenize = 'unicode61'
 );
 
--- 11. Security One-Time Recovery Codes Table
+-- 12. Security One-Time Recovery Codes Table
 CREATE TABLE IF NOT EXISTS recovery_codes (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -147,6 +161,14 @@ CREATE TABLE IF NOT EXISTS recovery_codes (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes (user_id, used_at);
+
+-- 13. System Settings / One-Way Security State Markers
+-- e.g. owner_initialized=1 permanently closes the first-run initialization entry.
+CREATE TABLE IF NOT EXISTS system_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 export function initDatabaseSchema(db: DatabaseSync): void {

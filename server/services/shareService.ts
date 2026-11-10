@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
-import { getDatabase, hashPassword, generateId } from '../db/sqlite';
-import { documentService } from './documentService';
+import { getDatabase, hashPassword, verifyPassword, generateId } from '../db/sqlite';
+import { documentService, toPublicDocument } from './documentService';
 
 export interface CreateShareOptions {
   documentId: string;
@@ -62,7 +62,10 @@ export class ShareService {
       if (!passwordAttempt) {
         return { allowed: false, reason: 'PASSWORD_REQUIRED', message: '该分享链接受密码保护，请输入访问密码' };
       }
-      if (hashPassword(passwordAttempt) !== share.password_hash) {
+      // hashPassword() generates a fresh random salt on every call, so comparing its output
+      // to a stored hash can never match. Verify against the stored salted hash instead.
+      const { isValid } = verifyPassword(passwordAttempt, share.password_hash);
+      if (!isValid) {
         return { allowed: false, reason: 'INCORRECT_PASSWORD', message: '访问密码错误，请重新输入' };
       }
     }
@@ -78,7 +81,8 @@ export class ShareService {
 
     return {
       allowed: true,
-      doc,
+      // Share recipients are external viewers: never expose internal paths/owner IDs.
+      doc: toPublicDocument(doc),
       shareInfo: {
         id: share.id,
         viewCount: share.view_count + 1,

@@ -5,6 +5,7 @@ import { searchService } from '../services/searchService';
 import { shareService } from '../services/shareService';
 import { assetService } from '../services/assetService';
 import { fileStorage } from '../services/fileStorageService';
+import { ensureInitialPhysicalDocs } from '../services/seedData';
 import { getDatabase, generateId } from '../db/sqlite';
 
 export const apiRouter = Router();
@@ -95,6 +96,8 @@ apiRouter.get('/auth/status', (req, res) => {
   res.json({
     data: {
       isInitialized: authService.isInitialized(),
+      // Whether the server has a one-time initialization key configured
+      canInitialize: authService.canInitialize(),
     },
   });
 });
@@ -106,17 +109,42 @@ apiRouter.post('/auth/init', checkAuthRateLimit, (req, res) => {
     return;
   }
 
-  const { username, password, email } = req.body || {};
+  if (!authService.isInitializationKeyConfigured()) {
+    res.status(403).json({
+      error: {
+        code: 'INIT_DISABLED',
+        message: '服务端未配置初始化密钥（INKFLOW_INIT_KEY），首次初始化已被禁用',
+      },
+    });
+    return;
+  }
+
+  const { initKey, username, password, email } = req.body || {};
+
+  // One-time initialization key is mandatory. Missing key is treated as unauthorized.
+  if (!initKey || typeof initKey !== 'string') {
+    recordFailedAuthAttempt(req);
+    res.status(401).json({ error: { code: 'INVALID_INIT_KEY', message: '缺少初始化密钥，禁止执行首次初始化' } });
+    return;
+  }
+
+  if (!authService.verifyInitializationKey(initKey)) {
+    recordFailedAuthAttempt(req);
+    res.status(403).json({ error: { code: 'INVALID_INIT_KEY', message: '初始化密钥无效' } });
+    return;
+  }
+
   if (!password || typeof password !== 'string' || password.length < 6) {
     recordFailedAuthAttempt(req);
     res.status(400).json({ error: { code: 'INVALID_PASSWORD', message: '主理人访问密钥最低要求 6 位' } });
     return;
   }
 
-  const result = authService.initializeOwner({ username, password, email });
+  const result = authService.initializeOwner({ initKey, username, password, email });
   if (!result.success) {
     recordFailedAuthAttempt(req);
-    res.status(400).json({ error: { code: 'INIT_FAILED', message: result.message || '初始化失败' } });
+    const status = result.code === 'ALREADY_INITIALIZED' ? 403 : result.code === 'INVALID_INIT_KEY' ? 403 : 400;
+    res.status(status).json({ error: { code: result.code || 'INIT_FAILED', message: result.message || '初始化失败' } });
     return;
   }
 
@@ -128,6 +156,12 @@ apiRouter.post('/auth/init', checkAuthRateLimit, (req, res) => {
       recoveryCode: result.recoveryCode,
       message: '主理人账号初始化成功，请妥善保存应急恢复密钥！',
     },
+  });
+
+  // Seed the explicit public starter documents now that an owner exists.
+  // Failures never affect the initialization response.
+  ensureInitialPhysicalDocs().catch(err => {
+    console.error('[Initial Seed Error]:', err);
   });
 });
 
@@ -251,6 +285,33 @@ apiRouter.put('/users/profile', requireOwner, (req, res) => {
 
 
 // ---------------- DOCUMENTS ROUTES ----------------
+export function validateDocumentPublicationInput(body: any): string | null {
+  if (!body || typeof body !== 'object') return null;
+
+  const allowedVisibility = ['public', 'private', 'unlisted'];
+  const allowedStatus = ['draft', 'published', 'archived'];
+
+  if (body.visibility !== undefined && !allowedVisibility.includes(body.visibility)) {
+    return 'visibility 仅允许 public / private / unlisted';
+  }
+  if (body.status !== undefined && !allowedStatus.includes(body.status)) {
+    return 'status 仅允许 draft / published / archived';
+  }
+  const title = body.title;
+  if (title !== undefined && typeof title !== 'string') {
+    return 'title 必须为字符串';
+  }
+  const rawMarkdown = body.rawMarkdown;
+  if (rawMarkdown !== undefined && typeof rawMarkdown !== 'string') {
+    return 'rawMarkdown 必须为字符串';
+  }
+  const tags = body.tags;
+  if (tags !== undefined && (!Array.isArray(tags) || tags.some((t: any) => typeof t !== 'string'))) {
+    return 'tags 必须为字符串数组';
+  }
+  return null;
+}
+
 apiRouter.get('/documents', authenticateOptional, async (req, res) => {
   const user = (req as any).user;
   const isOwner = user?.role === 'owner';
@@ -284,15 +345,33 @@ apiRouter.get('/documents/:id', authenticateOptional, async (req, res) => {
 
 apiRouter.post('/documents', requireOwner, async (req, res) => {
   const user = (req as any).user;
-  const saved = await documentService.saveDocument(req.body, user.id, req.body.note);
-  res.status(201).json({ data: saved });
+  const invalid = validateDocumentPublicationInput(req.body);
+  if (invalid) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: invalid } });
+    return;
+  }
+  try {
+    const saved = await documentService.saveDocument(req.body, user.id, req.body.note);
+    res.status(201).json({ data: saved });
+  } catch (err: any) {
+    res.status(400).json({ error: { code: 'SAVE_FAILED', message: err?.message || '保存文档失败' } });
+  }
 });
 
 apiRouter.put('/documents/:id', requireOwner, async (req, res) => {
   const user = (req as any).user;
+  const invalid = validateDocumentPublicationInput(req.body);
+  if (invalid) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: invalid } });
+    return;
+  }
   const input = { ...req.body, id: req.params.id };
-  const saved = await documentService.saveDocument(input, user.id, req.body.note);
-  res.json({ data: saved });
+  try {
+    const saved = await documentService.saveDocument(input, user.id, req.body.note);
+    res.json({ data: saved });
+  } catch (err: any) {
+    res.status(400).json({ error: { code: 'SAVE_FAILED', message: err?.message || '保存文档失败' } });
+  }
 });
 
 apiRouter.delete('/documents/:id', requireOwner, async (req, res) => {
@@ -424,32 +503,11 @@ apiRouter.get('/assets/file/:id', authenticateOptional, async (req, res) => {
   const user = (req as any).user;
   const isOwner = user?.role === 'owner';
 
-  // Permission check: if anonymous or non-owner, check if asset is referenced in any public published document
+  // Anonymous/non-owner access requires a REAL document_assets association with a
+  // document that is both public and published. Filename/ID substring matching is never used.
   if (!isOwner) {
-    const db = getDatabase();
-    const publicDocs = db.prepare(`
-      SELECT id, file_path FROM documents
-      WHERE visibility = 'public' AND status = 'published'
-    `).all() as any[];
-
-    let isPublic = false;
-    const assetId = asset.record.id;
-    const assetFilename = asset.record.filename;
-
-    for (const doc of publicDocs) {
-      const md = await fileStorage.readDocumentMarkdown(doc.id);
-      if (
-        md &&
-        (md.includes(assetId) ||
-          md.includes(`/assets/file/${assetId}`) ||
-          md.includes(assetFilename))
-      ) {
-        isPublic = true;
-        break;
-      }
-    }
-
-    if (!isPublic) {
+    const isPubliclyReadable = documentService.isAssetPubliclyReadable(asset.record.id);
+    if (!isPubliclyReadable) {
       res.status(403).json({ error: { code: 'FORBIDDEN', message: '私有附件或尚未公开的媒体资源，禁止匿名访问' } });
       return;
     }
@@ -479,7 +537,7 @@ apiRouter.get('/assets/file/:id', authenticateOptional, async (req, res) => {
     res.setHeader('Content-Type', asset.record.mime_type || 'application/octet-stream');
   }
 
-  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.setHeader('Cache-Control', isOwner ? 'private, max-age=86400' : 'public, max-age=86400');
   res.send(asset.buffer);
 });
 
@@ -574,8 +632,19 @@ apiRouter.delete('/tags/:name', requireOwner, async (req, res) => {
         const { frontmatter, body } = parseFrontmatter(raw);
         if (Array.isArray(frontmatter.tags) && frontmatter.tags.includes(tagName)) {
           frontmatter.tags = frontmatter.tags.filter((t: string) => t !== tagName);
+          // Legacy files have no `status` field; never write the literal string "undefined".
+          const visibility = ['public', 'private', 'unlisted'].includes(frontmatter.visibility)
+            ? frontmatter.visibility
+            : 'public';
+          const status = ['draft', 'published', 'archived'].includes(frontmatter.status)
+            ? frontmatter.status
+            : 'published';
           const newMarkdown = [
-            buildFrontmatterBlock(frontmatter as any),
+            buildFrontmatterBlock({
+              ...frontmatter,
+              visibility,
+              status,
+            } as any),
             '',
             body.trimStart(),
           ].join('\n');

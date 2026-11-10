@@ -241,6 +241,13 @@ class StorageService {
     return this.getDocs().find(d => d.id === id);
   }
 
+  /** Unlisted links are only handed out for genuinely published documents. */
+  public getDocByUnlistedKey(key: string): KnowledgeDoc | undefined {
+    return this.getDocs().find(
+      d => d.visibility === 'unlisted' && d.unlistedKey === key && (d.status ?? 'published') === 'published'
+    );
+  }
+
   public getDocBySlug(slug: string): KnowledgeDoc | undefined {
     return this.getDocs().find(d => d.slug === slug);
   }
@@ -253,10 +260,6 @@ class StorageService {
         d.title.trim().toLowerCase() === cleanTarget ||
         d.id.trim().toLowerCase() === cleanTarget
     );
-  }
-
-  public getDocByUnlistedKey(key: string): KnowledgeDoc | undefined {
-    return this.getDocs().find(d => d.visibility === 'unlisted' && d.unlistedKey === key);
   }
 
   public saveDoc(docInput: Partial<KnowledgeDoc> & { rawMarkdown: string }, note?: string): KnowledgeDoc {
@@ -278,7 +281,8 @@ class StorageService {
         slug: docInput.slug || existing.slug || generateSlug(docInput.title || 'doc'),
         category: docInput.category || existing.category || '未分类',
         tags: docInput.tags || existing.tags || [],
-        visibility: docInput.visibility || existing.visibility || 'public',
+        visibility: docInput.visibility || existing.visibility || 'private',
+        status: docInput.status || existing.status || 'draft',
         unlistedKey: docInput.visibility === 'unlisted' ? (existing.unlistedKey || Math.random().toString(36).slice(2, 10)) : undefined,
         updatedAt: now,
         wordCount: stats.wordCount,
@@ -303,7 +307,8 @@ class StorageService {
         rawMarkdown: docInput.rawMarkdown,
         category: docInput.category || '架构与系统',
         tags: docInput.tags || [],
-        visibility: docInput.visibility || 'public',
+        visibility: docInput.visibility || 'private',
+        status: docInput.status || 'draft',
         unlistedKey: docInput.visibility === 'unlisted' ? Math.random().toString(36).slice(2, 10) : undefined,
         author: docInput.author || 'Owner',
         createdAt: now,
@@ -332,6 +337,7 @@ class StorageService {
           category: finalDoc.category,
           tags: finalDoc.tags,
           visibility: finalDoc.visibility,
+          status: finalDoc.status,
           pinned: finalDoc.pinned,
           author: finalDoc.author,
         },
@@ -416,7 +422,13 @@ class StorageService {
           rawMarkdown: backendDoc.rawMarkdown || `# ${backendDoc.title}\n\n`,
           category: backendDoc.category || '未分类',
           tags: backendDoc.tags || [],
-          visibility: backendDoc.visibility || 'public',
+          // Fail closed: an unexpected visibility/status from the server must never render as public content
+          visibility: (['public', 'private', 'unlisted'].includes(backendDoc.visibility)
+            ? backendDoc.visibility
+            : 'private'),
+          status: (['draft', 'published', 'archived'].includes(backendDoc.status)
+            ? backendDoc.status
+            : 'draft'),
           pinned: Boolean(backendDoc.pinned),
           author: backendDoc.author || 'Hecker',
           createdAt: backendDoc.createdAt || backendDoc.created_at || new Date().toISOString(),
@@ -499,7 +511,9 @@ class StorageService {
   // --- Knowledge Graph Data Generation ---
 
   public getGraphData(): { nodes: GraphNode[]; links: GraphLink[] } {
-    const docs = this.getDocs().filter(d => d.visibility === 'public');
+    const docs = this.getDocs().filter(
+      d => d.visibility === 'public' && (d.status ?? 'published') === 'published'
+    );
     const nodes: GraphNode[] = [];
     const links: GraphLink[] = [];
     const tagSet = new Set<string>();
@@ -543,7 +557,12 @@ class StorageService {
       const wikiLinks = extractWikiLinks(doc.rawMarkdown);
       wikiLinks.forEach(target => {
         const targetDoc = this.getDocByTitleOrSlug(target);
-        if (targetDoc && targetDoc.id !== doc.id && targetDoc.visibility === 'public') {
+        if (
+          targetDoc &&
+          targetDoc.id !== doc.id &&
+          targetDoc.visibility === 'public' &&
+          (targetDoc.status ?? 'published') === 'published'
+        ) {
           links.push({
             source: doc.id,
             target: targetDoc.id,
@@ -1031,7 +1050,11 @@ class StorageService {
     const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags : [];
     const visibility = (['public', 'private', 'unlisted'].includes(frontmatter.visibility)
       ? frontmatter.visibility
-      : 'public') as KnowledgeDoc['visibility'];
+      : 'private') as KnowledgeDoc['visibility'];
+    // Imported Markdown never publishes itself: new imports start as drafts (SEC-011).
+    const status = (['draft', 'published', 'archived'].includes(frontmatter.status)
+      ? frontmatter.status
+      : 'draft') as KnowledgeDoc['status'];
 
     return this.saveDoc(
       {
@@ -1040,6 +1063,7 @@ class StorageService {
         category,
         tags,
         visibility,
+        status,
         unlistedKey: frontmatter.unlistedKey,
         author: frontmatter.author || 'Owner',
       },
@@ -1232,6 +1256,7 @@ class StorageService {
   }
 
   public async initOwner(params: {
+    initKey: string;
     username?: string;
     password: string;
     email?: string;

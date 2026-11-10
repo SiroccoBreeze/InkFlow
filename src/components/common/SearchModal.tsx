@@ -60,8 +60,10 @@ export const SearchModal: React.FC<SearchModalProps> = ({
     return () => clearTimeout(timer);
   }, [query]);
 
-  // Filter docs by permissions: visitors only see public docs
-  const visibleDocs = docs.filter(doc => isOwner || doc.visibility === 'public');
+  // Filter docs by permissions: visitors only see public AND published docs
+  const visibleDocs = docs.filter(
+    doc => isOwner || (doc.visibility === 'public' && (doc.status ?? 'published') === 'published')
+  );
 
   // Local fallback results
   const localFiltered = query.trim()

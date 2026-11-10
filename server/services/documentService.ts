@@ -64,6 +64,7 @@ export function buildFrontmatterBlock(meta: {
   category: string;
   tags: string[];
   visibility: string;
+  status: string;
   author: string;
   pinned: boolean;
   content_hash: string;
@@ -79,6 +80,7 @@ export function buildFrontmatterBlock(meta: {
     `category: "${meta.category}"`,
     `tags: ${tagsStr}`,
     `visibility: "${meta.visibility}"`,
+    `status: "${meta.status}"`,
     `author: "${meta.author || 'Hecker'}"`,
     `pinned: ${meta.pinned ? 'true' : 'false'}`,
     `content_hash: "${meta.content_hash}"`,
@@ -92,6 +94,31 @@ export function calculateContentHash(body: string): string {
   return crypto.createHash('sha256').update(body.trim()).digest('hex').slice(0, 16);
 }
 
+/**
+ * Extracts asset references that are explicitly present in Markdown.
+ * Recognized forms:
+ *   - /api/v1/assets/file/{assetId}      (the canonical URL inserted by the editor)
+ *   - attachment:{assetId}               (legacy inline attachment syntax)
+ *   - asset:{assetId}                    (explicit asset scheme)
+ * Filenames are deliberately NOT considered references.
+ */
+export function extractAssetReferences(markdown: string): string[] {
+  if (!markdown) return [];
+  const ids = new Set<string>();
+  const patterns = [
+    /\/api\/v1\/assets\/file\/([A-Za-z0-9_-]{1,200})/g,
+    /attachment:([A-Za-z0-9_-]{1,200})/g,
+    /asset:([A-Za-z0-9_-]{1,200})/g,
+  ];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(markdown)) !== null) {
+      ids.add(match[1]);
+    }
+  }
+  return Array.from(ids);
+}
+
 export function calculateReadingStats(content: string): { wordCount: number; readingTime: number } {
   const clean = content.replace(/```[\s\S]*?```/g, '').replace(/#|\*|`|>|\[.*?\]\(.*?\)/g, '');
   const cjkChars = (clean.match(/[\u4e00-\u9fa5]/g) || []).length;
@@ -99,6 +126,20 @@ export function calculateReadingStats(content: string): { wordCount: number; rea
   const wordCount = cjkChars + latinWords;
   const readingTime = Math.max(1, Math.ceil(wordCount / 300));
   return { wordCount, readingTime };
+}
+
+/**
+ * Removes fields that must never be exposed to anonymous visitors:
+ * internal filesystem paths, owner account identifiers, and content hashes.
+ */
+export function toPublicDocument<T extends Record<string, any>>(row: T): T {
+  const {
+    file_path: _filePath,
+    owner_id: _ownerId,
+    content_hash: _contentHash,
+    ...rest
+  } = row as Record<string, any>;
+  return rest as T;
 }
 
 export class DocumentService {
@@ -175,12 +216,14 @@ export class DocumentService {
 
         const rawMarkdown = await fileStorage.readDocumentMarkdown(row.id);
 
-        return {
+        const doc = {
           ...row,
           rawMarkdown: rawMarkdown || `# ${row.title}\n\n${row.description || ''}`,
           pinned: Boolean(row.pinned),
           tags: tagRows.map(t => t.name),
         };
+
+        return options.isOwner ? doc : toPublicDocument(doc);
       })
     );
 
@@ -223,19 +266,28 @@ export class DocumentService {
       )
       .all(id) as any[];
 
-    return {
+    const result = {
       ...docRow,
       category: docRow.category_name,
       pinned: Boolean(docRow.pinned),
       tags: tagRows.map(t => t.name),
       rawMarkdown,
     };
+
+    // Public responses never leak internal disk paths, owner IDs, or content hashes
+    return isOwner ? result : toPublicDocument(result);
   }
 
   // Create or Update Document: Dual write to physical disk and SQLite
   public async saveDocument(input: DocumentInput, ownerId: string, note?: string) {
     const db = this.getDb();
     const now = new Date().toISOString();
+
+    // Reject IDs that cannot be used safely as a storage folder segment.
+    if (input.id && !/^[A-Za-z0-9._-]{1,200}$/.test(input.id)) {
+      throw new Error('非法的文档 ID');
+    }
+
     const docId = input.id || generateId('doc');
     const title = input.title.trim() || '无标题文档';
     const slug = (input.slug || input.title || docId)
@@ -244,12 +296,14 @@ export class DocumentService {
       .replace(/^-+|-+$/g, '') || docId;
     const category = input.category?.trim() || '未分类';
     const tags = (input.tags || []).map(t => t.trim().replace(/^#/, '')).filter(Boolean);
-    const visibility = input.visibility || 'public';
-    const status = input.status || 'published';
-    const pinned = input.pinned ? 1 : 0;
 
-    // Check existing document
+    // Check existing document first so updates never silently loosen publication state.
     const existing = db.prepare('SELECT * FROM documents WHERE id = ?').get(docId) as any;
+
+    // Secure defaults: a brand-new document is a PRIVATE DRAFT unless the owner explicitly publishes it.
+    const visibility = input.visibility ?? existing?.visibility ?? 'private';
+    const status = input.status ?? existing?.status ?? 'draft';
+    const pinned = input.pinned ? 1 : 0;
 
     // Parse body for stats and hash
     const { body } = parseFrontmatter(input.rawMarkdown);
@@ -269,6 +323,7 @@ export class DocumentService {
         category,
         tags,
         visibility,
+        status,
         author: input.author || 'Hecker',
         pinned: Boolean(pinned),
         content_hash: contentHash,
@@ -333,7 +388,8 @@ export class DocumentService {
       versionCount,
       createdAt,
       now,
-      visibility === 'public' ? now : null
+      // recorded only when the document is actually public
+      visibility === 'public' ? (existing?.published_at || now) : null
     );
 
     // 4. Save revision snapshot now that documents row exists
@@ -378,6 +434,9 @@ export class DocumentService {
       VALUES (?, ?, ?, ?, ?)
     `).run(docId, title, cleanBody, category, tags.join(' '));
 
+    // 7. Persist the authoritative asset references (parsed, never substring-guessed)
+    this.syncDocumentAssets(docId, cleanBody);
+
     return {
       id: docId,
       slug,
@@ -396,9 +455,75 @@ export class DocumentService {
     };
   }
 
-  // Delete document
-  public async deleteDocument(id: string) {
+  /**
+   * Rebuilds `document_assets` from explicit references found in a document's Markdown.
+   * Only asset IDs that actually exist in the assets table are recorded.
+   */
+  public syncDocumentAssets(docId: string, markdownBody: string): string[] {
     const db = this.getDb();
+    const referencedIds = extractAssetReferences(markdownBody);
+
+    db.prepare('DELETE FROM document_assets WHERE document_id = ?').run(docId);
+
+    const validIds: string[] = [];
+    const existsStmt = db.prepare('SELECT id FROM assets WHERE id = ?');
+    const insertStmt = db.prepare(`
+      INSERT OR IGNORE INTO document_assets (document_id, asset_id, created_at)
+      VALUES (?, ?, ?)
+    `);
+    const now = new Date().toISOString();
+
+    for (const assetId of referencedIds) {
+      if (existsStmt.get(assetId)) {
+        insertStmt.run(docId, assetId, now);
+        validIds.push(assetId);
+      }
+    }
+
+    return validIds;
+  }
+
+  /**
+   * Rebuilds every document ↔ asset reference from the physical Markdown SSOT.
+   * Used at startup so legacy documents get a reliable association table.
+   */
+  public async rebuildAssetReferences(): Promise<number> {
+    const db = this.getDb();
+    const docIds = await fileStorage.listAllDiskDocumentIds();
+    let synced = 0;
+
+    for (const docId of docIds) {
+      const raw = await fileStorage.readDocumentMarkdown(docId);
+      if (!raw) continue;
+      const { body } = parseFrontmatter(raw);
+      this.syncDocumentAssets(docId, body);
+      synced++;
+    }
+
+    return synced;
+  }
+
+  /**
+   * Whether an asset is anonymously readable: it must be explicitly referenced by at
+   * least one document that is BOTH public AND published.
+   */
+  public isAssetPubliclyReadable(assetId: string): boolean {
+    const db = this.getDb();
+    if (!assetId) return false;
+    const row = db.prepare(`
+      SELECT 1 AS ok
+      FROM document_assets da
+      JOIN documents d ON d.id = da.document_id
+      WHERE da.asset_id = ?
+        AND d.visibility = 'public'
+        AND d.status = 'published'
+      LIMIT 1
+    `).get(assetId) as any;
+    return Boolean(row?.ok);
+  }
+
+  // Delete document
+  public async deleteDocument(id: string) {    const db = this.getDb();
     // 1. Read document markdown to check for attached assets before deleting
     const rawMarkdown = await fileStorage.readDocumentMarkdown(id);
 
@@ -443,6 +568,9 @@ export class DocumentService {
       const category = frontmatter.category || '未分类';
       const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags : [];
       const visibility = frontmatter.visibility || 'public';
+      // Disk snapshots from existing installations were published documents; keep them published
+      // so disaster recovery does not silently unpublish the whole site.
+      const status = frontmatter.status || 'published';
       const pinned = frontmatter.pinned ? true : false;
 
       await this.saveDocument(
@@ -454,6 +582,7 @@ export class DocumentService {
           category,
           tags,
           visibility: visibility as any,
+          status: status as any,
           pinned,
           author: frontmatter.author || 'Owner',
         },

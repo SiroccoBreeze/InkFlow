@@ -16,7 +16,80 @@ import { DocVisibility, KnowledgeDoc, TableOfContentItem } from '../types';
 
 // Whitelist pattern for safe inline base64 raster/webp images only (PNG, JPEG, WebP, GIF)
 // Specifically excludes data:text/html, data:text/javascript, data:image/svg+xml, etc.
-const SAFE_IMAGE_BASE64_REGEX = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/i;
+const SAFE_IMAGE_BASE64_REGEX = /^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=]+)$/i;
+
+// Magic-number signatures used to confirm that decoded bytes really match the declared MIME.
+const IMAGE_MAGIC_BYTES: Record<string, number[][]> = {
+  png: [[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  jpeg: [[0xff, 0xd8, 0xff]],
+  jpg: [[0xff, 0xd8, 0xff]],
+  gif: [[0x47, 0x49, 0x46, 0x38]],
+  webp: [[0x52, 0x49, 0x46, 0x46]], // "RIFF"; "WEBP" is checked separately below
+};
+
+function bytesStartWith(bytes: number[], signature: number[]): boolean {
+  if (bytes.length < signature.length) return false;
+  return signature.every((b, i) => bytes[i] === b);
+}
+
+function decodeBase64(payload: string): number[] | null {
+  try {
+    if (typeof atob === 'function') {
+      const binary = atob(payload);
+      const bytes: number[] = new Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+    if (typeof Buffer !== 'undefined') {
+      return Array.from(Buffer.from(payload, 'base64'));
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validates an `img[src]` value.
+ * - data: URIs must be base64 raster images whose decoded bytes match the declared MIME.
+ * - everything else is left to sanitize-html's scheme/protocol-relative handling.
+ */
+export function isSafeImageSrc(src: string): boolean {
+  if (typeof src !== 'string') return false;
+  const value = src.trim();
+  if (!value) return false;
+
+  // Reject control characters and backslashes that could smuggle a second URL / scheme
+  if (/[\u0000-\u001f\u007f\\]/.test(value)) return false;
+
+  if (!/^data:/i.test(value)) return true;
+
+  const match = SAFE_IMAGE_BASE64_REGEX.exec(value);
+  if (!match) return false;
+
+  const subtype = match[1].toLowerCase();
+  const base64Payload = match[2];
+  if (!base64Payload || base64Payload.length % 4 !== 0) return false;
+
+  const decoded = decodeBase64(base64Payload);
+  if (!decoded || decoded.length === 0) return false;
+
+  const signatures = IMAGE_MAGIC_BYTES[subtype];
+  if (!signatures || !signatures.some(sig => bytesStartWith(decoded, sig))) {
+    return false;
+  }
+
+  // WebP container: "RIFF....WEBP"
+  if (subtype === 'webp') {
+    return decoded.length >= 12 && String.fromCharCode(...decoded.slice(8, 12)) === 'WEBP';
+  }
+
+  return true;
+}
+
+function escapeHtml(value: string): string {
+  return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c));
+}
 
 // Strict HTML sanitizer options to prevent Stored XSS while preserving rich typography and code styling
 const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
@@ -29,7 +102,9 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
     ...sanitizeHtml.defaults.allowedAttributes,
     '*': ['class', 'id', 'title', 'data-*'],
     a: ['href', 'name', 'target', 'rel', 'data-wikilink', 'data-slug', 'class', 'title', 'role'],
-    img: ['src', 'srcset', 'alt', 'title', 'width', 'height', 'loading', 'class'],
+    // srcset is intentionally NOT allowed: responsive sources are not produced by the editor and
+    // parsing every candidate URL correctly is error-prone, so the safest option is to forbid it.
+    img: ['src', 'alt', 'title', 'width', 'height', 'loading', 'class'],
     code: ['class'],
     pre: ['class'],
     button: ['class', 'title', 'data-*'],
@@ -46,29 +121,31 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   transformTags: {
     a: (tagName, attribs) => {
       if (attribs.href) {
-        const href = attribs.href.trim().toLowerCase();
-        // Disallow data:, javascript:, vbscript:, or other pseudo-protocols
-        if (href.startsWith('data:') || href.startsWith('javascript:') || href.startsWith('vbscript:')) {
+        // Normalize away control characters / unicode whitespace before scheme inspection,
+        // so "java\tscript:" or "data :" style tricks cannot slip past.
+        const href = attribs.href.replace(/[\x00-\x20\x7f]+/g, '').toLowerCase();
+        // Disallow data:, javascript:, vbscript:, file:, or other pseudo-protocols,
+        // and protocol-relative URLs ("//evil.com").
+        if (
+          href.startsWith('data:') ||
+          href.startsWith('javascript:') ||
+          href.startsWith('vbscript:') ||
+          href.startsWith('file:') ||
+          href.startsWith('//')
+        ) {
           delete attribs.href;
         }
       }
       return { tagName, attribs };
     },
     img: (tagName, attribs) => {
+      // srcset is always stripped — no legitimate editor flow needs it.
+      delete attribs.srcset;
+      delete attribs.srcSet;
+
       if (attribs.src) {
-        const src = attribs.src.trim();
-        if (src.toLowerCase().startsWith('data:')) {
-          // Strictly match raster/webp base64 images; disallow svg, html, or malformed data URIs
-          if (!SAFE_IMAGE_BASE64_REGEX.test(src)) {
-            delete attribs.src;
-          }
-        }
-      }
-      if (attribs.srcset) {
-        const srcset = attribs.srcset.trim().toLowerCase();
-        // Disallow data: or script execution in srcset
-        if (srcset.includes('data:') || srcset.includes('javascript:')) {
-          delete attribs.srcset;
+        if (!isSafeImageSrc(attribs.src)) {
+          delete attribs.src;
         }
       }
       return { tagName, attribs };
@@ -320,7 +397,8 @@ export function renderMarkdown(rawMarkdown: string, attachmentMap?: Record<strin
   };
 
   renderer.code = function ({ text, lang }: { text: string; lang?: string }) {
-    const rawLang = (lang || '').trim().toLowerCase();
+    // Restrict the language identifier to a safe charset before it reaches an HTML attribute.
+    const rawLang = (lang || '').trim().toLowerCase().replace(/[^a-z0-9_+#-]/g, '');
     const aliasMap: Record<string, string> = {
       ts: 'typescript',
       js: 'javascript',
@@ -339,13 +417,13 @@ export function renderMarkdown(rawMarkdown: string, attachmentMap?: Record<strin
       try {
         highlighted = Prism.highlight(text, Prism.languages[targetLang], targetLang);
       } catch {
-        highlighted = text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c));
+        highlighted = escapeHtml(text);
       }
     } else {
-      highlighted = text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c));
+      highlighted = escapeHtml(text);
     }
 
-    const displayLang = (lang || 'code').toUpperCase();
+    const displayLang = escapeHtml((rawLang || 'code').toUpperCase());
     return `<div class="code-block-container relative group my-6 rounded-xl overflow-hidden border border-neutral-200 dark:border-neutral-800 bg-neutral-50/90 dark:bg-[#0c0c12] shadow-xs">
       <div class="code-header flex items-center justify-between px-4 py-2 bg-neutral-100/90 dark:bg-[#14141e] border-b border-neutral-200 dark:border-neutral-800 text-neutral-500 dark:text-neutral-400 text-xs font-mono select-none">
         <div class="flex items-center gap-2">

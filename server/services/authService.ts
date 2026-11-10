@@ -1,6 +1,17 @@
 import crypto from 'node:crypto';
 import { getDatabase, hashPassword, verifyPassword, hashRecoveryCode, generateId, seedDefaultCategoriesIfEmpty } from '../db/sqlite';
 
+const MIN_INIT_KEY_LENGTH = 24;
+const OWNER_INITIALIZED_MARKER = 'owner_initialized';
+
+function getInitializationKey(): string {
+  return (process.env.INKFLOW_INIT_KEY || '').trim();
+}
+
+function sha256(value: string): Buffer {
+  return crypto.createHash('sha256').update(value, 'utf8').digest();
+}
+
 export class AuthService {
   private getDb() {
     return getDatabase();
@@ -25,25 +36,83 @@ export class AuthService {
   }
 
   /**
+   * Whether a one-time initialization key is configured via environment.
+   * The key is never hardcoded and never shipped to the frontend.
+   */
+  public isInitializationKeyConfigured(): boolean {
+    return getInitializationKey().length >= MIN_INIT_KEY_LENGTH;
+  }
+
+  /**
    * Checks whether an active owner has been initialized.
    */
   public isInitialized(): boolean {
     const db = this.getDb();
     const row = db.prepare('SELECT COUNT(*) as count FROM users WHERE role = ? AND is_active = 1').get('owner') as any;
-    return (row?.count || 0) > 0;
+    if ((row?.count || 0) > 0) return true;
+    // One-way marker: once set, initialization stays closed even if the owner row is later disabled.
+    try {
+      const marker = db.prepare('SELECT value FROM system_settings WHERE key = ?').get(OWNER_INITIALIZED_MARKER) as any;
+      if (marker?.value === '1') return true;
+    } catch {
+      // pre-migration database without system_settings table
+    }
+    return false;
   }
 
   /**
-   * First-run admin initialization. Can only be invoked when the system is uninitialized.
+   * Whether the system can currently accept a first-run initialization.
+   */
+  public canInitialize(): boolean {
+    return this.isInitializationKeyConfigured() && !this.isInitialized();
+  }
+
+  /**
+   * Constant-time verification of the one-time initialization key.
+   */
+  public verifyInitializationKey(candidate: unknown): boolean {
+    const expected = getInitializationKey();
+    if (!expected || expected.length < MIN_INIT_KEY_LENGTH) return false;
+    if (typeof candidate !== 'string' || !candidate) return false;
+    const actualDigest = sha256(candidate);
+    const expectedDigest = sha256(expected);
+    return crypto.timingSafeEqual(actualDigest, expectedDigest);
+  }
+
+  private markOwnerInitialized(db: ReturnType<AuthService['getDb']>): void {
+    db.prepare(`
+      INSERT INTO system_settings (key, value, updated_at)
+      VALUES (?, '1', ?)
+      ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at
+    `).run(OWNER_INITIALIZED_MARKER, new Date().toISOString());
+  }
+
+  /**
+   * First-run admin initialization. Requires the one-time initialization key and
+   * can only be invoked when the system is uninitialized.
    */
   public initializeOwner(params: {
+    initKey?: string;
     username?: string;
     password: string;
     email?: string;
-  }): { success: boolean; user?: any; token?: string; recoveryCode?: string; message?: string } {
-    const { username = 'owner', password, email } = params;
+  }): { success: boolean; user?: any; token?: string; recoveryCode?: string; message?: string; code?: string } {
+    const { initKey, username = 'owner', password, email } = params;
+
+    if (!this.isInitializationKeyConfigured()) {
+      return {
+        success: false,
+        code: 'INIT_KEY_NOT_CONFIGURED',
+        message: '服务端尚未配置初始化密钥（INKFLOW_INIT_KEY），无法执行首次初始化',
+      };
+    }
+
+    if (!this.verifyInitializationKey(initKey)) {
+      return { success: false, code: 'INVALID_INIT_KEY', message: '初始化密钥无效' };
+    }
+
     if (!password || password.length < 6) {
-      return { success: false, message: '主理人访问密钥最低要求 6 位' };
+      return { success: false, code: 'INVALID_PASSWORD', message: '主理人访问密钥最低要求 6 位' };
     }
 
     const db = this.getDb();
@@ -51,10 +120,15 @@ export class AuthService {
 
     try {
       // 1. Strict atomic check inside transaction
-      const existing = db.prepare('SELECT COUNT(*) as count FROM users WHERE role = ? AND is_active = 1').get('owner') as any;
+      const existing = db.prepare('SELECT COUNT(*) as count FROM users WHERE role = ?').get('owner') as any;
       if ((existing?.count || 0) > 0) {
         db.exec('ROLLBACK;');
-        return { success: false, message: '系统主理人账号已初始化，无法重复执行' };
+        return { success: false, code: 'ALREADY_INITIALIZED', message: '系统主理人账号已初始化，无法重复执行' };
+      }
+      const marker = db.prepare('SELECT value FROM system_settings WHERE key = ?').get(OWNER_INITIALIZED_MARKER) as any;
+      if (marker?.value === '1') {
+        db.exec('ROLLBACK;');
+        return { success: false, code: 'ALREADY_INITIALIZED', message: '系统已完成初始化，初始化入口已永久关闭' };
       }
 
       const userId = generateId('usr_owner');
@@ -90,6 +164,9 @@ export class AuthService {
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(sessionId, userId, tokenHash, expiresAt, now, now);
 
+      // 6. Permanently close the initialization entry (one-way, inside the same transaction)
+      this.markOwnerInitialized(db);
+
       db.exec('COMMIT;');
 
       return {
@@ -108,7 +185,11 @@ export class AuthService {
       } catch {
         // ignore rollback error if connection lost
       }
-      return { success: false, message: err?.message?.includes('UNIQUE') ? '系统主理人账号已存在，无法重复初始化' : (err?.message || '初始化主理人账号失败') };
+      return {
+        success: false,
+        code: err?.message?.includes('UNIQUE') ? 'ALREADY_INITIALIZED' : 'INIT_FAILED',
+        message: err?.message?.includes('UNIQUE') ? '系统主理人账号已存在，无法重复初始化' : (err?.message || '初始化主理人账号失败'),
+      };
     }
   }
 

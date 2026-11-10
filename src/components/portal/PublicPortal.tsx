@@ -46,8 +46,11 @@ export const PublicPortal: React.FC<PublicPortalProps> = ({
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(6);
 
-  // Public docs only
-  const publicDocs = useMemo(() => docs.filter(d => d.visibility === 'public'), [docs]);
+  // Public docs only: anonymous viewers see published public documents exclusively
+  const publicDocs = useMemo(
+    () => docs.filter(d => d.visibility === 'public' && (d.status ?? 'published') === 'published'),
+    [docs]
+  );
 
   // Aggregate tags & counts
   const tagCounts = useMemo(() => {

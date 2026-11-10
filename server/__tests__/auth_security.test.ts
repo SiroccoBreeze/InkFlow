@@ -12,7 +12,12 @@ import { renderMarkdown } from '../../src/services/markdown';
 
 // Create an isolated temporary SQLite database for this test run
 const testDbPath = path.join(os.tmpdir(), `inkflow_test_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.sqlite`);
+const testDataDir = path.join(os.tmpdir(), `inkflow_data_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
 process.env.INKFLOW_DB_PATH = testDbPath;
+process.env.INKFLOW_DATA_DIR = testDataDir;
+// One-time initialization key required by SEC-006 (never a production value)
+const TEST_INIT_KEY = 'test-only-init-key-0123456789abcdef';
+process.env.INKFLOW_INIT_KEY = TEST_INIT_KEY;
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -30,6 +35,7 @@ describe('InkFlow Security & Access Control Verification', () => {
 
     // Initialize clean test owner
     const initRes = authService.initializeOwner({
+      initKey: TEST_INIT_KEY,
       username: 'security_audit_owner',
       password: 'AuditOwnerPassword2026!',
       email: 'audit@inkflow.local',
@@ -50,6 +56,7 @@ describe('InkFlow Security & Access Control Verification', () => {
       if (fs.existsSync(walPath)) fs.unlinkSync(walPath);
       const shmPath = `${testDbPath}-shm`;
       if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
+      if (fs.existsSync(testDataDir)) fs.rmSync(testDataDir, { recursive: true, force: true });
     } catch {
       // ignore unlink errors on cleanup
     }
@@ -242,13 +249,14 @@ describe('InkFlow Security & Access Control Verification', () => {
 
   describe('4. First Owner Initialization Safety & Idempotence', () => {
     it('prevents repeated owner initialization via API and service', async () => {
-      // 1. Service direct call
+      // 1. Service direct call (even with the correct key, initialization is closed)
       const repeatRes = authService.initializeOwner({
+        initKey: TEST_INIT_KEY,
         username: 'intruder',
         password: 'IntruderPass123!',
       });
       expect(repeatRes.success).toBe(false);
-      expect(repeatRes.message).toMatch(/已初始化|无法重复/);
+      expect(repeatRes.message).toMatch(/已初始化|无法重复|永久关闭/);
 
       // 2. HTTP endpoint check
       const httpRes = await request(app).post('/api/v1/auth/init').send({
@@ -458,7 +466,7 @@ describe('InkFlow Security & Access Control Verification', () => {
   describe('8. Private Assets Boundary', () => {
     it('prevents anonymous access to private unreferenced assets', async () => {
       const fsPromises = await import('node:fs/promises');
-      const assetsDir = path.resolve(process.cwd(), 'storage/assets');
+      const assetsDir = path.join(testDataDir, 'assets');
       await fsPromises.mkdir(assetsDir, { recursive: true });
       const assetFileName = `test_priv_${Date.now()}.png`;
       const fullAssetPath = path.join(assetsDir, assetFileName);
@@ -476,6 +484,8 @@ describe('InkFlow Security & Access Control Verification', () => {
         `).run(assetId, ownerUser.id, `assets/${assetFileName}`, now);
 
         const res = await request(app).get(`/api/v1/assets/file/${assetId}`);
+        // Anonymous access must be denied (403) — never served just because the file exists
+        expect([403, 404]).toContain(res.status);
         expect(res.status).toBe(403);
       } finally {
         try {

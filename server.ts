@@ -2,12 +2,26 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { apiRouter } from './server/routes/api';
-import { ensureInitialPhysicalDocs } from './server/services/seedData';
+import { ensureInitialPhysicalDocs, ensureAssetReferences } from './server/services/seedData';
+import { getDatabase } from './server/db/sqlite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+async function loadLocalEnv(): Promise<void> {
+  // Load an optional .env from the working directory (release deployments).
+  // The module is optional so the app also runs from plain environment variables.
+  try {
+    const { default: dotenv } = await import('dotenv');
+    dotenv.config({ path: path.resolve(process.cwd(), '.env'), quiet: true });
+  } catch {
+    // dotenv unavailable — environment variables are used directly
+  }
+}
+
 async function startServer() {
+  await loadLocalEnv();
+
   const app = express();
   const PORT = parseInt(process.env.PORT || '3000', 10);
   const isProd =
@@ -15,12 +29,26 @@ async function startServer() {
     process.argv.includes('--production') ||
     process.argv.includes('--prod');
 
+  // Only trust proxies we explicitly opt into; otherwise req.ip can be spoofed via X-Forwarded-For.
+  const trustProxy = process.env.INKFLOW_TRUST_PROXY;
+  if (trustProxy) {
+    app.set('trust proxy', /^\d+$/.test(trustProxy) ? parseInt(trustProxy, 10) : trustProxy);
+  }
+
   // Body parsers
   app.use(express.json({ limit: '20mb' }));
   app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
+  // Basic hardening headers for the SPA
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
+
   // Ensure storage directories & initial physical markdown files
   try {
+    getDatabase();
     await ensureInitialPhysicalDocs();
   } catch (err) {
     console.error('[Storage Init Error]:', err);
@@ -66,11 +94,14 @@ async function startServer() {
   } else {
     // Production mode: Serve built static assets from dist/
     const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, { dotfiles: 'deny' }));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  // Reconcile the asset ↔ document association table with the Markdown SSOT (non-blocking).
+  ensureAssetReferences().catch(err => console.error('[Asset Ref Sync Error]:', err));
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n==================================================`);
@@ -78,6 +109,9 @@ async function startServer() {
     console.log(`📁 Physical Markdown SSOT: storage/documents/`);
     console.log(`🗄️ Native SQLite WAL Database: storage/database/knowledge_hub.sqlite`);
     console.log(`🔌 API Base Endpoint: http://0.0.0.0:${PORT}/api/v1`);
+    if (!process.env.INKFLOW_INIT_KEY) {
+      console.log(`⚠️  INKFLOW_INIT_KEY is not set — first-run owner initialization is DISABLED.`);
+    }
     console.log(`==================================================\n`);
   });
 }

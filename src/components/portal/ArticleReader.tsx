@@ -332,7 +332,9 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
   }[fontFamily];
 
   // Next and Previous articles in same category
-  const publicDocs = allDocs.filter(d => isOwner || d.visibility === 'public');
+  const publicDocs = allDocs.filter(
+    d => isOwner || (d.visibility === 'public' && (d.status ?? 'published') === 'published')
+  );
   const currentIndex = publicDocs.findIndex(d => d.id === doc.id);
   const prevDoc = currentIndex > 0 ? publicDocs[currentIndex - 1] : null;
   const nextDoc = currentIndex < publicDocs.length - 1 ? publicDocs[currentIndex + 1] : null;

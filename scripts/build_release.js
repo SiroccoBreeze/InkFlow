@@ -1,84 +1,125 @@
+#!/usr/bin/env node
+/**
+ * InkFlow Release Builder
+ *
+ * Produces a self-contained production bundle inside release/.
+ *
+ * SEC-009 guarantees:
+ *  - The runtime storage/ directory is NEVER copied wholesale.
+ *  - Only an explicit allow-list of program files is copied.
+ *  - A hard post-build scan fails the build if any sensitive runtime data
+ *    (SQLite/WAL/SHM, user documents, revisions, assets, .env, keys, logs)
+ *    made it into the package.
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { assertSafeReleasePath, scanRelease } from './lib/releaseGuard.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, '..');
-const RELEASE_DIR = path.join(ROOT_DIR, 'release');
+// Test hooks: allow the builder to target another output dir / skip the frontend build.
+const RELEASE_DIR = process.env.INKFLOW_RELEASE_OUT
+  ? path.resolve(process.env.INKFLOW_RELEASE_OUT)
+  : path.join(ROOT_DIR, 'release');
+const SKIP_BUILD = process.env.INKFLOW_RELEASE_SKIP_BUILD === '1';
+const STAGING_DIR = path.join(ROOT_DIR, '.release-staging');
 
 console.log('🚀 [InkFlow Release Builder] Starting production release bundling...');
 
-// 1. Build frontend bundle if needed
-console.log('📦 Step 1: Building optimized frontend into dist/ ...');
-execSync('npm run build', { cwd: ROOT_DIR, stdio: 'inherit' });
+// ---------------------------------------------------------------------------
+// 0. Allow-list of files that may be shipped
+// ---------------------------------------------------------------------------
+const ALLOWED_ROOT_FILES = ['server.ts', 'tsconfig.json', '.env.example'];
+const ALLOWED_SERVER_DIRS = ['db', 'routes', 'services'];
 
-// 2. Prepare release directory
-console.log('📁 Step 2: Preparing release/ directory...');
-if (fs.existsSync(RELEASE_DIR)) {
-  fs.rmSync(RELEASE_DIR, { recursive: true, force: true });
+function copyFileSafe(src, destDir) {
+  const relative = path.relative(RELEASE_DIR, path.join(destDir, path.basename(src)));
+  assertSafeReleasePath(relative);
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.copyFileSync(src, path.join(destDir, path.basename(src)));
 }
-fs.mkdirSync(RELEASE_DIR, { recursive: true });
 
-// Helper to copy recursively
-function copyDirSync(src, dest) {
-  fs.mkdirSync(dest, { recursive: true });
-  const entries = fs.readdirSync(src, { withFileTypes: true });
-
-  for (const entry of entries) {
-    const srcPath = path.join(src, entry.name);
-    const destPath = path.join(dest, entry.name);
+function copyDirSafe(srcDir, destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    assertSafeReleasePath(path.relative(RELEASE_DIR, destPath));
 
     if (entry.isDirectory()) {
-      copyDirSync(srcPath, destPath);
-    } else {
+      // Skip tests and any nested runtime data folders
+      if (entry.name === '__tests__' || entry.name === 'node_modules') continue;
+      copyDirSafe(srcPath, destPath);
+    } else if (entry.isFile()) {
+      if (entry.name.endsWith('.test.ts') || entry.name.endsWith('.spec.ts')) continue;
       fs.copyFileSync(srcPath, destPath);
     }
   }
 }
 
-// 3. Copy dist/
-console.log('🚚 Step 3: Copying dist/ frontend assets...');
-copyDirSync(path.join(ROOT_DIR, 'dist'), path.join(RELEASE_DIR, 'dist'));
-
-// 4. Copy server/
-console.log('🚚 Step 4: Copying server/ backend modules...');
-copyDirSync(path.join(ROOT_DIR, 'server'), path.join(RELEASE_DIR, 'server'));
-
-// 5. Copy server.ts
-console.log('🚚 Step 5: Copying server.ts entry point...');
-fs.copyFileSync(path.join(ROOT_DIR, 'server.ts'), path.join(RELEASE_DIR, 'server.ts'));
-
-// 6. Copy tsconfig.json
-console.log('🚚 Step 6: Copying tsconfig.json...');
-fs.copyFileSync(path.join(ROOT_DIR, 'tsconfig.json'), path.join(RELEASE_DIR, 'tsconfig.json'));
-
-// 7. Copy .env.example
-if (fs.existsSync(path.join(ROOT_DIR, '.env.example'))) {
-  fs.copyFileSync(path.join(ROOT_DIR, '.env.example'), path.join(RELEASE_DIR, '.env.example'));
+// ---------------------------------------------------------------------------
+// 1. Build frontend bundle
+// ---------------------------------------------------------------------------
+console.log('📦 Step 1: Building optimized frontend into dist/ ...');
+if (SKIP_BUILD) {
+  console.log('   ↳ INKFLOW_RELEASE_SKIP_BUILD=1 — reusing existing dist/');
+} else {
+  execSync('npm run build', { cwd: ROOT_DIR, stdio: 'inherit' });
 }
 
-// 8. Prepare default storage folders in release/
-console.log('🗄️ Step 7: Initializing storage/ structure...');
-const releaseStorage = path.join(RELEASE_DIR, 'storage');
-['documents', 'assets', 'database', 'revisions', 'backups'].forEach(dir => {
-  fs.mkdirSync(path.join(releaseStorage, dir), { recursive: true });
-});
+// ---------------------------------------------------------------------------
+// 2. Recreate a clean release directory
+// ---------------------------------------------------------------------------
+console.log('📁 Step 2: Preparing a clean release/ directory...');
+if (fs.existsSync(RELEASE_DIR)) {
+  fs.rmSync(RELEASE_DIR, { recursive: true, force: true });
+}
+fs.mkdirSync(RELEASE_DIR, { recursive: true });
 
-// If local storage has documents or seed data, copy them over for instant out-of-the-box readiness
-const localStorageDir = path.join(ROOT_DIR, 'storage');
-if (fs.existsSync(localStorageDir)) {
-  try {
-    copyDirSync(localStorageDir, releaseStorage);
-    console.log('   ↳ Synced current storage assets and markdown into release/storage/');
-  } catch (err) {
-    console.warn('   ↳ Failed copying existing storage, created blank structure instead.');
+// ---------------------------------------------------------------------------
+// 3. Copy the program files (explicit allow-list)
+// ---------------------------------------------------------------------------
+console.log('🚚 Step 3: Copying dist/ frontend assets...');
+copyDirSafe(path.join(ROOT_DIR, 'dist'), path.join(RELEASE_DIR, 'dist'));
+
+console.log('🚚 Step 4: Copying allow-listed backend modules...');
+for (const dir of ALLOWED_SERVER_DIRS) {
+  const src = path.join(ROOT_DIR, 'server', dir);
+  if (fs.existsSync(src)) {
+    copyDirSafe(src, path.join(RELEASE_DIR, 'server', dir));
   }
 }
 
-// 9. Generate standalone production package.json
-console.log('📝 Step 8: Generating release/package.json...');
+console.log('🚚 Step 5: Copying root entry files...');
+for (const file of ALLOWED_ROOT_FILES) {
+  const src = path.join(ROOT_DIR, file);
+  if (fs.existsSync(src)) {
+    copyFileSafe(src, RELEASE_DIR);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Create an EMPTY runtime storage skeleton (no user data)
+// ---------------------------------------------------------------------------
+console.log('🗄️ Step 6: Creating empty runtime storage skeleton (no user data)...');
+const releaseStorage = path.join(RELEASE_DIR, 'storage');
+['documents', 'assets', 'database', 'revisions', 'backups'].forEach(dir => {
+  const target = path.join(releaseStorage, dir);
+  fs.mkdirSync(target, { recursive: true });
+  // .gitkeep keeps the empty structure versionable / visible
+  fs.writeFileSync(path.join(target, '.gitkeep'), '', 'utf-8');
+});
+
+// Never ship the developer's live runtime storage, even if an allow-listed folder
+// accidentally contains data. The source tree storage/ is intentionally untouched.
+
+// ---------------------------------------------------------------------------
+// 5. Generate standalone production package.json
+// ---------------------------------------------------------------------------
+console.log('📝 Step 7: Generating release/package.json...');
 const rootPkg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'package.json'), 'utf-8'));
 
 const releasePkg = {
@@ -95,7 +136,7 @@ const releasePkg = {
     dotenv: rootPkg.dependencies.dotenv || '^17.2.3',
     jszip: rootPkg.dependencies.jszip || '^3.10.2',
     marked: rootPkg.dependencies.marked || '^18.1.2',
-    tsx: rootPkg.devDependencies.tsx || '^4.21.0',
+    tsx: rootPkg.devDependencies?.tsx || '^4.21.0',
   },
 };
 
@@ -105,37 +146,60 @@ fs.writeFileSync(
   'utf-8'
 );
 
-// 10. Write standalone deployment README in release/
-console.log('📄 Step 9: Generating release/README.md guide...');
+// ---------------------------------------------------------------------------
+// 6. Write deployment README
+// ---------------------------------------------------------------------------
+console.log('📄 Step 8: Generating release/README.md guide...');
 const readmeContent = `# InkFlow Knowledge Hub · 生产独立部署包
 
-本文件夹（\`release/\`）包含了在服务器、VPS 或本地生产环境独立运行所需的全部资源：
+本文件夹（\`release/\`）包含了在服务器、VPS 或本地生产环境独立运行所需的全部资源。
+
+**发布包中不含任何运行时数据**：没有数据库、没有用户文档、没有附件、没有历史快照。
 
 \`\`\`
 release/
 ├── dist/             # 已打包编译的前端静态文件 (React + Tailwind)
-├── server/           # 全栈后端服务与 SQLite WAL 数据库驱动
+├── server/           # 全栈后端服务（仅 db/ routes/ services/）
 ├── server.ts         # 生产入口服务
-├── storage/          # 物理数据持久化目录 (Markdown SSOT, SQLite, Assets)
-│   ├── documents/    # Markdown 物理真源文件 (按 docId 独立存储)
-│   ├── database/     # SQLite WAL 数据库文件
-│   ├── assets/       # 上传与粘贴的图片媒体
-│   └── revisions/    # 文档版本快照
+├── storage/          # 空的数据目录骨架（首次启动时自动创建真实数据）
+│   ├── documents/    # Markdown 物理真源文件 (运行时生成)
+│   ├── database/     # SQLite WAL 数据库 (首次启动时创建)
+│   ├── assets/       # 上传的附件 (运行时生成)
+│   ├── revisions/    # 文档版本快照 (运行时生成)
+│   └── backups/      # 备份目录 (运行时生成)
+├── .env.example      # 环境变量模板
 ├── package.json      # 精简的生产依赖声明
 ├── tsconfig.json     # TypeScript 运行配置
 └── README.md
 \`\`\`
 
-## 🚀 生产部署运行步骤（仅需 2 步）
-
-在 \`release/\` 目录下打开终端（PowerShell 或 Bash）：
+## 🚀 生产部署步骤
 
 ### 步骤 1：安装依赖
 \`\`\`bash
 npm install
 \`\`\`
 
-### 步骤 2：启动生产全栈服务
+### 步骤 2：配置环境变量
+复制 \`.env.example\` 为 \`.env\`（或直接使用系统环境变量），并至少配置：
+
+\`\`\`bash
+# 一次性初始化密钥：仅用于创建第一位主理人账号
+# 要求：至少 24 个字符，随机生成，切勿提交到 Git
+# 生成方法：openssl rand -hex 32
+INKFLOW_INIT_KEY="<your-random-64-char-hex-key>"
+
+# 可选：监听端口
+PORT=3000
+
+# 可选：数据目录（默认 ./storage）
+# INKFLOW_DATA_DIR=/var/lib/inkflow
+
+# 可选：反向代理层数（仅当部署在 Nginx/CDN 之后时设置）
+# INKFLOW_TRUST_PROXY=1
+\`\`\`
+
+### 步骤 3：启动生产全栈服务
 \`\`\`bash
 npm start
 \`\`\`
@@ -149,16 +213,49 @@ npm start
 
 在浏览器访问 **http://localhost:3000** 即可。
 
-### 🔑 首次启动与管理员安全初始化
-InkFlow 遵循安全默认原则（Secure by Default），不存在任何预设的弱密码或固定应急恢复码。
-首次启动后在浏览器打开 http://localhost:3000 将自动进入初始化向导，由您设置专属主理人密码并获取一次性应急安全恢复密钥。
+### 🔑 首次启动与管理员安全初始化（SEC-006）
 
+InkFlow 遵循安全默认原则（Secure by Default），**不存在任何预设的弱密码或固定应急恢复码**。
+
+1. 首次启动前，必须在服务端配置 \`INKFLOW_INIT_KEY\`（本发布包不包含任何密钥）。
+   未配置时初始化接口返回 403，初始化入口完全关闭。
+2. 打开 **http://localhost:3000**，在【主理人初始化向导】中填入该初始化密钥。
+3. 设置主理人密码，系统将生成一次性的**应急恢复密钥**（\`INK-XXXX-XXXX-XXXX-XXXX\`），请离线保存。
+4. 初始化成功后，初始化入口**永久关闭**；重复请求返回 403。
+5. 初始化完成后建议从服务器环境中**删除 \`INKFLOW_INIT_KEY\`** 并重启服务。
+
+### 🗂️ 数据与备份
+
+- 运行时数据全部位于 \`storage/\`，请定期备份该目录（数据库 + documents + revisions + assets）。
+- 生产数据库在首次启动时自动创建，**发布包内不包含任何数据库文件**。
+- 若需迁移，停止服务后整体复制 \`storage/\` 即可。
 `;
 
 fs.writeFileSync(path.join(RELEASE_DIR, 'README.md'), readmeContent, 'utf-8');
+
+// ---------------------------------------------------------------------------
+// 7. Post-build security scan (fails the build)
+// ---------------------------------------------------------------------------
+console.log('🔍 Step 9: Scanning release package for sensitive data ...');
+
+const violations = scanRelease(RELEASE_DIR);
+
+if (violations.length > 0) {
+  console.error('\n❌ [InkFlow Release Builder] BUILD FAILED — sensitive data detected in release/:');
+  for (const v of violations) console.error(`   • ${v}`);
+  console.error('\nThe release directory was left in place for inspection. Do NOT deploy it.');
+  process.exit(1);
+}
+
+console.log('✅ Security scan passed: no database, user documents, assets, revisions, .env or logs.');
 
 console.log('\n============================================================');
 console.log('✅ [InkFlow Release Builder] Release folder successfully created at:');
 console.log(`📁 ${RELEASE_DIR}`);
 console.log('You can now copy the entire "release" directory to any server!');
 console.log('============================================================\n');
+
+// Cleanup staging dir if it was ever created
+if (fs.existsSync(STAGING_DIR)) {
+  fs.rmSync(STAGING_DIR, { recursive: true, force: true });
+}

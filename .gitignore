@@ -7,8 +7,27 @@ coverage/
 .env*
 !.env.example
 .aistudio/
-release/dist/
-release/node_modules/
+
+# ---- Runtime data (never commit) ----
+# Markdown SSOT, SQLite database (WAL/SHM), attachments, revision snapshots, backups
+storage/**
+!storage/.gitkeep
+!storage/*/
+!storage/*/.gitkeep
+*.sqlite
 *.sqlite-wal
 *.sqlite-shm
-storage/backups/
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# ---- Generated release bundle (produced by `npm run release`) ----
+release/
+.release-staging/
+
+# ---- Local secrets / key material ----
+*.pem
+*.key
+id_rsa
+secrets/

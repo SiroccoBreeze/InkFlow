@@ -27,6 +27,7 @@ interface LoginPageProps {
 export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   const [mode, setMode] = useState<'login' | 'reset' | 'setup'>('login');
   const [isCheckingInit, setIsCheckingInit] = useState(true);
+  const [canInitialize, setCanInitialize] = useState(false);
 
   // Login inputs
   const [username, setUsername] = useState('owner');
@@ -40,6 +41,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   const [setupEmail, setSetupEmail] = useState('');
   const [setupPassword, setSetupPassword] = useState('');
   const [setupConfirmPassword, setSetupConfirmPassword] = useState('');
+  const [setupInitKey, setSetupInitKey] = useState('');
   const [generatedRecoveryCode, setGeneratedRecoveryCode] = useState<string | null>(null);
   const [hasCopiedCode, setHasCopiedCode] = useState(false);
 
@@ -58,11 +60,15 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Check whether system is initialized on mount
+  // Check whether system is initialized on mount.
+  // The server only reports `canInitialize` when INKFLOW_INIT_KEY is configured.
   useEffect(() => {
     apiClient.getAuthStatus().then(res => {
-      if (res.data && res.data.isInitialized === false) {
-        setMode('setup');
+      if (res.data) {
+        setCanInitialize(Boolean(res.data.canInitialize));
+        if (res.data.isInitialized === false && res.data.canInitialize) {
+          setMode('setup');
+        }
       }
     }).catch(() => {}).finally(() => {
       setIsCheckingInit(false);
@@ -196,6 +202,11 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
       return;
     }
 
+    if (!setupInitKey.trim()) {
+      setErrorMessage('请输入服务端配置的初始化密钥');
+      return;
+    }
+
     if (setupPassword !== setupConfirmPassword) {
       setErrorMessage('两次输入的密码不一致，请核对');
       return;
@@ -211,6 +222,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
 
     try {
       const res = await storage.initOwner({
+        initKey: setupInitKey.trim(),
         username: setupUsername,
         password: setupPassword,
         email: setupEmail || undefined,
@@ -392,6 +404,33 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
           ) : (
             /* Setup Input Form */
             <form onSubmit={handleSetupSubmit} className="space-y-4 text-xs">
+              {!canInitialize ? (
+                <div className="p-3.5 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 text-[11px] leading-relaxed text-amber-800 dark:text-amber-300">
+                  服务端尚未配置初始化密钥（环境变量 <code className="font-mono">INKFLOW_INIT_KEY</code>），
+                  首次初始化已被禁用。请先在服务器上完成配置并重启服务。
+                </div>
+              ) : (
+                <div className="p-3.5 rounded-xl bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900/50 text-[11px] leading-relaxed text-blue-800 dark:text-blue-300">
+                  首次初始化需要验证服务端配置的一次性初始化密钥。该密钥不会保存在浏览器中，且初始化成功后入口将永久关闭。
+                </div>
+              )}
+
+              <div className="space-y-1.5">
+                <label className="font-semibold text-neutral-700 dark:text-neutral-300 flex items-center gap-1.5">
+                  <KeyRound className="w-3.5 h-3.5 text-neutral-400" />
+                  初始化密钥
+                </label>
+                <input
+                  type="password"
+                  value={setupInitKey}
+                  onChange={e => setSetupInitKey(e.target.value)}
+                  placeholder="请输入服务端 INKFLOW_INIT_KEY 配置值"
+                  required
+                  autoComplete="off"
+                  className="w-full px-3.5 py-2.5 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-xl outline-none text-neutral-900 dark:text-neutral-100 font-mono"
+                />
+              </div>
+
               <div className="space-y-1.5">
                 <label className="font-semibold text-neutral-700 dark:text-neutral-300 flex items-center gap-1.5">
                   <User className="w-3.5 h-3.5 text-neutral-400" />
@@ -489,8 +528,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
 
               <button
                 type="submit"
-                disabled={isLoading}
-                className="w-full mt-2 py-3 px-4 rounded-xl font-semibold text-white bg-neutral-900 dark:bg-neutral-100 dark:text-neutral-900 hover:opacity-90 active:scale-[0.99] transition-all flex items-center justify-center gap-2 shadow-lg"
+                disabled={isLoading || !canInitialize}
+                className="w-full mt-2 py-3 px-4 rounded-xl font-semibold text-white bg-neutral-900 dark:bg-neutral-100 dark:text-neutral-900 hover:opacity-90 active:scale-[0.99] transition-all flex items-center justify-center gap-2 shadow-lg disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {isLoading ? (
                   <>

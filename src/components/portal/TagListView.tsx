@@ -13,7 +13,9 @@ export const TagListView: React.FC<TagListViewProps> = ({
   onSelectTag,
   isOwner,
 }) => {
-  const visibleDocs = docs.filter(d => isOwner || d.visibility === 'public');
+  const visibleDocs = docs.filter(
+    d => isOwner || (d.visibility === 'public' && (d.status ?? 'published') === 'published')
+  );
 
   // Compute tag occurrences and docs list
   const tagMap = visibleDocs.reduce((acc, doc) => {
