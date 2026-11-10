@@ -1,0 +1,6 @@
+{
+  "name": "InkFlow 个人知识库",
+  "description": "本地优先的个人知识库分享系统，支持 Markdown 导入导出、标签分类、全文检索、版本管理与多级可见性。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

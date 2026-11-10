@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.aistudio/
+release/dist/
+release/node_modules/
+*.sqlite-wal
+*.sqlite-shm
+storage/backups/
