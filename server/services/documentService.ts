@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { marked } from 'marked';
 import { getDatabase, generateId } from '../db/sqlite';
 import { fileStorage } from './fileStorageService';
 import { assetService } from './assetService';
@@ -95,28 +96,85 @@ export function calculateContentHash(body: string): string {
 }
 
 /**
- * Extracts asset references that are explicitly present in Markdown.
- * Recognized forms:
+ * Normalizes one link/image target and returns the asset ID it refers to.
+ * Only the three supported, explicit reference forms are accepted:
  *   - /api/v1/assets/file/{assetId}      (the canonical URL inserted by the editor)
  *   - attachment:{assetId}               (legacy inline attachment syntax)
  *   - asset:{assetId}                    (explicit asset scheme)
+ * Anything else (external URLs, filenames, arbitrary text) yields null.
+ */
+export function extractAssetIdFromHref(href: unknown): string | null {
+  if (typeof href !== 'string') return null;
+  const value = href.trim();
+  if (!value || /[\u0000-\u001f\u007f\\]/.test(value)) return null;
+
+  // Query strings and fragments are not part of the asset identity.
+  let target = value.replace(/[?#].*$/, '');
+  if (target.startsWith('./')) target = target.slice(2);
+
+  // Supported explicit attachment schemes: attachment:{assetId} / asset:{assetId}
+  const schemeMatch = /^(?:attachment|asset):(.+)$/i.exec(target);
+  if (schemeMatch) {
+    const id = schemeMatch[1];
+    return /^[A-Za-z0-9_-]{1,200}$/.test(id) ? id : null;
+  }
+
+  // Any other scheme (http:, https:, mailto:, data:, file:, javascript:, …) is
+  // never a local asset reference, even if its path looks similar.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith('//')) return null;
+
+  // Canonical editor URL: /api/v1/assets/file/{assetId}
+  const fileMatch = /^\/api\/v1\/assets\/file\/([^/]+)$/i.exec(target);
+  if (!fileMatch) return null;
+
+  const assetId = fileMatch[1];
+  return /^[A-Za-z0-9_-]{1,200}$/.test(assetId) ? assetId : null;
+}
+
+/**
+ * Walks the Markdown token tree and collects asset references from real
+ * image/link nodes only. Code blocks, inline code, raw HTML and plain text are
+ * token types that never carry an `href`, so IDs written there cannot create an
+ * association.
+ */
+function collectAssetIdsFromTokens(tokens: any[] | undefined, found: Set<string>): void {
+  if (!Array.isArray(tokens)) return;
+  for (const token of tokens) {
+    if (!token || typeof token !== 'object') continue;
+
+    if (token.type === 'image' || token.type === 'link') {
+      const assetId = extractAssetIdFromHref(token.href);
+      if (assetId) found.add(assetId);
+    }
+
+    // Recurse into container tokens (paragraph, heading, list, blockquote, table, emphasis, …)
+    collectAssetIdsFromTokens(token.tokens, found);
+    collectAssetIdsFromTokens(token.items, found);
+    if (token.header) collectAssetIdsFromTokens(token.header, found);
+    if (Array.isArray(token.rows)) {
+      for (const row of token.rows) collectAssetIdsFromTokens(row, found);
+    }
+  }
+}
+
+/**
+ * Extracts asset references from Markdown using the parser's token tree.
  * Filenames are deliberately NOT considered references.
  */
 export function extractAssetReferences(markdown: string): string[] {
-  if (!markdown) return [];
-  const ids = new Set<string>();
-  const patterns = [
-    /\/api\/v1\/assets\/file\/([A-Za-z0-9_-]{1,200})/g,
-    /attachment:([A-Za-z0-9_-]{1,200})/g,
-    /asset:([A-Za-z0-9_-]{1,200})/g,
-  ];
-  for (const pattern of patterns) {
-    let match: RegExpExecArray | null;
-    while ((match = pattern.exec(markdown)) !== null) {
-      ids.add(match[1]);
-    }
+  if (!markdown || typeof markdown !== 'string') return [];
+
+  let tokens: any[];
+  try {
+    tokens = marked.lexer(markdown) as any[];
+  } catch {
+    // Unparseable Markdown grants no access (fail-closed).
+    return [];
   }
-  return Array.from(ids);
+
+  const found = new Set<string>();
+  collectAssetIdsFromTokens(tokens, found);
+  return Array.from(found);
 }
 
 export function calculateReadingStats(content: string): { wordCount: number; readingTime: number } {

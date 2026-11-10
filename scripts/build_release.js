@@ -16,18 +16,46 @@ import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { assertSafeReleasePath, scanRelease } from './lib/releaseGuard.js';
+import {
+  ReleaseTargetError,
+  resolveReleaseTarget,
+  removeReleaseDirSafely,
+} from './lib/releaseTarget.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, '..');
-// Test hooks: allow the builder to target another output dir / skip the frontend build.
-const RELEASE_DIR = process.env.INKFLOW_RELEASE_OUT
-  ? path.resolve(process.env.INKFLOW_RELEASE_OUT)
-  : path.join(ROOT_DIR, 'release');
 const SKIP_BUILD = process.env.INKFLOW_RELEASE_SKIP_BUILD === '1';
 const STAGING_DIR = path.join(ROOT_DIR, '.release-staging');
 
 console.log('🚀 [InkFlow Release Builder] Starting production release bundling...');
+
+// ---------------------------------------------------------------------------
+// 0a. Validate the output directory BEFORE doing anything destructive.
+//     INKFLOW_RELEASE_OUT is user-controlled; a bad value must never lead to
+//     the project root or user data being deleted (SEC-012).
+// ---------------------------------------------------------------------------
+const targetOptions = {
+  rootDir: ROOT_DIR,
+  dataDir: process.env.INKFLOW_DATA_DIR
+    ? path.resolve(process.env.INKFLOW_DATA_DIR)
+    : path.join(ROOT_DIR, 'storage'),
+};
+
+let RELEASE_DIR;
+try {
+  ({ releaseDir: RELEASE_DIR } = resolveReleaseTarget(process.env.INKFLOW_RELEASE_OUT, targetOptions));
+} catch (err) {
+  if (err instanceof ReleaseTargetError) {
+    console.error(`\n❌ [InkFlow Release Builder] BUILD ABORTED — unsafe output directory [${err.code}]`);
+    console.error(`   ${err.message}`);
+    console.error('   未删除或修改任何文件。');
+    process.exit(1);
+  }
+  throw err;
+}
+
+console.log(`📁 Output directory (validated): ${RELEASE_DIR}`);
 
 // ---------------------------------------------------------------------------
 // 0. Allow-list of files that may be shipped
@@ -72,10 +100,20 @@ if (SKIP_BUILD) {
 
 // ---------------------------------------------------------------------------
 // 2. Recreate a clean release directory
+//    The target is re-validated immediately before deletion so a symlink swap
+//    between step 0a and here cannot redirect the recursive delete.
 // ---------------------------------------------------------------------------
 console.log('📁 Step 2: Preparing a clean release/ directory...');
-if (fs.existsSync(RELEASE_DIR)) {
-  fs.rmSync(RELEASE_DIR, { recursive: true, force: true });
+try {
+  removeReleaseDirSafely(RELEASE_DIR, targetOptions);
+} catch (err) {
+  if (err instanceof ReleaseTargetError) {
+    console.error(`\n❌ [InkFlow Release Builder] BUILD ABORTED — output directory changed [${err.code}]`);
+    console.error(`   ${err.message}`);
+    console.error('   未删除或修改任何文件。');
+    process.exit(1);
+  }
+  throw err;
 }
 fs.mkdirSync(RELEASE_DIR, { recursive: true });
 

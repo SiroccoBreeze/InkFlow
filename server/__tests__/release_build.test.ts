@@ -154,12 +154,18 @@ describe('SEC-009 Release build excludes all runtime data', () => {
     });
 
     // Simulate `npm install` in the released package: link the runtime dependencies
-    // (express only) instead of performing a real network install.
+    // instead of performing a real network install.
     const releaseNodeModules = path.join(releaseOut, 'node_modules');
     if (!fs.existsSync(releaseNodeModules)) {
       fs.mkdirSync(releaseNodeModules, { recursive: true });
-      for (const dep of ['express']) {
-        fs.symlinkSync(path.join(ROOT_DIR, 'node_modules', dep), path.join(releaseNodeModules, dep), 'dir');
+      const runtimeDeps = Object.keys(
+        JSON.parse(fs.readFileSync(path.join(releaseOut, 'package.json'), 'utf-8')).dependencies || {}
+      ).filter(dep => dep !== 'tsx');
+      for (const dep of runtimeDeps) {
+        const sourceDir = path.join(ROOT_DIR, 'node_modules', dep);
+        if (fs.existsSync(sourceDir)) {
+          fs.symlinkSync(sourceDir, path.join(releaseNodeModules, dep), 'dir');
+        }
       }
     }
 

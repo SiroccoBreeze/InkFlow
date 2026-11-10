@@ -63,17 +63,34 @@ npm run release      # 生成 release/ 生产部署包（含敏感数据自检�
 - 既有文档的状态不会被批量改写；未携带 `visibility/status` 的更新保持原有状态。
 - Markdown 导入默认也是私有草稿（除非 frontmatter 显式声明）。
 
-## 🖼️ 附件匿名访问（SEC-007）
+## 🖼️ 附件匿名访问（SEC-007 / SEC-013）
 
 匿名访问 `GET /api/v1/assets/file/:id` 必须同时满足：
 
-1. 附件被某篇文档**真实引用**（通过解析 Markdown 中的 `/api/v1/assets/file/{id}`、
-   `attachment:{id}`、`asset:{id}` 建立 `document_assets` 关联）；
+1. 附件被某篇文档**真实引用**（通过解析 Markdown 中实际的图片/链接节点建立
+   `document_assets` 关联）；
 2. 该文档 `visibility='public'`；
 3. 该文档 `status='published'`。
 
-`document_assets` 关联表在每次保存文档、以及服务启动时从 Markdown 重新同步。
-**不会**因为文件名或 ID 字符串出现在正文中而授权。
+引用识别基于 Markdown **Token 树**（`marked.lexer`），只从 `image` / `link` 节点的
+目标地址中提取附件 ID，支持三种正式写法：
+
+| 写法 | 示例 |
+| --- | --- |
+| 编辑器标准 URL | `![图](/api/v1/assets/file/ast_xxx)` |
+| 旧版内联附件 | `![图](attachment:ast_xxx)` |
+| 显式附件协议 | `![图](asset:ast_xxx)` |
+
+以下情况**不会**建立关联，也不会获得匿名访问权限：
+
+- fenced code block / 行内代码中的 ID；
+- 普通正文文本中出现的 ID；
+- 原始 HTML `<img src="...">`；
+- 文件名或相似字符串（如 `secret-plans.png`、`ast_xxx_extra`）；
+- 外部域名或其他协议（`https://…`、`//…`、`javascript:`、`data:`）。
+
+`document_assets` 关联表在每次保存文档、以及服务启动时从 Markdown 重新同步，
+取消发布或删除引用后匿名访问立即失效。
 
 ## 🗄️ 数据目录与 Git（SEC-008）
 
@@ -95,7 +112,7 @@ storage/
 > ⚠️ 如果历史上曾提交过数据库或用户数据，请先备份再评估是否需要
 > `git filter-repo` 清理历史（本仓库不会自动重写历史）。
 
-## 📦 生产发布包（SEC-009）
+## 📦 生产发布包（SEC-009 / SEC-012）
 
 ```bash
 npm run release
@@ -106,6 +123,26 @@ npm run release
 - 构建结束后自动扫描，发现 SQLite/WAL/SHM、用户文档、附件、修订、`.env`、密钥、日志
   则**构建失败**并列出违规路径。
 - 生产数据库在首次启动时自动创建，并在主理人完成初始化后写入公开示例文档。
+
+### 输出目录安全限制（SEC-012）
+
+构建会**先删除**输出目录再重建，因此 `INKFLOW_RELEASE_OUT` 在使用前会被严格校验，
+任何危险取值都会在删除**之前**直接终止构建（退出码 1，不修改任何文件）：
+
+| 取值 | 结果 |
+| --- | --- |
+| 缺省 | `<项目>/release`（唯一的生产输出位置） |
+| `<项目>/release` 绝对路径 | 允许 |
+| 临时目录下 `inkflow_release_*` / `inkflow-release-*` 直接子目录 | 允许（仅测试构建） |
+| 项目根目录、其父目录、文件系统根、用户主目录、临时目录本身 | 拒绝 `FORBIDDEN_TARGET` |
+| `storage/`（运行时数据）及其内部任意路径 | 拒绝 `DATA_DIR_CONFLICT` |
+| `.git/`、`src/`、`server/`、`scripts/`、`dist/`、`docs/`、`node_modules/` | 拒绝 `PROTECTED_PATH` |
+| 相对路径、含控制字符/首尾空白的路径 | 拒绝 `RELATIVE_PATH` / `INVALID_PATH` |
+| 指向上述位置的符号链接、悬空链接、非目录路径 | 拒绝 `SYMLINK_TARGET` / `NOT_A_DIRECTORY` |
+| 其他任意位置 | 拒绝 `OUTSIDE_ALLOWED_BASE` |
+
+校验使用 `realpath` 与路径包含关系，并在真正删除前**再次校验**，防止校验与删除之间
+目录被替换为符号链接。
 
 部署：
 
