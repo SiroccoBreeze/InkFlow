@@ -26,7 +26,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, '..');
 const SKIP_BUILD = process.env.INKFLOW_RELEASE_SKIP_BUILD === '1';
-const STAGING_DIR = path.join(ROOT_DIR, '.release-staging');
 
 console.log('🚀 [InkFlow Release Builder] Starting production release bundling...');
 
@@ -293,7 +292,6 @@ console.log(`📁 ${RELEASE_DIR}`);
 console.log('You can now copy the entire "release" directory to any server!');
 console.log('============================================================\n');
 
-// Cleanup staging dir if it was ever created
-if (fs.existsSync(STAGING_DIR)) {
-  fs.rmSync(STAGING_DIR, { recursive: true, force: true });
-}
+// NOTE (SEC-014): no post-build cleanup runs here. The only directory this script
+// may delete is the validated RELEASE_DIR (see removeReleaseDirSafely above); any
+// other recursive deletion would bypass the path checks in scripts/lib/releaseTarget.js.
