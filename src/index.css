@@ -29,6 +29,144 @@
 .markdown-body {
   color: inherit;
   line-height: 1.8;
+  /* Long unbroken strings (URLs, hashes, pasted text) must wrap instead of
+     pushing the reading column wider than its container. */
+  overflow-wrap: break-word;
+  word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/*
+ * Reader-only image presentation.
+ * Every selector is scoped to `.markdown-body--zoomable`, a class only the
+ * article reader sets, so the admin dashboard, editor previews and other pages
+ * keep their existing image styling.
+ * Width/height stay `auto` with max-* constraints: the browser scales the image
+ * proportionally and never stretches, compresses or crops the file itself.
+ */
+.markdown-body--zoomable img {
+  cursor: zoom-in;
+  max-width: 100%;
+  max-height: 520px; /* desktop: ordinary images */
+  width: auto;
+  height: auto;
+}
+
+/* Frame added by the reader so long screenshots can be height-capped with a
+   fade-out hint while the Lightbox still opens the untouched original. */
+.markdown-body--zoomable .article-img-frame {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  margin: 1.5rem auto;
+  vertical-align: middle;
+  line-height: 0;
+}
+
+.markdown-body--zoomable .article-img-frame > img {
+  display: block;
+  margin: 0 auto;
+}
+
+/* Tall screenshots keep their full rendered width (text stays readable); only
+   the preview height is clipped, and the fade signals there is more below. */
+.markdown-body--zoomable .article-img-frame--tall {
+  max-height: 420px;
+  overflow: hidden;
+  border-radius: 0.75rem;
+}
+
+.markdown-body--zoomable .article-img-frame--tall > img {
+  max-height: none;
+}
+
+.markdown-body--zoomable .article-img-fade {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 96px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.96));
+}
+
+.dark .markdown-body--zoomable .article-img-fade {
+  background: linear-gradient(to bottom, rgba(23, 23, 23, 0), rgba(23, 23, 23, 0.96));
+}
+
+.markdown-body--zoomable .article-img-frame--tall .article-img-fade {
+  display: block;
+}
+
+/* Hover affordance: a small "click to enlarge" pill */
+.markdown-body--zoomable .article-img-hint {
+  position: absolute;
+  right: 0.6rem;
+  bottom: 0.6rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 9999px;
+  background: rgba(0, 0, 0, 0.68);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+
+.markdown-body--zoomable .article-img-hint svg {
+  flex: none;
+}
+
+.markdown-body--zoomable .article-img-frame:hover .article-img-hint,
+.markdown-body--zoomable .article-img-frame:focus-within .article-img-hint {
+  opacity: 1;
+}
+
+/* Touch devices have no hover: keep the "view full image" cue visible on long
+   screenshots so the fade is clearly actionable. */
+@media (hover: none) {
+  .markdown-body--zoomable .article-img-frame--tall .article-img-hint {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 640px) {
+  .markdown-body--zoomable img {
+    max-height: 360px;
+  }
+
+  .markdown-body--zoomable .article-img-frame--tall {
+    max-height: 360px;
+  }
+
+  .markdown-body--zoomable .article-img-frame--tall > img {
+    max-height: none;
+  }
+}
+
+@media print {
+  .markdown-body--zoomable .article-img-frame--tall {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .markdown-body--zoomable .article-img-fade,
+  .markdown-body--zoomable .article-img-hint {
+    display: none !important;
+  }
+}
+
+/* Local assets are fetched with the session token before they can be displayed;
+   holding the frame hidden avoids a broken-image icon on every preview re-render. */
+.markdown-body img[data-inkflow-pending='1'] {
+  visibility: hidden;
 }
 
 .markdown-body h1 {
@@ -149,7 +287,12 @@
 }
 
 .markdown-body table {
+  /* display:block lets a wide table scroll inside the article instead of
+     stretching the whole page content area. */
+  display: block;
   width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
   margin-top: 1.25rem;
   margin-bottom: 1.25rem;

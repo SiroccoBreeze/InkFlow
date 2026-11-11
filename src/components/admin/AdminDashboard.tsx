@@ -33,7 +33,7 @@ import {
   Calendar,
   Layers,
 } from 'lucide-react';
-import { Category, DocVisibility, KnowledgeDoc } from '../../types';
+import { Category, DocStatus, DocVisibility, KnowledgeDoc } from '../../types';
 import { storage } from '../../services/storage';
 import { apiClient } from '../../services/apiClient';
 import { DocEditor } from './DocEditor';
@@ -50,6 +50,12 @@ interface AdminDashboardProps {
   onViewDoc: (doc: KnowledgeDoc) => void;
   onLogout?: () => void;
 }
+
+const DOC_STATUS_LABELS: Record<DocStatus, string> = {
+  draft: '草稿',
+  published: '已发布',
+  archived: '已归档',
+};
 
 const CATEGORY_COLORS: Record<string, string> = {
   '架构与系统': '#0284c7', // Sky Blue
@@ -78,6 +84,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Filters for Document List
   const [searchQuery, setSearchQuery] = useState('');
   const [filterVisibility, setFilterVisibility] = useState<string>('all');
+  const [filterStatus, setFilterStatus] = useState<string>('all');
   const [filterCategory, setFilterCategory] = useState<string>('all');
   const [filterTag, setFilterTag] = useState<string>('all');
   const [filterPinnedOnly, setFilterPinnedOnly] = useState(false);
@@ -95,6 +102,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Batch selection
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]);
   const [batchMoveCat, setBatchMoveCat] = useState<string>('');
+  const [batchStatus, setBatchStatus] = useState<DocStatus | ''>('');
 
   // Category management form states
   const [newCatName, setNewCatName] = useState('');
@@ -148,7 +156,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Reset pagination on filter change
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchQuery, filterVisibility, filterCategory, filterTag, filterPinnedOnly, sortOrder]);
+  }, [searchQuery, filterVisibility, filterStatus, filterCategory, filterTag, filterPinnedOnly, sortOrder]);
 
   const showStatus = (msg: string) => {
     setStatusMessage(msg);
@@ -172,6 +180,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     let result = docs.filter(doc => {
       if (filterPinnedOnly && !doc.pinned) return false;
       if (filterVisibility !== 'all' && doc.visibility !== filterVisibility) return false;
+      // Legacy documents without a status field were published before statuses existed
+      if (filterStatus !== 'all' && (doc.status ?? 'published') !== filterStatus) return false;
       if (filterCategory !== 'all' && doc.category !== filterCategory) return false;
       if (filterTag !== 'all' && (!doc.tags || !doc.tags.includes(filterTag))) return false;
       if (searchQuery.trim()) {
@@ -207,7 +217,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
       }
     });
-  }, [docs, filterPinnedOnly, filterVisibility, filterCategory, filterTag, searchQuery, sortOrder]);
+  }, [docs, filterPinnedOnly, filterVisibility, filterStatus, filterCategory, filterTag, searchQuery, sortOrder]);
 
   // Pagination calculation
   const totalPages = Math.max(1, Math.ceil(filteredDocs.length / pageSize));
@@ -263,6 +273,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     );
     onRefreshData();
     showStatus(`已更新「${doc.title}」分类为「${newCat}」`);
+  };
+
+  const handleQuickStatusChange = (doc: KnowledgeDoc, newStatus: DocStatus) => {
+    storage.saveDoc(
+      {
+        ...doc,
+        status: newStatus,
+      },
+      `修改发布状态为 ${newStatus}`
+    );
+    onRefreshData();
+    showStatus(`已更新「${doc.title}」为「${DOC_STATUS_LABELS[newStatus]}」`);
   };
 
   const handleQuickPinToggle = (doc: KnowledgeDoc) => {
@@ -377,6 +399,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setSelectedDocIds([]);
     onRefreshData();
     showStatus(`已将选中的 ${selectedDocIds.length} 篇文档批量设为 ${newVis}`);
+  };
+
+  const handleBatchSetStatus = (newStatus: DocStatus) => {
+    if (selectedDocIds.length === 0) return;
+    selectedDocIds.forEach(id => {
+      const doc = storage.getDocById(id);
+      if (doc) {
+        storage.saveDoc(
+          {
+            ...doc,
+            status: newStatus,
+          },
+          `批量修改发布状态为 ${newStatus}`
+        );
+      }
+    });
+    setSelectedDocIds([]);
+    setBatchStatus('');
+    onRefreshData();
+    showStatus(`已将选中的 ${selectedDocIds.length} 篇文档批量设为「${DOC_STATUS_LABELS[newStatus]}」`);
   };
 
   const handleBatchMoveCategory = () => {
@@ -681,6 +723,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     filterCategory !== 'all' ||
     filterTag !== 'all' ||
     filterVisibility !== 'all' ||
+    filterStatus !== 'all' ||
     filterPinnedOnly;
 
   return (
@@ -913,6 +956,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <option value="private">🔒 私密</option>
               </select>
 
+              {/* Publish Status Filter */}
+              <select
+                value={filterStatus}
+                onChange={e => setFilterStatus(e.target.value)}
+                className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-neutral-700 dark:text-neutral-300 rounded-lg px-2.5 py-1.5 text-xs outline-none cursor-pointer hover:border-neutral-400"
+                title="按发布状态筛选"
+              >
+                <option value="all">全部状态</option>
+                <option value="draft">📝 草稿</option>
+                <option value="published">✅ 已发布</option>
+                <option value="archived">📦 已归档</option>
+              </select>
+
               {/* Pinned filter toggle */}
               <button
                 onClick={() => setFilterPinnedOnly(!filterPinnedOnly)}
@@ -935,6 +991,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     setFilterCategory('all');
                     setFilterTag('all');
                     setFilterVisibility('all');
+                    setFilterStatus('all');
                     setFilterPinnedOnly(false);
                   }}
                   className="text-neutral-400 hover:text-rose-500 text-xs underline"
@@ -1032,6 +1089,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   设为未公开
                 </button>
 
+                <span className="opacity-30">|</span>
+
+                {/* Batch publish-status update */}
+                <div className="flex items-center gap-1 bg-white/10 dark:bg-neutral-200 px-2 py-0.5 rounded">
+                  <span className="text-[11px] opacity-75">状态:</span>
+                  <select
+                    value={batchStatus}
+                    onChange={e => setBatchStatus(e.target.value as DocStatus | '')}
+                    className="bg-transparent text-xs text-white dark:text-neutral-900 outline-none cursor-pointer"
+                    title="批量修改发布状态"
+                  >
+                    <option value="" className="text-neutral-900">修改为...</option>
+                    <option value="draft" className="text-neutral-900">草稿</option>
+                    <option value="published" className="text-neutral-900">已发布</option>
+                    <option value="archived" className="text-neutral-900">已归档</option>
+                  </select>
+                  {batchStatus && (
+                    <button
+                      onClick={() => handleBatchSetStatus(batchStatus)}
+                      className="px-1.5 py-0.5 rounded bg-emerald-500 text-white font-bold text-[10px]"
+                    >
+                      确定
+                    </button>
+                  )}
+                </div>
+
                 <div className="flex items-center gap-1 bg-white/10 dark:bg-neutral-200 px-2 py-0.5 rounded">
                   <span className="text-[11px] opacity-75">移动至:</span>
                   <select
@@ -1102,6 +1185,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <th className="py-2.5 px-3">标题与元数据</th>
                       <th className="py-2.5 px-3 w-36">分类</th>
                       <th className="py-2.5 px-3 w-28">可见性</th>
+                      <th className="py-2.5 px-3 w-24">状态</th>
                       <th className="py-2.5 px-3 w-20">字数</th>
                       <th className="py-2.5 px-3 w-28">更新时间</th>
                       <th className="py-2.5 px-3 w-36 text-right">操作</th>
@@ -1110,7 +1194,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <tbody className="divide-y divide-neutral-100 dark:divide-neutral-800">
                     {paginatedDocs.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="py-12 text-center text-neutral-400">
+                        <td colSpan={8} className="py-12 text-center text-neutral-400">
                           <FileText className="w-7 h-7 text-neutral-300 dark:text-neutral-700 mx-auto mb-2" />
                           <div className="font-medium text-xs text-neutral-700 dark:text-neutral-300">
                             未匹配到相关文档
@@ -1122,6 +1206,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                 setFilterCategory('all');
                                 setFilterTag('all');
                                 setFilterVisibility('all');
+                                setFilterStatus('all');
                                 setFilterPinnedOnly(false);
                               }}
                               className="mt-2 text-xs text-blue-600 dark:text-blue-400 underline"
@@ -1234,6 +1319,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                                 <option value="public">公开</option>
                                 <option value="unlisted">未公开</option>
                                 <option value="private">私密</option>
+                              </select>
+                            </td>
+
+                            {/* Publish status with in-place selector */}
+                            <td className="py-2.5 px-3 whitespace-nowrap">
+                              <select
+                                value={doc.status ?? 'published'}
+                                onChange={e =>
+                                  handleQuickStatusChange(doc, e.target.value as DocStatus)
+                                }
+                                title="发布状态"
+                                className={`text-[11px] font-mono px-2 py-0.5 rounded-md border outline-none cursor-pointer ${
+                                  (doc.status ?? 'published') === 'published'
+                                    ? 'bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/60 dark:text-sky-300 dark:border-sky-800'
+                                    : (doc.status ?? 'published') === 'archived'
+                                    ? 'bg-neutral-100 text-neutral-600 border-neutral-300 dark:bg-neutral-800 dark:text-neutral-300 dark:border-neutral-700'
+                                    : 'bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/60 dark:text-indigo-300 dark:border-indigo-800'
+                                }`}
+                              >
+                                <option value="draft">草稿</option>
+                                <option value="published">已发布</option>
+                                <option value="archived">已归档</option>
                               </select>
                             </td>
 

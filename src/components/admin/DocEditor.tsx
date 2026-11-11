@@ -50,6 +50,7 @@ import {
 } from '../../services/markdown';
 import { VersionHistoryModal } from './VersionHistoryModal';
 import { AttachmentManager } from './AttachmentManager';
+import { hydrateAuthedImages } from '../../services/assetImages';
 
 interface DocEditorProps {
   initialDoc?: KnowledgeDoc | null;
@@ -132,6 +133,11 @@ export const DocEditor: React.FC<DocEditorProps> = ({
   const [uploadToast, setUploadToast] = useState<string | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // The fullscreen overlay renders its own textarea; the toolbar/insert helpers
+  // must target whichever editor the user is actually typing in.
+  const fullscreenTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const fullscreenPreviewRef = useRef<HTMLDivElement>(null);
 
   // Unified available tags list from storage and props
   const availableTagsList = useMemo(() => {
@@ -332,7 +338,9 @@ export const DocEditor: React.FC<DocEditorProps> = ({
 
   // Insert markdown syntax helper
   const insertText = (before: string, after: string = '', defaultText: string = '') => {
-    const textarea = textareaRef.current;
+    const textarea = isFullscreen ? fullscreenTextareaRef.current : textareaRef.current;
+    // The fullscreen overlay hides the inline textarea; without its own ref there
+    // is no cursor to insert at, so append to the end of the document instead.
     if (!textarea) {
       handleMarkdownChange(rawMarkdown + (rawMarkdown.endsWith('\n') ? '' : '\n') + before + defaultText + after);
       return;
@@ -442,6 +450,14 @@ export const DocEditor: React.FC<DocEditorProps> = ({
       }
     }
   };
+
+  // Local asset images require the owner token, which a bare <img src> cannot send.
+  // After each preview render, swap those sources for authenticated object URLs so
+  // a freshly pasted screenshot shows up in the right-hand preview immediately.
+  useEffect(() => {
+    const cleanups = [hydrateAuthedImages(previewRef.current), hydrateAuthedImages(fullscreenPreviewRef.current)];
+    return () => cleanups.forEach(fn => fn());
+  }, [rawMarkdown, editorMode, isFullscreen]);
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
@@ -869,6 +885,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
             <div className="p-6 sm:p-10 overflow-y-auto max-h-[700px] bg-white dark:bg-neutral-900">
               {rawMarkdown.trim() ? (
                 <div
+                  ref={previewRef}
                   className="markdown-body"
                   dangerouslySetInnerHTML={{ __html: renderMarkdown(rawMarkdown) }}
                 />
@@ -989,8 +1006,13 @@ export const DocEditor: React.FC<DocEditorProps> = ({
             >
                 {(editorMode === 'split' || editorMode === 'edit') && (
                   <textarea
+                    ref={fullscreenTextareaRef}
                     value={rawMarkdown}
                     onChange={e => handleMarkdownChange(e.target.value)}
+                    onPaste={handlePaste}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
                     placeholder="在此沉浸专注编写 Markdown 正文..."
                     className="w-full h-full p-8 text-base font-mono leading-relaxed bg-transparent text-neutral-900 dark:text-neutral-100 outline-none resize-none"
                     spellCheck={false}
@@ -1001,6 +1023,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
                 {(editorMode === 'split' || editorMode === 'preview') && (
                   <div className="p-8 sm:p-12 overflow-y-auto h-full bg-white dark:bg-neutral-900">
                     <div
+                      ref={fullscreenPreviewRef}
                       className="markdown-body max-w-3xl mx-auto"
                       dangerouslySetInnerHTML={{ __html: renderMarkdown(rawMarkdown) }}
                     />

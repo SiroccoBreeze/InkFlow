@@ -24,9 +24,11 @@ import {
   Clock,
   Sparkles,
   Info,
+  ZoomIn,
 } from 'lucide-react';
 import { Attachment, KnowledgeDoc, UserSession, WikiBacklink } from '../../types';
 import { storage } from '../../services/storage';
+import { hydrateAuthedImages, isLocalAssetUrl, loadAuthedAssetUrl } from '../../services/assetImages';
 import {
   extractTableOfContents,
   parseFrontmatter,
@@ -34,6 +36,7 @@ import {
   serializeToMarkdown,
 } from '../../services/markdown';
 import { DocComments } from './DocComments';
+import { isTallArticleImage } from '../../services/articleImageLayout';
 
 interface ArticleReaderProps {
   doc: KnowledgeDoc;
@@ -48,6 +51,53 @@ interface ArticleReaderProps {
 type FontSize = 'sm' | 'base' | 'lg' | 'xl';
 type FontFamily = 'sans' | 'serif' | 'mono';
 type ContainerWidth = 'cozy' | 'standard' | 'wide';
+
+// Inline magnifier used by the hover hint pill (static markup, no user data).
+const ZOOM_HINT_SVG =
+  '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path><path d="M11 8v6"></path><path d="M8 11h6"></path></svg>';
+
+/**
+ * Wraps each image in a presentation frame so the reader can cap preview height
+ * (with a fade for long screenshots) without touching the original file. The
+ * existing Lightbox click delegation keeps working because the <img> stays in
+ * the article container. Reader-only: this function is never called elsewhere.
+ */
+function decorateArticleImages(root: HTMLElement): void {
+  const images = Array.from(root.querySelectorAll<HTMLImageElement>('img'));
+  for (const img of images) {
+    if (img.closest('.article-img-frame')) continue;
+
+    const frame = document.createElement('span');
+    frame.className = 'article-img-frame';
+
+    const fade = document.createElement('span');
+    fade.className = 'article-img-fade';
+    fade.setAttribute('aria-hidden', 'true');
+
+    const hint = document.createElement('span');
+    hint.className = 'article-img-hint';
+    hint.setAttribute('aria-hidden', 'true');
+    hint.innerHTML = `${ZOOM_HINT_SVG}<span>点击放大</span>`;
+    const hintLabel = hint.querySelector('span');
+
+    img.parentNode?.insertBefore(frame, img);
+    frame.appendChild(img);
+    frame.appendChild(fade);
+    frame.appendChild(hint);
+
+    // naturalWidth/naturalHeight are zero until the (possibly authenticated)
+    // asset finishes loading, so classify after the load event when needed.
+    const classify = () => {
+      const isTall = isTallArticleImage(img.naturalWidth, img.naturalHeight);
+      frame.classList.toggle('article-img-frame--tall', isTall);
+      if (hintLabel) hintLabel.textContent = isTall ? '查看完整长图' : '点击放大';
+    };
+
+    if (img.complete && img.naturalWidth > 0) classify();
+    else img.addEventListener('load', classify, { once: true });
+  }
+}
 
 export const ArticleReader: React.FC<ArticleReaderProps> = ({
   doc,
@@ -68,6 +118,10 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
   const [showMobileToc, setShowMobileToc] = useState(false);
   const [showBackToTop, setShowBackToTop] = useState(false);
   const [zenMode, setZenMode] = useState(false);
+  // Image lightbox: resolved source, accessible description, and whether the
+  // original is a long screenshot (then it scrolls at readable width instead of
+  // being squeezed to fit one viewport height).
+  const [lightbox, setLightbox] = useState<{ src: string; alt: string; tall: boolean } | null>(null);
 
   // Bookmark state persisted locally
   const [isBookmarked, setIsBookmarked] = useState<boolean>(() => {
@@ -175,6 +229,57 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
     setActiveHeadingId('');
     setReadProgress(0);
   }, [doc.id]);
+
+  // Private assets need the owner token, which plain <img src> requests cannot send.
+  useEffect(() => {
+    const cleanup = hydrateAuthedImages(contentRef.current);
+    return cleanup;
+  }, [renderedHtml, zenMode]);
+
+  // Reader-only image presentation: frame each inline image so long screenshots
+  // are height-capped with a fade, and every image shows a hover zoom affordance.
+  useEffect(() => {
+    if (contentRef.current) decorateArticleImages(contentRef.current);
+  }, [renderedHtml, zenMode]);
+
+  // Click an inline image to open the lightbox preview
+  useEffect(() => {
+    const container = contentRef.current;
+    if (!container) return;
+
+    const handleImageClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!(target instanceof HTMLImageElement) || !container.contains(target)) return;
+      e.preventDefault();
+      const src = target.currentSrc || target.src || target.getAttribute('src') || '';
+      if (!src) return;
+
+      const alt = target.alt || '';
+      const tall = isTallArticleImage(target.naturalWidth, target.naturalHeight);
+
+      // Assets not hydrated yet would 403 in the lightbox; resolve with the token first.
+      if (isLocalAssetUrl(src)) {
+        loadAuthedAssetUrl(src).then(resolved => {
+          if (resolved) setLightbox({ src: resolved, alt, tall });
+        });
+        return;
+      }
+      setLightbox({ src, alt, tall });
+    };
+
+    container.addEventListener('click', handleImageClick);
+    return () => container.removeEventListener('click', handleImageClick);
+  }, [renderedHtml]);
+
+  // Close the lightbox with Escape
+  useEffect(() => {
+    if (!lightbox) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLightbox(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [lightbox]);
 
   // Click delegation for [[WikiLinks]] inside rendered HTML
   useEffect(() => {
@@ -367,7 +472,7 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
                 {Math.round(readProgress)}%
               </span>
               <span aria-hidden="true">·</span>
-              <span className="truncate">{doc.title}</span>
+              <span className="truncate" title={doc.title}>{doc.title}</span>
             </div>
 
             {/* Action cluster */}
@@ -592,7 +697,7 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
         <div className={`grid grid-cols-1 ${zenMode ? 'grid-cols-1' : 'lg:grid-cols-12'} gap-8 lg:gap-12`}>
           
           {/* Main Article Content Column (Left, Span 8) */}
-          <article className={`${zenMode ? 'w-full' : 'lg:col-span-8'} bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-6 sm:p-12 shadow-xs transition-all`}>
+          <article className={`${zenMode ? 'w-full' : 'lg:col-span-8'} min-w-0 max-w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-6 sm:p-12 shadow-xs transition-all`}>
             
             {/* Breadcrumbs (hidden in zen mode) */}
             {!zenMode && (
@@ -608,7 +713,7 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
                   {doc.category}
                 </span>
                 <span aria-hidden="true">/</span>
-                <span className="text-neutral-400 truncate max-w-xs">{doc.title}</span>
+                <span className="text-neutral-400 truncate max-w-xs" title={doc.title}>{doc.title}</span>
               </div>
             )}
 
@@ -657,7 +762,7 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
             {/* Markdown Body Content with Custom Font Size */}
             <div
               ref={contentRef}
-              className={`markdown-body ${fontSizeClass}`}
+              className={`markdown-body markdown-body--zoomable ${fontSizeClass}`}
               dangerouslySetInnerHTML={{ __html: renderedHtml }}
             />
 
@@ -747,7 +852,7 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
 
           {/* Sticky Sidebar Column (Span 4) on the Right - Hidden in Zen Mode */}
           {!zenMode && (
-            <aside className="lg:col-span-4 no-print">
+            <aside className="lg:col-span-4 min-w-0 no-print">
               <div className="sticky top-24 max-h-[calc(100vh-110px)] flex flex-col space-y-4">
                 
                 {/* Table of Contents */}
@@ -767,6 +872,8 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
                           <a
                             key={item.id}
                             href={`#${item.id}`}
+                            title={item.text}
+                            aria-label={item.text}
                             onClick={e => {
                               e.preventDefault();
                               const el = document.getElementById(item.id);
@@ -912,6 +1019,8 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
                   <a
                     key={item.id}
                     href={`#${item.id}`}
+                    title={item.text}
+                    aria-label={item.text}
                     onClick={e => {
                       e.preventDefault();
                       setShowMobileToc(false);
@@ -940,6 +1049,59 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
         <div className="fixed bottom-6 right-6 z-50 bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 px-4 py-2.5 rounded-xl shadow-xl text-xs font-medium animate-fade-in flex items-center gap-2">
           <Info className="w-4 h-4 text-amber-400 dark:text-amber-600 shrink-0" />
           <span>{toastNotice}</span>
+        </div>
+      )}
+
+      {/* Image Lightbox — click an inline image to view it enlarged */}
+      {lightbox && (
+        <div
+          className={`fixed inset-0 z-[60] bg-neutral-950/90 backdrop-blur-sm cursor-zoom-out animate-fade-in no-print ${
+            lightbox.tall
+              ? 'overflow-y-auto p-4 sm:p-8'
+              : 'flex items-center justify-center p-4 sm:p-10'
+          }`}
+          onClick={() => setLightbox(null)}
+          role="dialog"
+          aria-modal="true"
+          aria-label={lightbox.alt || '图片预览'}
+        >
+          <button
+            type="button"
+            onClick={() => setLightbox(null)}
+            className="fixed top-4 right-4 z-10 p-2 rounded-full bg-white/10 text-white hover:bg-white/20 transition-colors"
+            title="关闭预览 (ESC)"
+          >
+            <X className="w-5 h-5" />
+          </button>
+
+          {lightbox.alt && (
+            <div className="fixed top-0 left-0 right-0 z-[5] px-16 py-4 text-center text-xs text-white/70 truncate pointer-events-none">
+              {lightbox.alt}
+            </div>
+          )}
+
+          {lightbox.tall ? (
+            // Long screenshots: keep a readable width and let the viewer scroll,
+            // instead of squeezing the whole capture into one viewport height.
+            <img
+              src={lightbox.src}
+              alt={lightbox.alt}
+              className="block w-auto h-auto max-w-[95vw] mx-auto my-16 rounded-lg shadow-2xl cursor-default"
+              onClick={e => e.stopPropagation()}
+            />
+          ) : (
+            <img
+              src={lightbox.src}
+              alt={lightbox.alt}
+              className="max-w-full max-h-full object-contain rounded-lg shadow-2xl cursor-default"
+              onClick={e => e.stopPropagation()}
+            />
+          )}
+
+          <div className="fixed bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1.5 text-[11px] text-white/50 pointer-events-none">
+            <ZoomIn className="w-3.5 h-3.5" />
+            <span>点击背景或按 ESC 关闭</span>
+          </div>
         </div>
       )}
 
