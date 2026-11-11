@@ -567,16 +567,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     showStatus(`标签 #${tag} 已录入系统字典`);
   };
 
-  const handleSaveRenameTag = (oldTag: string) => {
+  const handleSaveRenameTag = async (oldTag: string) => {
     const newTag = editingTagNewName.trim().replace(/^#/, '');
     if (!newTag || newTag === oldTag) {
       setEditingTagOldName(null);
       return;
     }
-    storage.renameTag(oldTag, newTag);
     setEditingTagOldName(null);
+    const result = await storage.renameTag(oldTag, newTag);
     onRefreshData();
-    showStatus(`已将标签 #${oldTag} 重命名为 #${newTag}`);
+    if (!result) return;
+    if (result.failed === 0) {
+      showStatus(
+        result.dictionaryCleanupFailed
+          ? `已将 #${oldTag} 重命名为 #${newTag}（${result.succeeded} 篇），旧标签字典清理失败`
+          : `已将标签 #${oldTag} 重命名为 #${newTag}`
+      );
+    } else {
+      showStatus(
+        `标签重命名部分成功：${result.succeeded} 篇已更新，${result.failed} 篇保存失败并保留原标签`
+      );
+    }
   };
 
   const handleDeleteTag = (tag: string) => {
@@ -587,11 +598,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       confirmText: '删除标签',
       isDestructive: true,
       type: 'danger',
-      onConfirm: () => {
+      onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
-        storage.deleteTag(tag);
+        const result = await storage.deleteTag(tag);
         onRefreshData();
-        showStatus(`已移除标签 #${tag}`);
+        if (result.failed === 0) {
+          showStatus(
+            result.dictionaryCleanupFailed
+              ? `已从 ${result.succeeded} 篇文档移除标签 #${tag}，但服务端标签字典清理失败`
+              : `已移除标签 #${tag}`
+          );
+        } else {
+          showStatus(
+            `标签删除部分成功：${result.succeeded} 篇已更新，${result.failed} 篇保存失败并保留该标签`
+          );
+        }
       },
     });
   };
@@ -608,13 +629,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       message: `确定将标签 #${mergeSourceTag} 合并至 #${mergeTargetTag} 吗？所有关联文档将统一变更为新标签。`,
       confirmText: '确认合并',
       type: 'warning',
-      onConfirm: () => {
+      onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
-        storage.mergeTags(mergeSourceTag, mergeTargetTag);
+        const from = mergeSourceTag;
+        const to = mergeTargetTag;
+        const result = await storage.mergeTags(from, to);
         setMergeSourceTag('');
         setMergeTargetTag('');
         onRefreshData();
-        showStatus(`已合并标签 #${mergeSourceTag} 至 #${mergeTargetTag}`);
+        if (!result) return;
+        if (result.failed === 0) {
+          showStatus(
+            result.dictionaryCleanupFailed
+              ? `已将 #${from} 合并至 #${to}（${result.succeeded} 篇），旧标签字典清理失败`
+              : `已合并标签 #${from} 至 #${to}`
+          );
+        } else {
+          showStatus(
+            `标签合并部分成功：${result.succeeded} 篇已更新，${result.failed} 篇保存失败并保留原标签`
+          );
+        }
       },
     });
   };

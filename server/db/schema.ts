@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS documents (
   visibility TEXT NOT NULL DEFAULT 'private' CHECK(visibility IN ('public', 'private', 'unlisted')),
   status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'published', 'archived')),
   content_hash TEXT NOT NULL,
+  -- Full-document hash (frontmatter + body) used as the cross-filesystem commit
+  -- marker for crash recovery. content_hash keeps its body-only semantics.
+  document_hash TEXT,
   word_count INTEGER NOT NULL DEFAULT 0,
   reading_time INTEGER NOT NULL DEFAULT 1,
   pinned INTEGER NOT NULL DEFAULT 0,
@@ -175,4 +178,15 @@ export function initDatabaseSchema(db: DatabaseSync): void {
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec(SCHEMA_SQL);
+
+  // Incremental migration for installations created before document_hash existed.
+  // content_hash stays body-only; document_hash covers frontmatter + body.
+  try {
+    const columns = db.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>;
+    if (!columns.some(column => column.name === 'document_hash')) {
+      db.exec('ALTER TABLE documents ADD COLUMN document_hash TEXT');
+    }
+  } catch (err) {
+    console.error('[InkFlow Schema Migration] Failed ensuring documents.document_hash:', err);
+  }
 }

@@ -169,6 +169,18 @@ export function calculateContentHash(body: string): string {
 }
 
 /**
+ * Hash of the complete Markdown file, including YAML frontmatter.
+ *
+ * content_hash intentionally remains body-only for search/UI compatibility.
+ * Crash recovery needs to distinguish saves that only changed metadata (title,
+ * visibility, status, tags…), where the body hash is identical; this full hash
+ * is the commit marker stored alongside the SQLite row.
+ */
+export function calculateDocumentHash(markdown: string): string {
+  return crypto.createHash('sha256').update(markdown, 'utf-8').digest('hex');
+}
+
+/**
  * Normalizes one link/image target and returns the asset ID it refers to.
  * Only the three supported, explicit reference forms are accepted:
  *   - /api/v1/assets/file/{assetId}      (the canonical URL inserted by the editor)
@@ -411,6 +423,13 @@ export class DocumentService {
 
   // Per-document save mutex: serialises the Markdown + SQLite write sequence inside
   // this process, so two requests cannot interleave between the version check and commit.
+  //
+  // SINGLE-INSTANCE CONSTRAINT: this lock is process-local. InkFlow is started as a
+  // single Node process (see package.json / release deployment) and does not support
+  // multiple writers sharing one storage/ directory. The SQLite version CAS still
+  // prevents lost updates across processes, but the `.bak` / `.save.pending` staging
+  // files use fixed names and are only safe with one writer. If multi-process support
+  // is ever required, replace this with a cross-process lock before enabling it.
   private saveLocks = new Map<string, Promise<void>>();
 
   private async withDocumentLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
@@ -443,21 +462,31 @@ export class DocumentService {
     if (!(await fileStorage.hasPendingDocumentSave(docId))) return false;
 
     const db = this.getDb();
-    const row = db.prepare('SELECT content_hash FROM documents WHERE id = ?').get(docId) as any;
+    const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(docId) as any;
     const currentMarkdown = await fileStorage.readDocumentMarkdown(docId);
-    let currentHash: string | null = null;
-    if (currentMarkdown !== null) {
-      currentHash = calculateContentHash(parseFrontmatter(currentMarkdown).body.trim());
-    }
 
     if (row) {
-      if (currentHash === row.content_hash) {
+      // Prefer the full-document commit marker. Legacy rows (created before
+      // document_hash existed) fall back to comparing the file's frontmatter
+      // metadata with SQLite; the body hash alone cannot distinguish a
+      // metadata-only save that never committed.
+      let fileMatchesCommittedState: boolean;
+      if (row.document_hash) {
+        fileMatchesCommittedState =
+          currentMarkdown !== null && calculateDocumentHash(currentMarkdown) === row.document_hash;
+      } else if (currentMarkdown === null) {
+        fileMatchesCommittedState = false;
+      } else {
+        fileMatchesCommittedState = this.markdownMetadataMatchesRow(docId, currentMarkdown, row);
+      }
+
+      if (fileMatchesCommittedState) {
         // Committed (or the file was never replaced): the backup is stale.
         await fileStorage.clearDocumentSaveArtifacts(docId);
       } else {
         const restored = await fileStorage.restoreDocumentSaveBackup(docId);
         if (!restored) {
-          const hasBackup = (await fileStorage.readDocumentSaveBackup(docId)) !== null;
+          const hasBackup = fileStorage.documentSaveBackupExists(docId);
           if (hasBackup) {
             // Backup exists but could not be restored (I/O error). Leave every
             // artifact in place so a later recovery attempt can retry.
@@ -481,6 +510,53 @@ export class DocumentService {
     return true;
   }
 
+  /**
+   * Legacy fallback for rows without document_hash: does the file's frontmatter
+   * describe the same metadata as the committed SQLite row? Used only by
+   * recovery, so body-only edits (identical body hash) are classified correctly.
+   */
+  private markdownMetadataMatchesRow(docId: string, markdown: string, row: any): boolean {
+    const { frontmatter } = parseFrontmatter(markdown);
+    const dbTags = (
+      this.getDb()
+        .prepare(
+          `SELECT t.name FROM tags t
+           JOIN document_tags dt ON dt.tag_id = t.id
+           WHERE dt.document_id = ?
+           ORDER BY t.name`
+        )
+        .all(docId) as any[]
+    ).map(t => String(t.name));
+    const fileTags = (Array.isArray(frontmatter.tags) ? frontmatter.tags : [])
+      .map((t: any) => String(t))
+      .sort();
+    const sameTags =
+      fileTags.length === dbTags.length && fileTags.every((tag, index) => tag === dbTags[index]);
+    const samePinned = String(frontmatter.pinned === true || frontmatter.pinned === 'true') === String(Boolean(row.pinned));
+
+    // updated_at is written by the same save as every metadata field; when present
+    // an exact match is the strongest signal.
+    if (frontmatter.updated_at) {
+      return (
+        String(frontmatter.updated_at) === String(row.updated_at) &&
+        String(frontmatter.title || '') === String(row.title) &&
+        String(frontmatter.visibility || '') === String(row.visibility) &&
+        String(frontmatter.status || '') === String(row.status) &&
+        samePinned &&
+        sameTags
+      );
+    }
+
+    return (
+      String(frontmatter.title || '') === String(row.title) &&
+      String(frontmatter.visibility || '') === String(row.visibility) &&
+      String(frontmatter.status || '') === String(row.status) &&
+      String(frontmatter.category || '') === String(row.category_name) &&
+      samePinned &&
+      sameTags
+    );
+  }
+
   /** Runs crash recovery for every document that left save artifacts behind. */
   public async recoverPendingSaves(): Promise<number> {
     const ids = await fileStorage.listPendingSaveDocumentIds();
@@ -492,7 +568,32 @@ export class DocumentService {
         console.error(`[InkFlow Save Recovery] Failed recovering ${id}:`, err);
       }
     }
+
+    // Upgrade legacy rows so future metadata-only saves can be recovered by
+    // comparing the full Markdown hash instead of the body hash alone.
+    await this.backfillDocumentHashes();
+
     return recovered;
+  }
+
+  /** Fills document_hash for rows created before the column existed. */
+  public async backfillDocumentHashes(): Promise<number> {
+    const db = this.getDb();
+    const rows = db.prepare('SELECT id FROM documents WHERE document_hash IS NULL').all() as any[];
+    let updated = 0;
+    for (const row of rows) {
+      // Never seal the hash of a file whose recovery is still unresolved: doing so
+      // would make the uncommitted file look committed on the next attempt.
+      if (await fileStorage.hasPendingDocumentSave(row.id)) continue;
+      const markdown = await fileStorage.readDocumentMarkdown(row.id);
+      if (markdown === null) continue;
+      db.prepare('UPDATE documents SET document_hash = ? WHERE id = ? AND document_hash IS NULL').run(
+        calculateDocumentHash(markdown),
+        row.id
+      );
+      updated++;
+    }
+    return updated;
   }
 
   // Create or Update Document: dual write to physical disk and SQLite.
@@ -567,6 +668,8 @@ export class DocumentService {
       '',
       cleanBody,
     ].join('\n');
+    // Full-file hash (frontmatter + body) is the commit marker used by recovery.
+    const documentHash = calculateDocumentHash(fullMarkdown);
 
     // 1. Stage the new Markdown and back up the previous file. index.md is untouched
     //    until commitStagedDocumentSave() renames the temp file.
@@ -602,7 +705,7 @@ export class DocumentService {
           const updated = db.prepare(`
             UPDATE documents SET
               title = ?, slug = ?, category_id = ?, category_name = ?, file_path = ?,
-              visibility = ?, status = ?, content_hash = ?, word_count = ?, reading_time = ?,
+              visibility = ?, status = ?, content_hash = ?, document_hash = ?, word_count = ?, reading_time = ?,
               pinned = ?, version_count = ?, updated_at = ?
             WHERE id = ? AND version_count = ?
           `).run(
@@ -614,6 +717,7 @@ export class DocumentService {
             visibility,
             status,
             contentHash,
+            documentHash,
             stats.wordCount,
             stats.readingTime,
             pinned,
@@ -635,10 +739,10 @@ export class DocumentService {
           db.prepare(`
             INSERT INTO documents (
               id, owner_id, slug, title, description, category_id, category_name,
-              file_path, visibility, status, content_hash, word_count, reading_time,
+              file_path, visibility, status, content_hash, document_hash, word_count, reading_time,
               pinned, version_count, created_at, updated_at, published_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(
             docId,
             ownerId,
@@ -651,6 +755,7 @@ export class DocumentService {
             visibility,
             status,
             contentHash,
+            documentHash,
             stats.wordCount,
             stats.readingTime,
             pinned,

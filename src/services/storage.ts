@@ -175,6 +175,15 @@ export interface SaveDocError {
   details?: any;
 }
 
+export interface BulkSaveResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  errors: SaveDocError[];
+  /** Document saves succeeded but the server tag dictionary cleanup failed. */
+  dictionaryCleanupFailed?: boolean;
+}
+
 export interface SaveDocResult {
   success: boolean;
   serverSaved: boolean;
@@ -858,109 +867,128 @@ export class StorageService {
     } catch {}
   }
 
-  public renameTag(oldTag: string, newTag: string): void {
+  /** Applies a tag mutation to every affected document through the confirmed save path. */
+  private async applyTagUpdateToDocs(
+    docs: KnowledgeDoc[],
+    updateTags: (tags: string[]) => string[],
+    note: string
+  ): Promise<BulkSaveResult> {
+    const errors: SaveDocError[] = [];
+    let attempted = 0;
+    let succeeded = 0;
+
+    // Sequential: each document save waits for the server (and its version check)
+    // before the next one starts, so partial failures are deterministic.
+    for (const doc of docs) {
+      const currentTags = doc.tags || [];
+      const nextTags = updateTags([...currentTags]);
+      const unchanged =
+        nextTags.length === currentTags.length && nextTags.every((tag, index) => tag === currentTags[index]);
+      if (unchanged) continue;
+
+      attempted++;
+      const result = await this.saveDoc({ ...doc, tags: nextTags }, note);
+      if (result.success) succeeded++;
+      else {
+        errors.push(
+          result.error || {
+            code: 'SAVE_FAILED',
+            message: '保存失败',
+            retryable: true,
+          }
+        );
+      }
+    }
+
+    return { total: attempted, succeeded, failed: errors.length, errors };
+  }
+
+  private updateCustomTags(updater: (list: string[]) => string[]): void {
+    try {
+      const data = localStorage.getItem('inkflow_custom_tags_v1');
+      if (!data) return;
+      const list: string[] = JSON.parse(data);
+      localStorage.setItem('inkflow_custom_tags_v1', JSON.stringify(updater(list)));
+    } catch {
+      // custom tag dictionary is a local convenience cache
+    }
+  }
+
+  /**
+   * Rename a tag across all documents. Each document goes through saveDoc(), so
+   * the local cache is only updated after the server confirms it. Returns null
+   * when the rename is invalid/no-op.
+   */
+  public async renameTag(oldTag: string, newTag: string): Promise<BulkSaveResult | null> {
     const cleanOld = oldTag.trim().replace(/^#/, '');
     const cleanNew = newTag.trim().replace(/^#/, '');
-    if (!cleanOld || !cleanNew || cleanOld === cleanNew) return;
+    if (!cleanOld || !cleanNew || cleanOld === cleanNew) return null;
 
-    const docs = this.getDocs();
-    let docsChanged = false;
+    const affected = this.getDocs().filter(d => (d.tags || []).includes(cleanOld));
+    const result = await this.applyTagUpdateToDocs(
+      affected,
+      tags => Array.from(new Set(tags.map(tag => (tag === cleanOld ? cleanNew : tag)))),
+      `重命名标签 ${cleanOld} → ${cleanNew}`
+    );
 
-    docs.forEach(d => {
-      if (d.tags && d.tags.includes(cleanOld)) {
-        d.tags = Array.from(new Set(d.tags.map(t => (t === cleanOld ? cleanNew : t))));
-        docsChanged = true;
-      }
-    });
-
-    if (docsChanged) {
-      this.persistDocs(docs);
+    if (result.failed === 0) {
+      this.updateCustomTags(list => list.map(tag => (tag === cleanOld ? cleanNew : tag)));
+      const cleanup = await apiClient.deleteTag(cleanOld);
+      if (cleanup.error) result.dictionaryCleanupFailed = true;
     }
 
-    // Update custom tags list
-    try {
-      const data = localStorage.getItem('inkflow_custom_tags_v1');
-      if (data) {
-        let list: string[] = JSON.parse(data);
-        list = list.map(t => (t === cleanOld ? cleanNew : t));
-        localStorage.setItem('inkflow_custom_tags_v1', JSON.stringify(list));
-      }
-    } catch {}
+    return result;
   }
 
-  public deleteTag(tagName: string): void {
+  /** Remove a tag from all documents through the confirmed save path. */
+  public async deleteTag(tagName: string): Promise<BulkSaveResult> {
     const cleanTag = tagName.trim().replace(/^#/, '');
-    const docs = this.getDocs();
-    let docsChanged = false;
+    if (!cleanTag) return { total: 0, succeeded: 0, failed: 0, errors: [] };
 
-    docs.forEach(d => {
-      if (d.tags && d.tags.includes(cleanTag)) {
-        d.tags = d.tags.filter(t => t !== cleanTag);
-        docsChanged = true;
-        apiClient.saveDocument({
-          id: d.id,
-          title: d.title,
-          slug: d.slug,
-          rawMarkdown: d.rawMarkdown,
-          category: d.category,
-          tags: d.tags,
-          visibility: d.visibility,
-          pinned: d.pinned,
-          author: d.author,
-          expectedVersionCount: d.versionCount,
-        }).catch(() => {});
-      }
-    });
+    const affected = this.getDocs().filter(d => (d.tags || []).includes(cleanTag));
+    const result = await this.applyTagUpdateToDocs(
+      affected,
+      tags => tags.filter(tag => tag !== cleanTag),
+      `删除标签 ${cleanTag}`
+    );
 
-    if (docsChanged) {
-      this.persistDocs(docs);
+    if (result.failed === 0) {
+      this.updateCustomTags(list => list.filter(tag => tag !== cleanTag));
+      const cleanup = await apiClient.deleteTag(cleanTag);
+      if (cleanup.error) result.dictionaryCleanupFailed = true;
     }
 
-    apiClient.deleteTag(cleanTag).catch(() => {});
-
-    // Remove from custom tags list
-    try {
-      const data = localStorage.getItem('inkflow_custom_tags_v1');
-      if (data) {
-        let list: string[] = JSON.parse(data);
-        list = list.filter(t => t !== cleanTag);
-        localStorage.setItem('inkflow_custom_tags_v1', JSON.stringify(list));
-      }
-    } catch {}
+    return result;
   }
 
-  public mergeTags(fromTag: string, toTag: string): void {
+  /** Merge one tag into another across all documents through the confirmed save path. */
+  public async mergeTags(fromTag: string, toTag: string): Promise<BulkSaveResult | null> {
     const cleanFrom = fromTag.trim().replace(/^#/, '');
     const cleanTo = toTag.trim().replace(/^#/, '');
-    if (!cleanFrom || !cleanTo || cleanFrom === cleanTo) return;
+    if (!cleanFrom || !cleanTo || cleanFrom === cleanTo) return null;
 
-    const docs = this.getDocs();
-    let docsChanged = false;
+    const affected = this.getDocs().filter(d => (d.tags || []).includes(cleanFrom));
+    const result = await this.applyTagUpdateToDocs(
+      affected,
+      tags => {
+        const next = tags.filter(tag => tag !== cleanFrom);
+        if (!next.includes(cleanTo)) next.push(cleanTo);
+        return next;
+      },
+      `合并标签 ${cleanFrom} → ${cleanTo}`
+    );
 
-    docs.forEach(d => {
-      if (d.tags && d.tags.includes(cleanFrom)) {
-        const withoutOld = d.tags.filter(t => t !== cleanFrom);
-        if (!withoutOld.includes(cleanTo)) {
-          withoutOld.push(cleanTo);
-        }
-        d.tags = withoutOld;
-        docsChanged = true;
-      }
-    });
-
-    if (docsChanged) {
-      this.persistDocs(docs);
+    if (result.failed === 0) {
+      this.updateCustomTags(list => {
+        const next = list.filter(tag => tag !== cleanFrom);
+        if (!next.includes(cleanTo)) next.push(cleanTo);
+        return next;
+      });
+      const cleanup = await apiClient.deleteTag(cleanFrom);
+      if (cleanup.error) result.dictionaryCleanupFailed = true;
     }
 
-    try {
-      const data = localStorage.getItem('inkflow_custom_tags_v1');
-      if (data) {
-        let list: string[] = JSON.parse(data);
-        list = list.filter(t => t !== cleanFrom);
-        if (!list.includes(cleanTo)) list.push(cleanTo);
-        localStorage.setItem('inkflow_custom_tags_v1', JSON.stringify(list));
-      }
-    } catch {}
+    return result;
   }
 
   public cleanUnusedTags(): number {

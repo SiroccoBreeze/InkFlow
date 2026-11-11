@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import cluster from 'node:cluster';
 import { fileURLToPath } from 'url';
 import { apiRouter } from './server/routes/api';
 import { ensureInitialPhysicalDocs, ensureAssetReferences } from './server/services/seedData';
@@ -22,6 +23,17 @@ async function loadLocalEnv(): Promise<void> {
 
 async function startServer() {
   await loadLocalEnv();
+
+  // Document writing is single-instance by design (process-local per-document
+  // lock + fixed-name backup/staging files). Refuse to silently operate when
+  // started as a cluster worker against the same storage directory.
+  if (cluster.isWorker) {
+    console.error(
+      '[InkFlow] 检测到 cluster worker。InkFlow 仅支持单进程写入同一 storage/ 目录，' +
+        '多进程会破坏 Markdown 备份/恢复的互斥性，请以单实例方式部署。'
+    );
+    process.exit(1);
+  }
 
   const app = express();
   const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -116,6 +128,7 @@ async function startServer() {
     console.log(`📁 Physical Markdown SSOT: storage/documents/`);
     console.log(`🗄️ Native SQLite WAL Database: storage/database/knowledge_hub.sqlite`);
     console.log(`🔌 API Base Endpoint: http://0.0.0.0:${PORT}/api/v1`);
+    console.log(`🔒 Document write mode: single instance (no cluster workers)`);
     if (!process.env.INKFLOW_INIT_KEY) {
       console.log(`⚠️  INKFLOW_INIT_KEY is not set — first-run owner initialization is DISABLED.`);
     }

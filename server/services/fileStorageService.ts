@@ -272,6 +272,12 @@ export class FileStorageService {
     }
   }
 
+  /** Whether a restore source exists, independent of whether it can be read. */
+  public documentSaveBackupExists(documentId: string): boolean {
+    const artifacts = this.getSaveArtifacts(documentId);
+    return artifacts ? fsSync.existsSync(artifacts.backupPath) : false;
+  }
+
   public async restoreDocumentSaveBackup(documentId: string): Promise<boolean> {
     const artifacts = this.getSaveArtifacts(documentId);
     if (!artifacts || !fsSync.existsSync(artifacts.backupPath)) return false;

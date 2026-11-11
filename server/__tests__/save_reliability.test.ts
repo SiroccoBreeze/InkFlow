@@ -7,7 +7,13 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { apiRouter } from '../routes/api';
 import { authService } from '../services/authService';
-import { documentService, calculateContentHash, parseFrontmatter } from '../services/documentService';
+import {
+  documentService,
+  calculateContentHash,
+  calculateDocumentHash,
+  parseFrontmatter,
+  buildFrontmatterBlock,
+} from '../services/documentService';
 import { getDatabase, closeDatabase } from '../db/sqlite';
 
 // Isolated database + storage for this suite.
@@ -83,6 +89,58 @@ function artifacts(docId: string): string[] {
   return fs.readdirSync(folder).filter(n => n === 'index.md.bak' || n === '.save.pending' || n.endsWith('.tmp'));
 }
 
+function docTags(docId: string): string[] {
+  return (db
+    .prepare(
+      `SELECT t.name FROM tags t
+       JOIN document_tags dt ON dt.tag_id = t.id
+       WHERE dt.document_id = ?
+       ORDER BY t.name`
+    )
+    .all(docId) as any[]).map(row => row.name);
+}
+
+/**
+ * Builds the full Markdown that a save with only metadata changes would write:
+ * same body, new frontmatter (including a new updated_at), like the real save path.
+ */
+function fullMarkdownWithMetadata(
+  docId: string,
+  overrides: { title?: string; visibility?: string; status?: string; tags?: string[] }
+): string {
+  const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(docId) as any;
+  const raw = fs.readFileSync(filePath(docId), 'utf-8');
+  const { frontmatter, body } = parseFrontmatter(raw);
+  return [
+    buildFrontmatterBlock({
+      id: docId,
+      title: overrides.title ?? row.title,
+      slug: row.slug,
+      category: row.category_name,
+      tags: overrides.tags ?? (Array.isArray(frontmatter.tags) ? frontmatter.tags : []),
+      visibility: overrides.visibility ?? row.visibility,
+      status: overrides.status ?? row.status,
+      author: frontmatter.author || 'Hecker',
+      pinned: Boolean(row.pinned),
+      content_hash: calculateContentHash(body.trim()),
+      created_at: row.created_at,
+      updated_at: new Date().toISOString(),
+    }),
+    '',
+    body.trim(),
+  ].join('\n');
+}
+
+/** Simulates: new file renamed into place, crash before the SQLite commit. */
+function simulateCrashBeforeCommit(docId: string, newMarkdown: string): string {
+  const folder = path.join(testDataDir, 'documents', docId);
+  const oldRaw = fs.readFileSync(filePath(docId), 'utf-8');
+  fs.writeFileSync(path.join(folder, 'index.md.bak'), oldRaw, 'utf-8');
+  fs.writeFileSync(path.join(folder, '.save.pending'), new Date().toISOString(), 'utf-8');
+  fs.writeFileSync(filePath(docId), newMarkdown, 'utf-8');
+  return oldRaw;
+}
+
 describe('Document save reliability', () => {
   beforeAll(() => {
     closeDatabase();
@@ -119,9 +177,12 @@ describe('Document save reliability', () => {
     expect(updated.body.data.versionCount).toBe(created.versionCount + 1);
     expect(readBody(created.id)).toBe('# 正常保存\n\nv2');
 
-    const row = db.prepare('SELECT version_count, content_hash FROM documents WHERE id = ?').get(created.id) as any;
+    const row = db.prepare('SELECT version_count, content_hash, document_hash FROM documents WHERE id = ?').get(
+      created.id
+    ) as any;
     expect(row.version_count).toBe(created.versionCount + 1);
     expect(row.content_hash).toBe(calculateContentHash('# 正常保存\n\nv2'));
+    expect(row.document_hash).toBe(calculateDocumentHash(fs.readFileSync(filePath(created.id), 'utf-8')));
     expect(revisionCount(created.id)).toBe(2);
 
     const fts = db.prepare('SELECT body FROM documents_fts WHERE document_id = ?').get(created.id) as any;
@@ -331,5 +392,181 @@ describe('Document save reliability', () => {
     await documentService.recoverPendingSaves();
 
     expect(fs.existsSync(folder)).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // Metadata-only saves have an identical body hash. These scenarios prove that
+  // recovery uses the full-document commit marker, not content_hash alone.
+  const metadataOnlyScenarios: Array<{
+    label: string;
+    overrides: { title?: string; visibility?: string; status?: string; tags?: string[] };
+  }> = [
+    { label: 'title', overrides: { title: '仅修改标题后的版本' } },
+    { label: 'visibility', overrides: { visibility: 'public' } },
+    { label: 'status', overrides: { status: 'published' } },
+    { label: 'tags', overrides: { tags: ['new-tag'] } },
+  ];
+
+  for (const scenario of metadataOnlyScenarios) {
+    it(`restores the previous version when only ${scenario.label} changed before a crash`, async () => {
+      const created = await createDoc('# 元数据恢复\n\n正文保持不变', {
+        tags: ['old-tag'],
+        visibility: 'private',
+        status: 'draft',
+      });
+      const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+      const oldRow = db.prepare('SELECT * FROM documents WHERE id = ?').get(created.id) as any;
+      const oldTags = docTags(created.id);
+      const oldDocumentHash = calculateDocumentHash(oldRaw);
+
+      const newMarkdown = fullMarkdownWithMetadata(created.id, scenario.overrides);
+      // Guard against a false-positive test: body hash must be unchanged.
+      expect(parseFrontmatter(newMarkdown).body.trim()).toBe(parseFrontmatter(oldRaw).body.trim());
+      expect(calculateContentHash(parseFrontmatter(newMarkdown).body.trim())).toBe(oldRow.content_hash);
+
+      simulateCrashBeforeCommit(created.id, newMarkdown);
+      await documentService.recoverPendingSaves();
+
+      // Markdown restored byte-for-byte, so frontmatter metadata is the old one.
+      expect(fs.readFileSync(filePath(created.id), 'utf-8')).toBe(oldRaw);
+
+      const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(created.id) as any;
+      expect(row.title).toBe(oldRow.title);
+      expect(row.visibility).toBe(oldRow.visibility);
+      expect(row.status).toBe(oldRow.status);
+      expect(row.version_count).toBe(oldRow.version_count);
+      expect(row.content_hash).toBe(oldRow.content_hash);
+      expect(row.document_hash).toBe(oldDocumentHash);
+      expect(revisionCount(created.id)).toBe(1);
+      expect(docTags(created.id)).toEqual(oldTags);
+      expect(artifacts(created.id)).toEqual([]);
+
+      const fm = parseFrontmatter(fs.readFileSync(filePath(created.id), 'utf-8')).frontmatter;
+      expect(fm.title).toBe(row.title);
+      expect(fm.visibility).toBe(row.visibility);
+      expect(fm.status).toBe(row.status);
+      const fmTags = Array.isArray(fm.tags) ? [...fm.tags].sort() : [];
+      expect(fmTags).toEqual([...oldTags].sort());
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  it('recovers metadata-only changes for legacy rows that have no document_hash', async () => {
+    const created = await createDoc('# 旧行恢复\n\nbody', { visibility: 'private', status: 'draft' });
+    db.prepare('UPDATE documents SET document_hash = NULL WHERE id = ?').run(created.id);
+    const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+    const oldRow = db.prepare('SELECT * FROM documents WHERE id = ?').get(created.id) as any;
+
+    const newMarkdown = fullMarkdownWithMetadata(created.id, {
+      title: '旧行上未提交的标题',
+      visibility: 'public',
+      status: 'published',
+    });
+    simulateCrashBeforeCommit(created.id, newMarkdown);
+
+    await documentService.recoverPendingSaves();
+
+    expect(fs.readFileSync(filePath(created.id), 'utf-8')).toBe(oldRaw);
+    const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(created.id) as any;
+    expect(row.title).toBe(oldRow.title);
+    expect(row.visibility).toBe('private');
+    expect(row.status).toBe('draft');
+    expect(row.version_count).toBe(oldRow.version_count);
+    // Backfill runs after recovery and records the restored file's full hash.
+    expect(row.document_hash).toBe(calculateDocumentHash(oldRaw));
+    expect(artifacts(created.id)).toEqual([]);
+  });
+
+  it('keeps a committed legacy metadata save instead of reverting it', async () => {
+    const created = await createDoc('# 旧行已提交\n\nbody', { visibility: 'private' });
+    const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+    const slug = (db.prepare('SELECT slug FROM documents WHERE id = ?').get(created.id) as any).slug;
+
+    const updated = await request(app)
+      .put(`/api/v1/documents/${created.id}`)
+      .set(auth())
+      .send({
+        title: '旧行已提交的新标题',
+        slug,
+        rawMarkdown: '# 旧行已提交\n\nbody',
+        category: '安全与数据主权',
+        tags: [],
+        visibility: 'public',
+        expectedVersionCount: created.versionCount,
+      });
+    expect(updated.status).toBe(200);
+    const newRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+
+    // Simulate a legacy row (no document_hash) plus a leftover backup.
+    db.prepare('UPDATE documents SET document_hash = NULL WHERE id = ?').run(created.id);
+    const folder = path.join(testDataDir, 'documents', created.id);
+    fs.writeFileSync(path.join(folder, 'index.md.bak'), oldRaw, 'utf-8');
+    fs.writeFileSync(path.join(folder, '.save.pending'), new Date().toISOString(), 'utf-8');
+
+    await documentService.recoverPendingSaves();
+
+    expect(fs.readFileSync(filePath(created.id), 'utf-8')).toBe(newRaw);
+    expect(artifacts(created.id)).toEqual([]);
+    const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(created.id) as any;
+    expect(row.title).toBe('旧行已提交的新标题');
+    expect(row.visibility).toBe('public');
+    expect(row.document_hash).toBe(calculateDocumentHash(newRaw));
+  });
+
+  // -------------------------------------------------------------------------
+  it('keeps the committed version and clears the backup when the crash happened after commit', async () => {
+    const created = await createDoc('# 已提交元数据\n\nbody', { tags: ['old'] });
+    const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+
+    const rowBefore = db.prepare('SELECT slug FROM documents WHERE id = ?').get(created.id) as any;
+    const updated = await request(app)
+      .put(`/api/v1/documents/${created.id}`)
+      .set(auth())
+      .send({
+        title: '提交后的新标题',
+        slug: rowBefore.slug,
+        rawMarkdown: '# 已提交元数据\n\nbody',
+        category: '安全与数据主权',
+        tags: ['new'],
+        visibility: 'public',
+        expectedVersionCount: created.versionCount,
+      });
+    expect(updated.status).toBe(200);
+
+    const newRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+    const folder = path.join(testDataDir, 'documents', created.id);
+    fs.writeFileSync(path.join(folder, 'index.md.bak'), oldRaw, 'utf-8');
+    fs.writeFileSync(path.join(folder, '.save.pending'), new Date().toISOString(), 'utf-8');
+
+    await documentService.recoverPendingSaves();
+
+    expect(fs.readFileSync(filePath(created.id), 'utf-8')).toBe(newRaw);
+    expect(artifacts(created.id)).toEqual([]);
+
+    const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(created.id) as any;
+    expect(row.title).toBe('提交后的新标题');
+    expect(row.visibility).toBe('public');
+    expect(row.version_count).toBe(created.versionCount + 1);
+    expect(row.content_hash).toBe(calculateContentHash('# 已提交元数据\n\nbody'));
+    expect(row.document_hash).toBe(calculateDocumentHash(newRaw));
+    expect(revisionCount(created.id)).toBe(2);
+
+    const fm = parseFrontmatter(newRaw).frontmatter;
+    expect(fm.title).toBe(row.title);
+    expect(fm.visibility).toBe(row.visibility);
+    expect(fm.status).toBe(row.status);
+    expect(Array.isArray(fm.tags) ? fm.tags : []).toEqual(['new']);
+    expect(docTags(created.id)).toEqual(['new']);
+  });
+
+  // -------------------------------------------------------------------------
+  it('backfills document_hash for rows created before the column existed', async () => {
+    const created = await createDoc('# 旧数据\n\nbody');
+    db.prepare('UPDATE documents SET document_hash = NULL WHERE id = ?').run(created.id);
+
+    await documentService.backfillDocumentHashes();
+
+    const row = db.prepare('SELECT document_hash FROM documents WHERE id = ?').get(created.id) as any;
+    expect(row.document_hash).toBe(calculateDocumentHash(fs.readFileSync(filePath(created.id), 'utf-8')));
   });
 });

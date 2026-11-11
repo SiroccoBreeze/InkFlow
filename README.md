@@ -241,6 +241,18 @@ npm install
 INKFLOW_INIT_KEY="$(openssl rand -hex 32)" npm start
 ```
 
+> **单实例写入约束（重要）**
+>
+> InkFlow 的文档保存采用「进程内按文档互斥 + SQLite 版本号乐观锁 + Markdown 备份/恢复」。
+> 其中互斥锁是 Node.js 进程内的，`index.md.bak` / `.save.pending` 也使用固定文件名，
+> 因此**同一份 `storage/` 目录只能由一个 InkFlow 进程写入**。
+>
+> - `npm start` / `npm run dev` 默认都是单进程，请勿使用 `cluster`、PM2
+>   `instances > 1` 或多个容器共享同一存储卷。
+> - 需要横向扩展时，请先实现跨进程写锁（或改为单写入者 + 队列），再开放多实例写入；
+>   仅依赖 SQLite 乐观锁无法保护文件系统层的备份/替换竞争。
+> - 读请求不涉及此约束；数据库本身仍使用 WAL，可被多个只读连接访问。
+
 ## 🛡️ 其他加固说明
 
 - 附件路径经 `resolveWithinStorage()` 校验，拒绝目录穿越；文档/版本 ID 必须是安全路径段。

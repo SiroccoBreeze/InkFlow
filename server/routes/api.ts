@@ -4,13 +4,10 @@ import {
   documentService,
   DocumentConflictError,
   DocumentValidationError,
-  parseFrontmatter,
-  buildFrontmatterBlock,
 } from '../services/documentService';
 import { searchService } from '../services/searchService';
 import { shareService } from '../services/shareService';
 import { assetService } from '../services/assetService';
-import { fileStorage } from '../services/fileStorageService';
 import { ensureInitialPhysicalDocs } from '../services/seedData';
 import { getDatabase, generateId } from '../db/sqlite';
 
@@ -664,47 +661,19 @@ apiRouter.get('/tags', (req, res) => {
   res.json({ data: rows });
 });
 
-apiRouter.delete('/tags/:name', requireOwner, async (req, res) => {
+apiRouter.delete('/tags/:name', requireOwner, (req, res) => {
   const tagName = decodeURIComponent(req.params.name).trim();
   const db = getDatabase();
 
+  // Dictionary cleanup only. Removing the tag from each document's Markdown is
+  // handled by the versioned saveDocument() path (client saveDoc), so this route
+  // must not rewrite Markdown behind the optimistic lock or skip revision/FTS
+  // updates. Markdown remains the SSOT: a tag still present in a document file
+  // will simply be re-indexed into the dictionary on that document's next save.
   const tagRow = db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any;
   if (tagRow) {
     db.prepare('DELETE FROM document_tags WHERE tag_id = ?').run(tagRow.id);
     db.prepare('DELETE FROM tags WHERE id = ?').run(tagRow.id);
-  }
-
-  // Also remove tag from physical markdown files in storage/documents/
-  try {
-    const docIds = await fileStorage.listAllDiskDocumentIds();
-    for (const docId of docIds) {
-      const raw = await fileStorage.readDocumentMarkdown(docId);
-      if (raw) {
-        const { frontmatter, body } = parseFrontmatter(raw);
-        if (Array.isArray(frontmatter.tags) && frontmatter.tags.includes(tagName)) {
-          frontmatter.tags = frontmatter.tags.filter((t: string) => t !== tagName);
-          // Legacy files have no `status` field; never write the literal string "undefined".
-          const visibility = ['public', 'private', 'unlisted'].includes(frontmatter.visibility)
-            ? frontmatter.visibility
-            : 'public';
-          const status = ['draft', 'published', 'archived'].includes(frontmatter.status)
-            ? frontmatter.status
-            : 'published';
-          const newMarkdown = [
-            buildFrontmatterBlock({
-              ...frontmatter,
-              visibility,
-              status,
-            } as any),
-            '',
-            body.trimStart(),
-          ].join('\n');
-          await fileStorage.saveDocumentMarkdown(docId, newMarkdown);
-        }
-      }
-    }
-  } catch (err) {
-    console.error('[Delete Tag Sync Error]:', err);
   }
 
   res.json({ data: { success: true } });
