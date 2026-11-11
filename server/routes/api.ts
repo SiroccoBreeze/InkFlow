@@ -680,64 +680,100 @@ apiRouter.get('/tags', (req, res) => {
 
 apiRouter.delete('/tags/:name', requireOwner, async (req, res) => {
   const tagName = decodeURIComponent(req.params.name).trim();
-  const db = getDatabase();
 
   // Dictionary cleanup only. Removing the tag from each document's Markdown is
   // handled by the versioned saveDocument() path (client saveDoc), so this route
   // must not rewrite Markdown behind the optimistic lock or skip revision/FTS
   // updates. Markdown remains the SSOT.
-
-  const tagRow = db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any;
-  if (!tagRow) {
-    res.json({ data: { success: true, tagDeleted: false, referencedDocuments: 0 } });
-    return;
-  }
-
-  const dbAssociations = Number(
-    (db.prepare('SELECT COUNT(*) AS c FROM document_tags WHERE tag_id = ?').get(tagRow.id) as any)?.c || 0
-  );
-
-  // The client cache may be incomplete, so also check the Markdown SSOT before
-  // deleting the dictionary entry. If any file still references the tag, keep
-  // the tag row and its associations; deleting them would silently diverge from
-  // the documents on disk.
-  let markdownReferences = 0;
+  //
+  // The whole check→delete sequence runs under the exclusive maintenance lease:
+  // document saves/deletes hold the shared lease, so no document can add a tag
+  // association between the Markdown scan and the dictionary deletion.
   try {
-    const docIds = await fileStorage.listAllDiskDocumentIds();
-    for (const docId of docIds) {
-      const raw = await fileStorage.readDocumentMarkdown(docId);
-      if (!raw) continue;
-      const { frontmatter } = parseFrontmatter(raw);
-      if (
-        Array.isArray(frontmatter.tags) &&
-        frontmatter.tags.map((tag: any) => String(tag)).includes(tagName)
-      ) {
-        markdownReferences++;
+    const data = await documentService.runExclusiveMaintenance(async () => {
+      const db = getDatabase();
+
+      const readTag = () => db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any;
+      const countAssociations = (tagId: string) =>
+        Number(
+          (db.prepare('SELECT COUNT(*) AS c FROM document_tags WHERE tag_id = ?').get(tagId) as any)?.c || 0
+        );
+
+      const tagRow = readTag();
+      if (!tagRow) {
+        return { success: true, tagDeleted: false, referencedDocuments: 0 };
       }
-    }
-  } catch (err) {
-    console.error('[InkFlow Tag Cleanup] Markdown reference scan failed:', err);
-    res.json({
-      data: {
-        success: true,
-        tagDeleted: false,
-        referencedDocuments: dbAssociations,
-        reason: 'markdown_scan_failed',
-      },
+
+      // The client cache may be incomplete, so check the Markdown SSOT too.
+      let markdownReferences = 0;
+      try {
+        const docIds = await fileStorage.listAllDiskDocumentIds();
+        for (const docId of docIds) {
+          const raw = await fileStorage.readDocumentMarkdown(docId);
+          if (!raw) continue;
+          const { frontmatter } = parseFrontmatter(raw);
+          if (
+            Array.isArray(frontmatter.tags) &&
+            frontmatter.tags.map((tag: any) => String(tag)).includes(tagName)
+          ) {
+            markdownReferences++;
+          }
+        }
+      } catch (err) {
+        console.error('[InkFlow Tag Cleanup] Markdown reference scan failed:', err);
+        return {
+          success: true,
+          tagDeleted: false,
+          referencedDocuments: countAssociations(tagRow.id),
+          reason: 'markdown_scan_failed',
+        };
+      }
+
+      if (markdownReferences > 0) {
+        return {
+          success: true,
+          tagDeleted: false,
+          referencedDocuments: Math.max(countAssociations(tagRow.id), markdownReferences),
+        };
+      }
+
+      // Re-check the database inside a write transaction as a second barrier, then
+      // delete both the associations and the dictionary entry atomically.
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const currentTag = readTag();
+        if (!currentTag) {
+          db.exec('COMMIT');
+          return { success: true, tagDeleted: false, referencedDocuments: 0 };
+        }
+
+        const dbAssociations = countAssociations(currentTag.id);
+        if (dbAssociations > 0) {
+          db.exec('ROLLBACK');
+          return { success: true, tagDeleted: false, referencedDocuments: dbAssociations };
+        }
+
+        db.prepare('DELETE FROM document_tags WHERE tag_id = ?').run(currentTag.id);
+        db.prepare('DELETE FROM tags WHERE id = ?').run(currentTag.id);
+        db.exec('COMMIT');
+        return { success: true, tagDeleted: true, referencedDocuments: 0 };
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // may already be rolled back
+        }
+        throw err;
+      }
     });
-    return;
+
+    res.json({ data });
+  } catch (err) {
+    console.error('[InkFlow Tag Cleanup] Failed; tag dictionary preserved:', err);
+    res.status(500).json({
+      error: { code: 'TAG_CLEANUP_FAILED', message: '标签清理失败，标签字典已保留' },
+    });
   }
-
-  const referencedDocuments = Math.max(dbAssociations, markdownReferences);
-  if (referencedDocuments > 0) {
-    res.json({ data: { success: true, tagDeleted: false, referencedDocuments } });
-    return;
-  }
-
-  db.prepare('DELETE FROM document_tags WHERE tag_id = ?').run(tagRow.id);
-  db.prepare('DELETE FROM tags WHERE id = ?').run(tagRow.id);
-
-  res.json({ data: { success: true, tagDeleted: true, referencedDocuments: 0 } });
 });
 
 // ---------------- SEARCH ROUTE ----------------

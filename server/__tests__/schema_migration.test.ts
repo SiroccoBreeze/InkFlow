@@ -137,8 +137,10 @@ describe('documents.document_hash schema migration', () => {
     db.close();
 
     try {
-      const tsxBin = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
-      const result = spawnSync(tsxBin, ['server.ts'], {
+      // Cross-platform: invoke the tsx CLI through the current Node binary
+      // instead of relying on the platform-specific .bin shim.
+      const tsxCli = path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+      const result = spawnSync(process.execPath, [tsxCli, 'server.ts'], {
         cwd: process.cwd(),
         env: {
           ...process.env,

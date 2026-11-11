@@ -193,6 +193,61 @@ export function calculateDocumentHash(markdown: string): string {
 }
 
 /**
+ * Minimal async read/write lock (no third-party dependency).
+ * Document saves/deletes hold a shared lease; global maintenance operations
+ * (tag dictionary cleanup, global revision pruning) hold an exclusive lease.
+ * Writer-preferring so a maintenance request cannot starve behind new saves.
+ */
+class AsyncReadWriteLock {
+  private readers = 0;
+  private writing = false;
+  private queue: Array<{ mode: 'read' | 'write'; grant: (release: () => void) => void }> = [];
+
+  private makeRelease(mode: 'read' | 'write'): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (mode === 'read') this.readers--;
+      else this.writing = false;
+      this.drain();
+    };
+  }
+
+  private drain(): void {
+    if (this.writing) return;
+
+    if (this.queue[0]?.mode === 'write') {
+      if (this.readers > 0) return;
+      const next = this.queue.shift()!;
+      this.writing = true;
+      next.grant(this.makeRelease('write'));
+      return;
+    }
+
+    while (this.queue[0]?.mode === 'read') {
+      const next = this.queue.shift()!;
+      this.readers++;
+      next.grant(this.makeRelease('read'));
+    }
+  }
+
+  public acquireRead(): Promise<() => void> {
+    return new Promise(resolve => {
+      this.queue.push({ mode: 'read', grant: resolve });
+      this.drain();
+    });
+  }
+
+  public acquireWrite(): Promise<() => void> {
+    return new Promise(resolve => {
+      this.queue.push({ mode: 'write', grant: resolve });
+      this.drain();
+    });
+  }
+}
+
+/**
  * Normalizes one link/image target and returns the asset ID it refers to.
  * Only the three supported, explicit reference forms are accepted:
  *   - /api/v1/assets/file/{assetId}      (the canonical URL inserted by the editor)
@@ -444,6 +499,33 @@ export class DocumentService {
   // is ever required, replace this with a cross-process lock before enabling it.
   private saveLocks = new Map<string, Promise<void>>();
 
+  // Shared by all document writes; exclusive for tag dictionary cleanup and global
+  // revision pruning, so their multi-document scan/delete cannot interleave with a
+  // save that adds a tag association.
+  private maintenanceLock = new AsyncReadWriteLock();
+
+  private async withSaveGate<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.maintenanceLock.acquireRead();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Runs a multi-document maintenance operation while no document save/delete is
+   * in flight (and blocks new ones until the operation completes).
+   */
+  public async runExclusiveMaintenance<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.maintenanceLock.acquireWrite();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
   private async withDocumentLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.saveLocks.get(docId) ?? Promise.resolve();
     let release!: () => void;
@@ -635,7 +717,7 @@ export class DocumentService {
     assertValidDocumentInput(input);
 
     const docId = input.id || generateId('doc');
-    return this.withDocumentLock(docId, async () => {
+    return this.withSaveGate(() => this.withDocumentLock(docId, async () => {
       // Heal a previously interrupted save for this document before touching it again.
       // If recovery cannot complete, refuse to write: continuing would overwrite
       // the only `.bak` / `.save.pending` that an administrator may need.
@@ -647,7 +729,7 @@ export class DocumentService {
         throw new DocumentRecoveryRequiredError(docId);
       }
       return this.saveDocumentLocked(input, docId, ownerId, note);
-    });
+    }));
   }
 
   private async saveDocumentLocked(input: DocumentInput, docId: string, ownerId: string, note?: string) {
@@ -926,11 +1008,15 @@ export class DocumentService {
     let synced = 0;
 
     for (const docId of docIds) {
-      const raw = await fileStorage.readDocumentMarkdown(docId);
-      if (!raw) continue;
-      const { body } = parseFrontmatter(raw);
-      this.syncDocumentAssets(docId, body);
-      synced++;
+      // Serialise with saves: a concurrent save rebuilds the same association
+      // table inside its transaction, and a stale read must not overwrite it.
+      await this.withDocumentLock(docId, async () => {
+        const raw = await fileStorage.readDocumentMarkdown(docId);
+        if (!raw) return;
+        const { body } = parseFrontmatter(raw);
+        this.syncDocumentAssets(docId, body);
+        synced++;
+      });
     }
 
     return synced;
@@ -957,44 +1043,66 @@ export class DocumentService {
 
   // Delete document
   public async deleteDocument(id: string) {
-    // Deletion must not run while a save is awaiting recovery: it would remove
-    // the backup/marker files that contain the last committed content.
-    const recovery = await this.recoverPendingSave(id).catch(err => {
-      console.error(`[InkFlow Save Recovery] Recovery failed for ${id}:`, err);
-      return 'failed' as const;
-    });
-    if (recovery === 'failed') {
-      throw new DocumentRecoveryRequiredError(id);
-    }
+    // Same gate + per-document lock as saveDocument: a save and a delete for the
+    // same document can never interleave, and global tag/revision maintenance
+    // cannot observe a half-deleted document.
+    return this.withSaveGate(() =>
+      this.withDocumentLock(id, async () => {
+        // Deletion must not run while a save is awaiting recovery: it would remove
+        // the backup/marker files that contain the last committed content.
+        const recovery = await this.recoverPendingSave(id).catch(err => {
+          console.error(`[InkFlow Save Recovery] Recovery failed for ${id}:`, err);
+          return 'failed' as const;
+        });
+        if (recovery === 'failed') {
+          throw new DocumentRecoveryRequiredError(id);
+        }
 
-    const db = this.getDb();
-    // 1. Read document markdown to check for attached assets before deleting
-    const rawMarkdown = await fileStorage.readDocumentMarkdown(id);
+        const db = this.getDb();
+        // 1. Read document markdown to check for attached assets before deleting
+        const rawMarkdown = await fileStorage.readDocumentMarkdown(id);
 
-    // 2. Delete physical document folder and revisions folder
-    await fileStorage.deleteDocumentFolder(id);
-    await fileStorage.deleteRevisionFolder(id);
+        // 2. Remove SQLite records first, in one transaction. If this fails the
+        //    Markdown folder is untouched (consistent). The reverse order could
+        //    leave a DB row pointing at a folder that was already deleted.
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.prepare('DELETE FROM documents_fts WHERE document_id = ?').run(id);
+          db.prepare('DELETE FROM document_tags WHERE document_id = ?').run(id);
+          db.prepare('DELETE FROM document_revisions WHERE document_id = ?').run(id);
+          try {
+            db.prepare('DELETE FROM comments WHERE document_id = ?').run(id);
+          } catch {}
+          // Cascades remove document_assets.
+          db.prepare('DELETE FROM documents WHERE id = ?').run(id);
+          db.exec('COMMIT');
+        } catch (err) {
+          try {
+            db.exec('ROLLBACK');
+          } catch {
+            // may already be rolled back
+          }
+          throw err;
+        }
 
-    // 3. Delete database records
-    db.prepare('DELETE FROM documents_fts WHERE document_id = ?').run(id);
-    db.prepare('DELETE FROM document_tags WHERE document_id = ?').run(id);
-    db.prepare('DELETE FROM document_revisions WHERE document_id = ?').run(id);
-    try {
-      db.prepare('DELETE FROM comments WHERE document_id = ?').run(id);
-    } catch {}
-    db.prepare('DELETE FROM documents WHERE id = ?').run(id);
+        // 3. Delete physical document folder and revisions folder. If a filesystem
+        //    deletion fails, only orphan files remain (no live DB record).
+        await fileStorage.deleteDocumentFolder(id);
+        await fileStorage.deleteRevisionFolder(id);
 
-    // 4. Clean up any assets that were only in this document
-    if (rawMarkdown) {
-      try {
-        await assetService.cleanupUnreferencedAssets();
-      } catch {}
-    }
+        // 4. Clean up any assets that were only in this document
+        if (rawMarkdown) {
+          try {
+            await assetService.cleanupUnreferencedAssets();
+          } catch {}
+        }
 
-    // 5. Clean up any orphaned revisions
-    await fileStorage.cleanupOrphanRevisions();
+        // 5. Clean up any orphaned revisions
+        await fileStorage.cleanupOrphanRevisions();
 
-    return true;
+        return true;
+      })
+    );
   }
 
   // Disaster Recovery: Rebuild Index from Physical Disk Markdown Files
@@ -1181,58 +1289,76 @@ export class DocumentService {
     remainingCount: number;
     totalDiskBytes: number;
   }> {
-    const db = this.getDb();
     const keepLatest = options.all ? 0 : options.keepLatest !== undefined ? options.keepLatest : 1;
 
-    let deletedCount = 0;
-    let freedBytes = 0;
-    let deletedIds: string[] = [];
+    const runCleanup = async (documentId?: string) => {
+      const db = this.getDb();
+      let deletedCount = 0;
+      let freedBytes = 0;
+      let deletedIds: string[] = [];
 
-    if (options.documentId) {
-      const res = await fileStorage.pruneDocumentRevisions(options.documentId, keepLatest);
-      deletedCount = res.deletedCount;
-      freedBytes = res.freedBytes;
-      deletedIds = res.deletedRevisionIds;
+      if (documentId) {
+        const res = await fileStorage.pruneDocumentRevisions(documentId, keepLatest);
+        deletedCount = res.deletedCount;
+        freedBytes = res.freedBytes;
+        deletedIds = res.deletedRevisionIds;
 
-      if (deletedIds.length > 0) {
-        const placeholders = deletedIds.map(() => '?').join(',');
-        db.prepare(`DELETE FROM document_revisions WHERE document_id = ? AND id IN (${placeholders})`).run(
-          options.documentId,
-          ...deletedIds
-        );
-      }
-    } else {
-      const res = await fileStorage.pruneAllRevisions(keepLatest);
-      deletedCount = res.deletedCount;
-      freedBytes = res.freedBytes;
-      deletedIds = res.deletedRevisionIds;
+        if (deletedIds.length > 0) {
+          const placeholders = deletedIds.map(() => '?').join(',');
+          db.prepare(`DELETE FROM document_revisions WHERE document_id = ? AND id IN (${placeholders})`).run(
+            documentId,
+            ...deletedIds
+          );
+        }
+      } else {
+        const res = await fileStorage.pruneAllRevisions(keepLatest);
+        deletedCount = res.deletedCount;
+        freedBytes = res.freedBytes;
+        deletedIds = res.deletedRevisionIds;
 
-      if (deletedIds.length > 0) {
-        const batchSize = 100;
-        for (let i = 0; i < deletedIds.length; i += batchSize) {
-          const chunk = deletedIds.slice(i, i + batchSize);
-          const placeholders = chunk.map(() => '?').join(',');
-          db.prepare(`DELETE FROM document_revisions WHERE id IN (${placeholders})`).run(...chunk);
+        if (deletedIds.length > 0) {
+          const batchSize = 100;
+          for (let i = 0; i < deletedIds.length; i += batchSize) {
+            const chunk = deletedIds.slice(i, i + batchSize);
+            const placeholders = chunk.map(() => '?').join(',');
+            db.prepare(`DELETE FROM document_revisions WHERE id IN (${placeholders})`).run(...chunk);
+          }
         }
       }
+
+      const updatedStats = await fileStorage.getRevisionsDiskStats();
+
+      return {
+        cleanedCount: deletedCount,
+        freedBytes,
+        remainingCount: updatedStats.totalRevisionsCount,
+        totalDiskBytes: updatedStats.totalDiskBytes,
+      };
+    };
+
+    const documentId = options.documentId;
+    if (documentId) {
+      // A save writes a snapshot file and inserts its row in one save transaction;
+      // pruning must not run between those two steps for the same document. The
+      // shared lease also excludes the global (exclusive) pruning path.
+      return this.withSaveGate(() => this.withDocumentLock(documentId, () => runCleanup(documentId)));
     }
 
-    const updatedStats = await fileStorage.getRevisionsDiskStats();
-
-    return {
-      cleanedCount: deletedCount,
-      freedBytes,
-      remainingCount: updatedStats.totalRevisionsCount,
-      totalDiskBytes: updatedStats.totalDiskBytes,
-    };
+    // Global pruning touches every document's revision folder: block all saves
+    // while it runs instead of trying to lock an unknown, changing document set.
+    return this.runExclusiveMaintenance(() => runCleanup());
   }
 
   // Delete a single revision file and DB record
   public async deleteSingleRevision(documentId: string, revisionId: string): Promise<boolean> {
-    const db = this.getDb();
-    const diskRemoved = await fileStorage.deleteSingleRevisionFile(documentId, revisionId);
-    db.prepare('DELETE FROM document_revisions WHERE document_id = ? AND id = ?').run(documentId, revisionId);
-    return diskRemoved;
+    return this.withSaveGate(() =>
+      this.withDocumentLock(documentId, async () => {
+        const db = this.getDb();
+        const diskRemoved = await fileStorage.deleteSingleRevisionFile(documentId, revisionId);
+        db.prepare('DELETE FROM document_revisions WHERE document_id = ? AND id = ?').run(documentId, revisionId);
+        return diskRemoved;
+      })
+    );
   }
 }
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import os from 'node:os';
@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { apiRouter } from '../routes/api';
 import { authService } from '../services/authService';
 import { getDatabase, closeDatabase } from '../db/sqlite';
+import { fileStorage } from '../services/fileStorageService';
 
 const testDbPath = path.join(
   os.tmpdir(),
@@ -28,6 +29,7 @@ app.use('/api/v1', apiRouter);
 
 let db: any;
 let ownerToken: string;
+let ownerId: string;
 
 const auth = () => ({ Authorization: `Bearer ${ownerToken}` });
 
@@ -61,6 +63,7 @@ describe('Tag dictionary cleanup guard', () => {
     });
     expect(init.success).toBe(true);
     ownerToken = init.token!;
+    ownerId = init.user.id;
   });
 
   afterAll(() => {
@@ -139,5 +142,137 @@ describe('Tag dictionary cleanup guard', () => {
       'utf-8'
     );
     expect(raw).toContain(`"${tagName}"`);
+  });
+
+  it('cannot delete a tag association created by a save that races the scan', async () => {
+    const tagName = `race-${Date.now().toString(36)}`;
+    const created = await createDoc([]);
+    const tagId = `tag_race_${Date.now().toString(36)}`;
+    db.prepare('INSERT INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
+      tagId,
+      ownerId,
+      tagName,
+      tagName,
+      new Date().toISOString()
+    );
+
+    const originalRead = fileStorage.readDocumentMarkdown.bind(fileStorage);
+    let markScanStarted!: () => void;
+    const scanStarted = new Promise<void>(resolve => (markScanStarted = resolve));
+    let releaseScan!: () => void;
+    const scanGate = new Promise<void>(resolve => (releaseScan = resolve));
+    let pausedFirstRead = false;
+
+    const readSpy = vi.spyOn(fileStorage, 'readDocumentMarkdown').mockImplementation(async (docId: string) => {
+      if (!pausedFirstRead) {
+        pausedFirstRead = true;
+        markScanStarted();
+        await scanGate;
+      }
+      return originalRead(docId);
+    });
+
+    let prepareCalledWhileScanning = false;
+    const originalPrepare = fileStorage.prepareDocumentSave.bind(fileStorage);
+    const prepareSpy = vi.spyOn(fileStorage, 'prepareDocumentSave').mockImplementation(async (...args: any[]) => {
+      prepareCalledWhileScanning = true;
+      return originalPrepare(...(args as [string, string | null, string]));
+    });
+
+    try {
+      const deletePromise = request(app).delete(`/api/v1/tags/${encodeURIComponent(tagName)}`).set(auth());
+      void deletePromise.then(() => {}, () => {});
+      await scanStarted;
+
+      const savePromise = request(app)
+        .put(`/api/v1/documents/${created.id}`)
+        .set(auth())
+        .send({
+          title: created.title,
+          slug: created.slug,
+          rawMarkdown: '# 标签清理测试\n\n正文',
+          category: '安全与数据主权',
+          tags: [tagName],
+          visibility: 'private',
+          status: 'draft',
+          expectedVersionCount: created.versionCount,
+        });
+      void savePromise.then(() => {}, () => {});
+
+      // The exclusive maintenance lease must keep the save out of its write path.
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(prepareCalledWhileScanning).toBe(false);
+
+      releaseScan();
+      const [deleted, saved] = await Promise.all([deletePromise, savePromise]);
+      expect(deleted.status).toBe(200);
+      expect(saved.status).toBe(200);
+
+      // Either the cleanup retained the tag or the save re-created it. In both
+      // cases Markdown, document_tags and the tag dictionary must agree.
+      const raw = fs.readFileSync(path.join(testDataDir, 'documents', created.id, 'index.md'), 'utf-8');
+      expect(raw).toContain(`"${tagName}"`);
+      expect((db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any)?.id).toBeTruthy();
+      const assoc = db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM document_tags dt
+           JOIN tags t ON t.id = dt.tag_id
+           WHERE t.name = ? AND dt.document_id = ?`
+        )
+        .get(tagName, created.id) as any;
+      expect(assoc.c).toBe(1);
+    } finally {
+      releaseScan();
+      readSpy.mockRestore();
+      prepareSpy.mockRestore();
+    }
+  });
+
+  it('keeps the tag dictionary when the Markdown scan fails', async () => {
+    const tagName = `scan-fail-${Date.now().toString(36)}`;
+    const tagId = `tag_scan_${Date.now().toString(36)}`;
+    db.prepare('INSERT INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
+      tagId,
+      ownerId,
+      tagName,
+      tagName,
+      new Date().toISOString()
+    );
+
+    const readSpy = vi
+      .spyOn(fileStorage, 'readDocumentMarkdown')
+      .mockRejectedValueOnce(new Error('simulated EACCES while scanning Markdown'));
+
+    try {
+      const res = await request(app).delete(`/api/v1/tags/${encodeURIComponent(tagName)}`).set(auth());
+      expect(res.status).toBe(200);
+      expect(res.body.data.tagDeleted).toBe(false);
+      expect(res.body.data.reason).toBe('markdown_scan_failed');
+      expect((db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any)?.id).toBeTruthy();
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it('keeps the tag dictionary when the database association check fails', async () => {
+    const tagName = `db-fail-${Date.now().toString(36)}`;
+    const tagId = `tag_db_${Date.now().toString(36)}`;
+    db.prepare('INSERT INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
+      tagId,
+      ownerId,
+      tagName,
+      tagName,
+      new Date().toISOString()
+    );
+
+    db.exec('ALTER TABLE document_tags RENAME TO document_tags_broken');
+    try {
+      const res = await request(app).delete(`/api/v1/tags/${encodeURIComponent(tagName)}`).set(auth());
+      expect(res.status).toBe(500);
+      expect(res.body.error.code).toBe('TAG_CLEANUP_FAILED');
+      expect((db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any)?.id).toBeTruthy();
+    } finally {
+      db.exec('ALTER TABLE document_tags_broken RENAME TO document_tags');
+    }
   });
 });

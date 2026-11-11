@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import os from 'node:os';
@@ -543,9 +543,9 @@ describe('Document save reliability', () => {
     const backupPath = path.join(folder, 'index.md.bak');
     const markerPath = path.join(folder, '.save.pending');
 
-    // Rename inside the folder requires write permission; removing it simulates
-    // a filesystem EACCES during backup restore.
-    fs.chmodSync(folder, 0o500);
+    // Deterministic, cross-platform fault injection: force the restore primitive
+    // to report failure while the real backup file still exists.
+    const restoreSpy = vi.spyOn(fileStorage, 'restoreDocumentSaveBackup').mockResolvedValue(false);
     try {
       const blocked = await updateDoc(created.id, '# 恢复失败\n\nnew', created.versionCount);
       expect(blocked.status).toBe(503);
@@ -566,13 +566,49 @@ describe('Document save reliability', () => {
       expect(row.version_count).toBe(created.versionCount);
       expect(row.title).not.toBe('未提交且恢复失败');
     } finally {
-      fs.chmodSync(folder, 0o755);
+      restoreSpy.mockRestore();
     }
 
-    // Once the filesystem is writable again, recovery succeeds and the save runs.
+    // Once restoration works again, recovery succeeds and the save runs.
     const retried = await updateDoc(created.id, '# 恢复失败\n\nnew', created.versionCount);
     expect(retried.status).toBe(200);
     expect(readBody(created.id)).toBe('# 恢复失败\n\nnew');
+    expect(artifacts(created.id)).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  it('handles a real rename failure without relying on OS permission bits', async () => {
+    const created = await createDoc('# 重命名失败\n\nold');
+    const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+    const uncommitted = fullMarkdownWithMetadata(created.id, { title: '重命名失败的未提交标题' });
+    simulateCrashBeforeCommit(created.id, uncommitted);
+
+    const folder = path.join(testDataDir, 'documents', created.id);
+    const backupPath = path.join(folder, 'index.md.bak');
+    const markerPath = path.join(folder, '.save.pending');
+
+    // Replace the backup file with a directory: renaming it over index.md fails
+    // identically on Windows and Linux, without chmod.
+    fs.rmSync(backupPath, { recursive: true, force: true });
+    fs.mkdirSync(backupPath);
+
+    try {
+      const blocked = await updateDoc(created.id, '# 重命名失败\n\nnew', created.versionCount);
+      expect(blocked.status).toBe(503);
+      expect(blocked.body.error.code).toBe('SAVE_RECOVERY_REQUIRED');
+      expect(fs.existsSync(backupPath)).toBe(true);
+      expect(fs.statSync(backupPath).isDirectory()).toBe(true);
+      expect(fs.existsSync(markerPath)).toBe(true);
+      expect(fs.readFileSync(filePath(created.id), 'utf-8')).toBe(uncommitted);
+    } finally {
+      // Restore a valid backup so the retry can complete.
+      fs.rmSync(backupPath, { recursive: true, force: true });
+      fs.writeFileSync(backupPath, oldRaw, 'utf-8');
+    }
+
+    const retried = await updateDoc(created.id, '# 重命名失败\n\nnew', created.versionCount);
+    expect(retried.status).toBe(200);
+    expect(readBody(created.id)).toBe('# 重命名失败\n\nnew');
     expect(artifacts(created.id)).toEqual([]);
   });
 
@@ -583,7 +619,7 @@ describe('Document save reliability', () => {
     simulateCrashBeforeCommit(created.id, fullMarkdownWithMetadata(created.id, { title: '删除前的未提交标题' }));
 
     const folder = path.join(testDataDir, 'documents', created.id);
-    fs.chmodSync(folder, 0o500);
+    const restoreSpy = vi.spyOn(fileStorage, 'restoreDocumentSaveBackup').mockResolvedValue(false);
     try {
       const blocked = await request(app).delete(`/api/v1/documents/${created.id}`).set(auth());
       expect(blocked.status).toBe(503);
@@ -592,12 +628,125 @@ describe('Document save reliability', () => {
       expect(fs.readFileSync(path.join(folder, 'index.md.bak'), 'utf-8')).toBe(oldRaw);
       expect(fs.existsSync(path.join(folder, '.save.pending'))).toBe(true);
     } finally {
-      fs.chmodSync(folder, 0o755);
+      restoreSpy.mockRestore();
     }
 
     const deleted = await request(app).delete(`/api/v1/documents/${created.id}`).set(auth());
     expect(deleted.status).toBe(200);
     expect(fs.existsSync(folder)).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  it('serialises a save and a delete on the same document (save first)', async () => {
+    const created = await createDoc('# 保存删除竞争\n\nold');
+    const folder = path.join(testDataDir, 'documents', created.id);
+    const events: string[] = [];
+
+    const originalPrepare = fileStorage.prepareDocumentSave.bind(fileStorage);
+    let releasePrepare!: () => void;
+    const prepareGate = new Promise<void>(resolve => (releasePrepare = resolve));
+    let markPrepareStarted!: () => void;
+    const prepareStarted = new Promise<void>(resolve => (markPrepareStarted = resolve));
+    const prepareSpy = vi.spyOn(fileStorage, 'prepareDocumentSave').mockImplementation(async (...args: any[]) => {
+      events.push('prepare:start');
+      markPrepareStarted();
+      await prepareGate;
+      events.push('prepare:continue');
+      return originalPrepare(...(args as [string, string | null, string]));
+    });
+
+    const originalDeleteFolder = fileStorage.deleteDocumentFolder.bind(fileStorage);
+    let pendingAtDelete = true;
+    const deleteFolderSpy = vi.spyOn(fileStorage, 'deleteDocumentFolder').mockImplementation(async (docId: string) => {
+      events.push('delete-folder');
+      // The save finished (and its artifacts were finalized) before the lock
+      // was released, so nothing in-use can be deleted here.
+      pendingAtDelete = await fileStorage.hasPendingDocumentSave(docId);
+      return originalDeleteFolder(docId);
+    });
+
+    try {
+      const savePromise = updateDoc(created.id, '# 保存删除竞争\n\nsaved', created.versionCount);
+      await prepareStarted;
+
+      const deletePromise = request(app).delete(`/api/v1/documents/${created.id}`).set(auth());
+      void deletePromise.then(() => {}, () => {});
+      // Give the delete request a chance to (incorrectly) proceed.
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(events).not.toContain('delete-folder');
+
+      releasePrepare();
+      const [saved, deleted] = await Promise.all([savePromise, deletePromise]);
+
+      expect(saved.status).toBe(200);
+      expect(deleted.status).toBe(200);
+      expect(events.indexOf('delete-folder')).toBeGreaterThan(events.indexOf('prepare:continue'));
+      expect(pendingAtDelete).toBe(false);
+
+      // Save completed first, so delete removed both DB row and folder.
+      expect(db.prepare('SELECT id FROM documents WHERE id = ?').get(created.id)).toBeUndefined();
+      expect(fs.existsSync(folder)).toBe(false);
+    } finally {
+      releasePrepare();
+      prepareSpy.mockRestore();
+      deleteFolderSpy.mockRestore();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  it('serialises a delete and a save on the same document (delete first)', async () => {
+    const created = await createDoc('# 删除保存竞争\n\nold');
+    const folder = path.join(testDataDir, 'documents', created.id);
+    const events: string[] = [];
+
+    const originalDeleteFolder = fileStorage.deleteDocumentFolder.bind(fileStorage);
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>(resolve => (releaseDelete = resolve));
+    let markDeleteStarted!: () => void;
+    const deleteStarted = new Promise<void>(resolve => (markDeleteStarted = resolve));
+    const deleteFolderSpy = vi.spyOn(fileStorage, 'deleteDocumentFolder').mockImplementation(async (docId: string) => {
+      events.push('delete-folder:start');
+      markDeleteStarted();
+      await deleteGate;
+      events.push('delete-folder:end');
+      return originalDeleteFolder(docId);
+    });
+
+    const originalPrepare = fileStorage.prepareDocumentSave.bind(fileStorage);
+    const prepareSpy = vi.spyOn(fileStorage, 'prepareDocumentSave').mockImplementation(async (...args: any[]) => {
+      events.push('prepare');
+      return originalPrepare(...(args as [string, string | null, string]));
+    });
+
+    try {
+      const deletePromise = request(app).delete(`/api/v1/documents/${created.id}`).set(auth());
+      // Supertest only issues the request when it is awaited/then-ed; start it now.
+      void deletePromise.then(() => {}, () => {});
+      await deleteStarted;
+
+      const savePromise = updateDoc(created.id, '# 删除保存竞争\n\nrecreated', created.versionCount);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      // Save must wait for delete to release the per-document lock.
+      expect(events).toEqual(['delete-folder:start']);
+
+      releaseDelete();
+      const [deleted, saved] = await Promise.all([deletePromise, savePromise]);
+      expect(deleted.status).toBe(200);
+      expect(saved.status).toBe(200);
+
+      // Delete ran first; the save re-created the document. Either way, DB row and
+      // folder must agree (never a live row with a missing folder).
+      const row = db.prepare('SELECT id, version_count FROM documents WHERE id = ?').get(created.id) as any;
+      const folderExists = fs.existsSync(folder);
+      expect(Boolean(row)).toBe(folderExists);
+      expect(folderExists).toBe(true);
+      expect(row.version_count).toBe(1);
+      expect(readBody(created.id)).toBe('# 删除保存竞争\n\nrecreated');
+    } finally {
+      releaseDelete();
+      deleteFolderSpy.mockRestore();
+      prepareSpy.mockRestore();
+    }
   });
 
   // -------------------------------------------------------------------------
