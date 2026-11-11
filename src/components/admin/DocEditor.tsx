@@ -36,6 +36,8 @@ import {
   Folder,
   FileText,
   Image as ImageIcon,
+  AlertTriangle,
+  Loader2,
 } from 'lucide-react';
 import { Attachment, Category, DocStatus, DocVisibility, KnowledgeDoc } from '../../types';
 import { storage } from '../../services/storage';
@@ -127,6 +129,13 @@ export const DocEditor: React.FC<DocEditorProps> = ({
   const [isTagModalOpen, setIsTagModalOpen] = useState(false);
   const [tagSearchQuery, setTagSearchQuery] = useState('');
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<{
+    code: string;
+    message: string;
+    retryable: boolean;
+    conflict: boolean;
+  } | null>(null);
   const [copiedShareLink, setCopiedShareLink] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isUploadingFile, setIsUploadingFile] = useState(false);
@@ -270,7 +279,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [title, rawMarkdown, category, selectedTags, visibility, author, pinned, slug, isFullscreen]);
+  }, [title, rawMarkdown, category, selectedTags, visibility, author, pinned, slug, isFullscreen, isSaving]);
 
   // Track newly uploaded assets during this editing session for unsaved draft cleanup
   const sessionNewAssetIds = useRef<string[]>([]);
@@ -293,12 +302,12 @@ export const DocEditor: React.FC<DocEditorProps> = ({
     onCancel();
   };
 
-  const handleSave = (note?: string) => {
+  const handleSave = async (note?: string): Promise<void> => {
+    // Prevent duplicate requests from double clicks / rapid Ctrl+S.
+    if (isSaving) return;
+
     const finalTitle = title.trim() || extractTitle(rawMarkdown, '无标题笔记');
     const finalSlug = slug.trim() || generateSlug(finalTitle);
-
-    // Assets are now committed with document save, clear draft cleanup list
-    sessionNewAssetIds.current = [];
 
     // Synthesize full canonical Markdown with standard Frontmatter for storage & export
     const fullMarkdown = [
@@ -314,26 +323,50 @@ export const DocEditor: React.FC<DocEditorProps> = ({
       rawMarkdown.trimStart(),
     ].join('\n');
 
-    const saved = storage.saveDoc(
-      {
-        id: docId,
-        title: finalTitle,
-        slug: finalSlug,
-        rawMarkdown: fullMarkdown,
-        category,
-        tags: selectedTags,
-        visibility,
-        status,
-        author: author.trim() || 'Hecker',
-        unlistedKey: visibility === 'unlisted' ? unlistedKey : undefined,
-        pinned,
-      },
-      note || (initialDoc ? '在个人管理工作台保存修改' : '创建新文档')
-    );
+    setIsSaving(true);
+    setSaveError(null);
+    setSaveStatus(null);
 
-    setSaveStatus('已成功保存');
-    setTimeout(() => setSaveStatus(null), 2500);
-    onSaveSuccess(saved);
+    try {
+      const result = await storage.saveDoc(
+        {
+          id: docId,
+          title: finalTitle,
+          slug: finalSlug,
+          rawMarkdown: fullMarkdown,
+          category,
+          tags: selectedTags,
+          visibility,
+          status,
+          author: author.trim() || 'Hecker',
+          unlistedKey: visibility === 'unlisted' ? unlistedKey : undefined,
+          pinned,
+        },
+        note || (initialDoc ? '在个人管理工作台保存修改' : '创建新文档')
+      );
+
+      if (!result.success) {
+        // Editing state (rawMarkdown/title/...) is untouched, so the user can retry
+        // or copy the content out. Never report success here.
+        setSaveError({
+          code: result.error?.code || 'SAVE_FAILED',
+          message: result.error?.message || '保存失败，内容仍保留在编辑器中。',
+          retryable: Boolean(result.error?.retryable),
+          conflict: result.error?.code === 'VERSION_CONFLICT',
+        });
+        return;
+      }
+
+      // Assets are now committed with the document save, so draft cleanup is no
+      // longer needed for this editing session.
+      sessionNewAssetIds.current = [];
+
+      setSaveStatus('已成功保存');
+      setTimeout(() => setSaveStatus(null), 2500);
+      onSaveSuccess(result.doc);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   // Insert markdown syntax helper
@@ -510,10 +543,15 @@ export const DocEditor: React.FC<DocEditorProps> = ({
           <button
             type="button"
             onClick={() => handleSave()}
-            className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 hover:opacity-90 transition-opacity flex items-center gap-1.5 shadow-xs"
+            disabled={isSaving}
+            className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 hover:opacity-90 transition-opacity flex items-center gap-1.5 shadow-xs disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <Save className="w-3.5 h-3.5" />
-            <span>保存 (⌘S)</span>
+            {isSaving ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Save className="w-3.5 h-3.5" />
+            )}
+            <span>{isSaving ? '保存中...' : '保存 (⌘S)'}</span>
           </button>
 
           {saveStatus && (
@@ -671,6 +709,32 @@ export const DocEditor: React.FC<DocEditorProps> = ({
 
         </div>
       </div>
+
+      {/* Save failure feedback: editing state is preserved for retry/copy */}
+      {saveError && (
+        <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900/60 text-xs text-rose-800 dark:text-rose-200 flex items-start gap-2 animate-fade-in">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <div className="font-semibold">
+              {saveError.conflict ? '保存被拒绝：版本冲突' : '保存失败'}
+            </div>
+            <p className="mt-0.5 leading-relaxed">{saveError.message}</p>
+            <p className="mt-1 text-[11px] opacity-80">
+              当前编辑内容不会被清空；可复制内容后刷新页面，或直接重试。
+            </p>
+          </div>
+          {saveError.retryable && (
+            <button
+              type="button"
+              onClick={() => handleSave()}
+              disabled={isSaving}
+              className="shrink-0 px-2.5 py-1 rounded-md bg-rose-600 text-white font-semibold hover:bg-rose-700 disabled:opacity-50"
+            >
+              重试保存
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Editor & Preview Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2 p-2 bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-xl text-xs text-neutral-600 dark:text-neutral-400">
@@ -976,10 +1040,11 @@ export const DocEditor: React.FC<DocEditorProps> = ({
               <button
                 type="button"
                 onClick={() => handleSave()}
-                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 hover:opacity-90 flex items-center gap-1.5"
+                disabled={isSaving}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 hover:opacity-90 flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <Save className="w-3.5 h-3.5" />
-                <span>保存 (⌘S)</span>
+                {isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                <span>{isSaving ? '保存中...' : '保存 (⌘S)'}</span>
               </button>
 
               {/* Exit Fullscreen */}
@@ -997,6 +1062,22 @@ export const DocEditor: React.FC<DocEditorProps> = ({
 
           {/* Fullscreen Workspace Pane */}
           <div className="flex-1 min-h-0 bg-neutral-50/50 dark:bg-neutral-900/50 border border-neutral-200 dark:border-neutral-800 rounded-2xl overflow-hidden flex flex-col">
+            {saveError && (
+              <div className="px-4 py-2 bg-rose-50 dark:bg-rose-950/50 border-b border-rose-200 dark:border-rose-900/60 text-[11px] text-rose-800 dark:text-rose-200 flex items-center gap-2 shrink-0">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span className="flex-1 truncate">{saveError.message}</span>
+                {saveError.retryable && (
+                  <button
+                    type="button"
+                    onClick={() => handleSave()}
+                    disabled={isSaving}
+                    className="px-2 py-0.5 rounded bg-rose-600 text-white font-semibold disabled:opacity-50"
+                  >
+                    重试
+                  </button>
+                )}
+              </div>
+            )}
             <div
               className={`h-full grid divide-y lg:divide-y-0 lg:divide-x divide-neutral-200 dark:divide-neutral-800 ${
                 editorMode === 'split'

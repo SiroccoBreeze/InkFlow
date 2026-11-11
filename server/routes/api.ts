@@ -1,6 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authService } from '../services/authService';
-import { documentService, parseFrontmatter, buildFrontmatterBlock } from '../services/documentService';
+import {
+  documentService,
+  DocumentConflictError,
+  DocumentValidationError,
+  parseFrontmatter,
+  buildFrontmatterBlock,
+} from '../services/documentService';
 import { searchService } from '../services/searchService';
 import { shareService } from '../services/shareService';
 import { assetService } from '../services/assetService';
@@ -350,11 +356,20 @@ apiRouter.post('/documents', requireOwner, async (req, res) => {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: invalid } });
     return;
   }
+
+  // A POST is a create. Reusing an existing id must not silently overwrite it.
+  if (req.body?.id && documentService.documentExists(req.body.id)) {
+    res.status(409).json({
+      error: { code: 'DOCUMENT_EXISTS', message: '文档 ID 已存在，更新请使用 PUT 并携带 expectedVersionCount' },
+    });
+    return;
+  }
+
   try {
     const saved = await documentService.saveDocument(req.body, user.id, req.body.note);
     res.status(201).json({ data: saved });
   } catch (err: any) {
-    res.status(400).json({ error: { code: 'SAVE_FAILED', message: err?.message || '保存文档失败' } });
+    respondDocumentSaveError(res, err);
   }
 });
 
@@ -365,14 +380,50 @@ apiRouter.put('/documents/:id', requireOwner, async (req, res) => {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: invalid } });
     return;
   }
-  const input = { ...req.body, id: req.params.id };
+
+  // Optimistic lock precondition: clients must tell us which version they edited.
+  const expectedVersionCount = req.body?.expectedVersionCount;
+  if (!Number.isInteger(expectedVersionCount) || expectedVersionCount < 1) {
+    res.status(428).json({
+      error: {
+        code: 'PRECONDITION_REQUIRED',
+        message: '更新文档必须携带 expectedVersionCount（乐观锁版本号）',
+      },
+    });
+    return;
+  }
+
+  const input = { ...req.body, id: req.params.id, expectedVersionCount };
   try {
     const saved = await documentService.saveDocument(input, user.id, req.body.note);
     res.json({ data: saved });
   } catch (err: any) {
-    res.status(400).json({ error: { code: 'SAVE_FAILED', message: err?.message || '保存文档失败' } });
+    respondDocumentSaveError(res, err);
   }
 });
+
+/**
+ * Maps save failures to explicit HTTP semantics so the client can decide whether
+ * to retry, reload, or stop. Only genuine I/O/DB failures are reported as 500.
+ */
+function respondDocumentSaveError(res: Response, err: any): void {
+  if (err instanceof DocumentConflictError) {
+    res.status(409).json({
+      error: {
+        code: 'VERSION_CONFLICT',
+        message: err.message,
+        details: err.details,
+      },
+    });
+    return;
+  }
+  if (err instanceof DocumentValidationError) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: err.message } });
+    return;
+  }
+  console.error('[InkFlow Document Save]', err);
+  res.status(500).json({ error: { code: 'SAVE_FAILED', message: err?.message || '保存文档失败' } });
+}
 
 apiRouter.delete('/documents/:id', requireOwner, async (req, res) => {
   await documentService.deleteDocument(req.params.id);

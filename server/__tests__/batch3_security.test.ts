@@ -455,7 +455,13 @@ process.stdout.write(JSON.stringify({ success: result.success, message: result.m
       const updated = await request(app)
         .put(`/api/v1/documents/${created.body.data.id}`)
         .set('Authorization', `Bearer ${ownerToken}`)
-        .send({ title: '保持公开', rawMarkdown: '# 保持公开\n\nv2', category: '未分类', tags: [] });
+        .send({
+          title: '保持公开',
+          rawMarkdown: '# 保持公开\n\nv2',
+          category: '未分类',
+          tags: [],
+          expectedVersionCount: created.body.data.versionCount,
+        });
 
       expect(updated.status).toBe(200);
       expect(updated.body.data.visibility).toBe('public');

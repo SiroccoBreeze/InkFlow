@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
 import { marked } from 'marked';
 import { getDatabase, generateId } from '../db/sqlite';
 import { fileStorage } from './fileStorageService';
@@ -15,6 +16,78 @@ export interface DocumentInput {
   status?: 'draft' | 'published' | 'archived';
   pinned?: boolean;
   author?: string;
+  /** Version the client based its edit on. Required by the HTTP API for updates. */
+  expectedVersionCount?: number;
+}
+
+/** Thrown when a save is rejected because the document changed since the client read it. */
+export class DocumentConflictError extends Error {
+  public readonly code = 'VERSION_CONFLICT';
+  constructor(
+    public readonly details: {
+      currentVersionCount: number;
+      currentUpdatedAt: string;
+      currentContentHash: string;
+    }
+  ) {
+    super('文档已被其他客户端修改，请刷新后重试');
+  }
+}
+
+/** Thrown for malformed save payloads (HTTP 400). */
+export class DocumentValidationError extends Error {
+  public readonly code = 'VALIDATION_ERROR';
+}
+
+const MAX_MARKDOWN_BYTES = 5 * 1024 * 1024;
+const MAX_TITLE_LENGTH = 500;
+const MAX_CATEGORY_LENGTH = 120;
+const MAX_TAGS = 100;
+const MAX_TAG_LENGTH = 80;
+
+/** Validates a document save payload before any file or DB mutation. */
+export function assertValidDocumentInput(input: DocumentInput): void {
+  if (!input || typeof input !== 'object') {
+    throw new DocumentValidationError('无效的文档数据');
+  }
+  if (input.id !== undefined) {
+    if (typeof input.id !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(input.id)) {
+      throw new DocumentValidationError('非法的文档 ID');
+    }
+  }
+  if (typeof input.title !== 'string' || input.title.length > MAX_TITLE_LENGTH) {
+    throw new DocumentValidationError(`文档标题必须为不超过 ${MAX_TITLE_LENGTH} 字符的字符串`);
+  }
+  if (typeof input.rawMarkdown !== 'string') {
+    throw new DocumentValidationError('文档正文必须为字符串');
+  }
+  if (Buffer.byteLength(input.rawMarkdown, 'utf-8') > MAX_MARKDOWN_BYTES) {
+    throw new DocumentValidationError('文档正文超过 5MB 限制');
+  }
+  if (input.category !== undefined && (typeof input.category !== 'string' || input.category.length > MAX_CATEGORY_LENGTH)) {
+    throw new DocumentValidationError(`分类必须为不超过 ${MAX_CATEGORY_LENGTH} 字符的字符串`);
+  }
+  if (input.tags !== undefined) {
+    if (!Array.isArray(input.tags) || input.tags.length > MAX_TAGS) {
+      throw new DocumentValidationError(`标签必须为不超过 ${MAX_TAGS} 项的数组`);
+    }
+    for (const tag of input.tags) {
+      if (typeof tag !== 'string' || tag.length > MAX_TAG_LENGTH) {
+        throw new DocumentValidationError(`单个标签必须为不超过 ${MAX_TAG_LENGTH} 字符的字符串`);
+      }
+    }
+  }
+  if (input.visibility !== undefined && !['public', 'private', 'unlisted'].includes(input.visibility)) {
+    throw new DocumentValidationError('visibility 仅允许 public / private / unlisted');
+  }
+  if (input.status !== undefined && !['draft', 'published', 'archived'].includes(input.status)) {
+    throw new DocumentValidationError('status 仅允许 draft / published / archived');
+  }
+  if (input.expectedVersionCount !== undefined) {
+    if (!Number.isInteger(input.expectedVersionCount) || input.expectedVersionCount < 1) {
+      throw new DocumentValidationError('expectedVersionCount 必须为大于 0 的整数');
+    }
+  }
 }
 
 export function parseFrontmatter(markdown: string): {
@@ -336,17 +409,110 @@ export class DocumentService {
     return isOwner ? result : toPublicDocument(result);
   }
 
-  // Create or Update Document: Dual write to physical disk and SQLite
+  // Per-document save mutex: serialises the Markdown + SQLite write sequence inside
+  // this process, so two requests cannot interleave between the version check and commit.
+  private saveLocks = new Map<string, Promise<void>>();
+
+  private async withDocumentLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.saveLocks.get(docId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const tail = previous.catch(() => {}).then(() => gate);
+    this.saveLocks.set(docId, tail);
+    await previous.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.saveLocks.get(docId) === tail) this.saveLocks.delete(docId);
+    }
+  }
+
+  public documentExists(docId: string): boolean {
+    if (!docId || typeof docId !== 'string') return false;
+    const row = this.getDb().prepare('SELECT 1 AS ok FROM documents WHERE id = ?').get(docId) as any;
+    return Boolean(row?.ok);
+  }
+
+  /**
+   * Recovers saves interrupted between the Markdown rename and the SQLite commit.
+   * The DB content hash is the commit point: if index.md matches it the save is
+   * kept, otherwise the previous file is restored (or an uncommitted new file removed).
+   */
+  private async recoverPendingSave(docId: string): Promise<boolean> {
+    if (!(await fileStorage.hasPendingDocumentSave(docId))) return false;
+
+    const db = this.getDb();
+    const row = db.prepare('SELECT content_hash FROM documents WHERE id = ?').get(docId) as any;
+    const currentMarkdown = await fileStorage.readDocumentMarkdown(docId);
+    let currentHash: string | null = null;
+    if (currentMarkdown !== null) {
+      currentHash = calculateContentHash(parseFrontmatter(currentMarkdown).body.trim());
+    }
+
+    if (row) {
+      if (currentHash === row.content_hash) {
+        // Committed (or the file was never replaced): the backup is stale.
+        await fileStorage.clearDocumentSaveArtifacts(docId);
+      } else {
+        const restored = await fileStorage.restoreDocumentSaveBackup(docId);
+        if (!restored) {
+          const hasBackup = (await fileStorage.readDocumentSaveBackup(docId)) !== null;
+          if (hasBackup) {
+            // Backup exists but could not be restored (I/O error). Leave every
+            // artifact in place so a later recovery attempt can retry.
+            console.error(`[InkFlow Save Recovery] Could not restore backup for ${docId}; will retry later.`);
+            return false;
+          }
+          // No backup at all: index.md is ahead of the DB with nothing to restore.
+          const indexPath = fileStorage.getDocumentIndexPath(docId);
+          if (indexPath) {
+            await fs.rm(indexPath, { force: true }).catch(() => {});
+          }
+        }
+        await fileStorage.clearDocumentSaveArtifacts(docId);
+      }
+    } else {
+      // Interrupted create: no DB row means this Markdown was never committed.
+      // The folder only contains the uncommitted index/artifacts, so remove it.
+      await fileStorage.deleteDocumentFolder(docId);
+    }
+
+    return true;
+  }
+
+  /** Runs crash recovery for every document that left save artifacts behind. */
+  public async recoverPendingSaves(): Promise<number> {
+    const ids = await fileStorage.listPendingSaveDocumentIds();
+    let recovered = 0;
+    for (const id of ids) {
+      try {
+        if (await this.recoverPendingSave(id)) recovered++;
+      } catch (err) {
+        console.error(`[InkFlow Save Recovery] Failed recovering ${id}:`, err);
+      }
+    }
+    return recovered;
+  }
+
+  // Create or Update Document: dual write to physical disk and SQLite.
+  // The HTTP layer requires expectedVersionCount for updates; internal callers
+  // (rollback, index rebuild) may omit it and are serialised by the same lock.
   public async saveDocument(input: DocumentInput, ownerId: string, note?: string) {
+    assertValidDocumentInput(input);
+
+    const docId = input.id || generateId('doc');
+    return this.withDocumentLock(docId, async () => {
+      // Heal a previously interrupted save for this document before touching it again.
+      await this.recoverPendingSave(docId);
+      return this.saveDocumentLocked(input, docId, ownerId, note);
+    });
+  }
+
+  private async saveDocumentLocked(input: DocumentInput, docId: string, ownerId: string, note?: string) {
     const db = this.getDb();
     const now = new Date().toISOString();
 
-    // Reject IDs that cannot be used safely as a storage folder segment.
-    if (input.id && !/^[A-Za-z0-9._-]{1,200}$/.test(input.id)) {
-      throw new Error('非法的文档 ID');
-    }
-
-    const docId = input.id || generateId('doc');
     const title = input.title.trim() || '无标题文档';
     const slug = (input.slug || input.title || docId)
       .toLowerCase()
@@ -355,15 +521,26 @@ export class DocumentService {
     const category = input.category?.trim() || '未分类';
     const tags = (input.tags || []).map(t => t.trim().replace(/^#/, '')).filter(Boolean);
 
-    // Check existing document first so updates never silently loosen publication state.
+    // Re-read inside the lock: this is the authoritative "version we are editing from".
     const existing = db.prepare('SELECT * FROM documents WHERE id = ?').get(docId) as any;
+
+    if (
+      existing &&
+      input.expectedVersionCount !== undefined &&
+      input.expectedVersionCount !== existing.version_count
+    ) {
+      throw new DocumentConflictError({
+        currentVersionCount: existing.version_count,
+        currentUpdatedAt: existing.updated_at,
+        currentContentHash: existing.content_hash,
+      });
+    }
 
     // Secure defaults: a brand-new document is a PRIVATE DRAFT unless the owner explicitly publishes it.
     const visibility = input.visibility ?? existing?.visibility ?? 'private';
     const status = input.status ?? existing?.status ?? 'draft';
     const pinned = input.pinned ? 1 : 0;
 
-    // Parse body for stats and hash
     const { body } = parseFrontmatter(input.rawMarkdown);
     const cleanBody = body.trim();
     const contentHash = calculateContentHash(cleanBody);
@@ -372,7 +549,6 @@ export class DocumentService {
     const createdAt = existing?.created_at || now;
     const versionCount = (existing?.version_count || 0) + 1;
 
-    // Assemble canonical Markdown file with Frontmatter
     const fullMarkdown = [
       buildFrontmatterBlock({
         id: docId,
@@ -392,125 +568,179 @@ export class DocumentService {
       cleanBody,
     ].join('\n');
 
-    // 1. Physically write to disk: storage/documents/{docId}/index.md
-    const relativeFilePath = await fileStorage.saveDocumentMarkdown(docId, fullMarkdown);
-
-    // 2. Upsert Category if new
-    const existingCat = db.prepare('SELECT id FROM categories WHERE name = ?').get(category) as any;
-    let categoryId = existingCat?.id;
-    if (!categoryId) {
-      categoryId = generateId('cat');
-      db.prepare(`
-        INSERT OR IGNORE INTO categories (id, owner_id, name, slug, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(categoryId, ownerId, category, slug, now, now);
+    // 1. Stage the new Markdown and back up the previous file. index.md is untouched
+    //    until commitStagedDocumentSave() renames the temp file.
+    const previousMarkdown = await fileStorage.readDocumentMarkdown(docId);
+    const artifacts = await fileStorage.prepareDocumentSave(docId, previousMarkdown, fullMarkdown);
+    if (!artifacts) {
+      throw new Error('无法准备文档存储路径');
     }
 
-    // 3. Update SQLite documents table first (so foreign keys in child tables succeed)
-    db.prepare(`
-      INSERT INTO documents (
-        id, owner_id, slug, title, description, category_id, category_name,
-        file_path, visibility, status, content_hash, word_count, reading_time,
-        pinned, version_count, created_at, updated_at, published_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        title = excluded.title,
-        slug = excluded.slug,
-        category_id = excluded.category_id,
-        category_name = excluded.category_name,
-        file_path = excluded.file_path,
-        visibility = excluded.visibility,
-        status = excluded.status,
-        content_hash = excluded.content_hash,
-        word_count = excluded.word_count,
-        reading_time = excluded.reading_time,
-        pinned = excluded.pinned,
-        version_count = excluded.version_count,
-        updated_at = excluded.updated_at
-    `).run(
-      docId,
-      ownerId,
-      slug,
-      title,
-      cleanBody.slice(0, 160).replace(/\n/g, ' '),
-      categoryId,
-      category,
-      relativeFilePath,
-      visibility,
-      status,
-      contentHash,
-      stats.wordCount,
-      stats.readingTime,
-      pinned,
-      versionCount,
-      createdAt,
-      now,
-      // recorded only when the document is actually public
-      visibility === 'public' ? (existing?.published_at || now) : null
-    );
+    let dbCommitted = false;
+    let revisionId: string | null = null;
 
-    // 4. Save revision snapshot now that documents row exists
-    if (existing) {
-      const revId = generateId('rev');
-      const snapshotPath = await fileStorage.saveRevisionSnapshot(docId, revId, fullMarkdown);
-      db.prepare(`
-        INSERT INTO document_revisions (id, document_id, title, content_hash, snapshot_path, version_number, note, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(revId, docId, title, contentHash, snapshotPath, versionCount, note || '更新文章内容', now);
-    } else {
-      const revId = generateId('rev');
-      const snapshotPath = await fileStorage.saveRevisionSnapshot(docId, revId, fullMarkdown);
-      db.prepare(`
-        INSERT INTO document_revisions (id, document_id, title, content_hash, snapshot_path, version_number, note, created_at)
-        VALUES (?, ?, ?, ?, ?, 1, '创建初始化版本', ?)
-      `).run(revId, docId, title, contentHash, snapshotPath, now);
-    }
+    try {
+      // 2. Commit the file change (atomic rename on the same filesystem).
+      await fileStorage.commitStagedDocumentSave(artifacts.stagedPath, artifacts.finalPath);
 
-    // 5. Update Tags & Associations
-    db.prepare('DELETE FROM document_tags WHERE document_id = ?').run(docId);
-    for (const tagName of tags) {
-      let tagRow = db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any;
-      let tagId = tagRow?.id;
-      if (!tagId) {
-        tagId = generateId('tag');
-        db.prepare('INSERT OR IGNORE INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
-          tagId,
-          ownerId,
-          tagName,
-          tagName.toLowerCase(),
+      // 3. All SQLite writes happen in one transaction. If anything fails (revision
+      //    snapshot I/O, FTS, tag, asset association), the DB rolls back and the
+      //    Markdown file is restored from the backup below.
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const existingCat = db.prepare('SELECT id FROM categories WHERE name = ?').get(category) as any;
+        let categoryId = existingCat?.id;
+        if (!categoryId) {
+          categoryId = generateId('cat');
+          db.prepare(`
+            INSERT OR IGNORE INTO categories (id, owner_id, name, slug, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).run(categoryId, ownerId, category, slug, now, now);
+        }
+
+        if (existing) {
+          const updated = db.prepare(`
+            UPDATE documents SET
+              title = ?, slug = ?, category_id = ?, category_name = ?, file_path = ?,
+              visibility = ?, status = ?, content_hash = ?, word_count = ?, reading_time = ?,
+              pinned = ?, version_count = ?, updated_at = ?
+            WHERE id = ? AND version_count = ?
+          `).run(
+            title,
+            slug,
+            categoryId,
+            category,
+            fileStorage.toStorageRelativePath(artifacts.finalPath),
+            visibility,
+            status,
+            contentHash,
+            stats.wordCount,
+            stats.readingTime,
+            pinned,
+            versionCount,
+            now,
+            docId,
+            existing.version_count
+          );
+
+          if (Number((updated as any).changes) !== 1) {
+            const current = db.prepare('SELECT version_count, updated_at, content_hash FROM documents WHERE id = ?').get(docId) as any;
+            throw new DocumentConflictError({
+              currentVersionCount: current?.version_count ?? versionCount,
+              currentUpdatedAt: current?.updated_at ?? now,
+              currentContentHash: current?.content_hash ?? contentHash,
+            });
+          }
+        } else {
+          db.prepare(`
+            INSERT INTO documents (
+              id, owner_id, slug, title, description, category_id, category_name,
+              file_path, visibility, status, content_hash, word_count, reading_time,
+              pinned, version_count, created_at, updated_at, published_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            docId,
+            ownerId,
+            slug,
+            title,
+            cleanBody.slice(0, 160).replace(/\n/g, ' '),
+            categoryId,
+            category,
+            fileStorage.toStorageRelativePath(artifacts.finalPath),
+            visibility,
+            status,
+            contentHash,
+            stats.wordCount,
+            stats.readingTime,
+            pinned,
+            versionCount,
+            createdAt,
+            now,
+            visibility === 'public' ? now : null
+          );
+        }
+
+        revisionId = generateId('rev');
+        const snapshotPath = await fileStorage.saveRevisionSnapshot(docId, revisionId, fullMarkdown);
+        db.prepare(`
+          INSERT INTO document_revisions (id, document_id, title, content_hash, snapshot_path, version_number, note, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          revisionId,
+          docId,
+          title,
+          contentHash,
+          snapshotPath,
+          versionCount,
+          existing ? note || '更新文章内容' : '创建初始化版本',
           now
         );
+
+        db.prepare('DELETE FROM document_tags WHERE document_id = ?').run(docId);
+        for (const tagName of tags) {
+          let tagRow = db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any;
+          let tagId = tagRow?.id;
+          if (!tagId) {
+            tagId = generateId('tag');
+            db.prepare('INSERT OR IGNORE INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
+              tagId,
+              ownerId,
+              tagName,
+              tagName.toLowerCase(),
+              now
+            );
+          }
+          db.prepare('INSERT OR IGNORE INTO document_tags (document_id, tag_id) VALUES (?, ?)').run(docId, tagId);
+        }
+
+        db.prepare('DELETE FROM documents_fts WHERE document_id = ?').run(docId);
+        db.prepare(`
+          INSERT INTO documents_fts (document_id, title, body, category, tags)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(docId, title, cleanBody, category, tags.join(' '));
+
+        this.syncDocumentAssets(docId, cleanBody);
+
+        db.exec('COMMIT');
+        dbCommitted = true;
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // transaction may already be rolled back by SQLite
+        }
+        throw err;
       }
-      db.prepare('INSERT OR IGNORE INTO document_tags (document_id, tag_id) VALUES (?, ?)').run(docId, tagId);
+
+      // 4. Success: drop the backup marker files.
+      await fileStorage.finalizeDocumentSave(artifacts);
+
+      return {
+        id: docId,
+        slug,
+        title,
+        category,
+        tags,
+        visibility,
+        status,
+        pinned: Boolean(pinned),
+        versionCount,
+        wordCount: stats.wordCount,
+        readingTime: stats.readingTime,
+        createdAt,
+        updatedAt: now,
+        rawMarkdown: fullMarkdown,
+      };
+    } catch (err) {
+      if (!dbCommitted) {
+        if (revisionId) {
+          await fileStorage.deleteSingleRevisionFile(docId, revisionId).catch(() => {});
+        }
+        await fileStorage.rollbackDocumentSave(docId, artifacts).catch(() => {});
+      }
+      throw err;
     }
-
-    // 6. Update FTS5 Search Index
-    db.prepare('DELETE FROM documents_fts WHERE document_id = ?').run(docId);
-    db.prepare(`
-      INSERT INTO documents_fts (document_id, title, body, category, tags)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(docId, title, cleanBody, category, tags.join(' '));
-
-    // 7. Persist the authoritative asset references (parsed, never substring-guessed)
-    this.syncDocumentAssets(docId, cleanBody);
-
-    return {
-      id: docId,
-      slug,
-      title,
-      category,
-      tags,
-      visibility,
-      status,
-      pinned: Boolean(pinned),
-      versionCount,
-      wordCount: stats.wordCount,
-      readingTime: stats.readingTime,
-      createdAt,
-      updatedAt: now,
-      rawMarkdown: fullMarkdown,
-    };
   }
 
   /**
@@ -720,6 +950,9 @@ export class DocumentService {
         visibility: (frontmatter.visibility || docRow.visibility) as any,
         pinned: Boolean(frontmatter.pinned !== undefined ? frontmatter.pinned : docRow.pinned),
         author: frontmatter.author || 'Hecker',
+        // Rollback is an intentional overwrite, but still participates in the
+        // optimistic lock so a concurrent edit cannot be silently clobbered.
+        expectedVersionCount: docRow.version_count,
       },
       ownerId,
       `回滚至历史版本 v${snapshot.versionNumber}`

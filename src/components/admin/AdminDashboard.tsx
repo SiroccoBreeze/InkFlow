@@ -246,9 +246,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     );
   };
 
-  // Quick document operations
-  const handleQuickVisibilityChange = (doc: KnowledgeDoc, newVis: DocVisibility) => {
-    storage.saveDoc(
+  // Quick document operations. Every mutation now waits for the server commit;
+  // the local cache only changes on success.
+  const saveDocWithFeedback = async (
+    input: Parameters<typeof storage.saveDoc>[0],
+    note: string,
+    successMessage: string
+  ): Promise<boolean> => {
+    const result = await storage.saveDoc(input, note);
+    // Refresh in both cases: on failure this restores the controls to the
+    // server-confirmed local state instead of showing an unsaved value.
+    onRefreshData();
+    if (result.success) {
+      showStatus(successMessage);
+      return true;
+    }
+    showStatus(`保存失败：${result.error?.message || '未知错误'}`);
+    return false;
+  };
+
+  const handleQuickVisibilityChange = async (doc: KnowledgeDoc, newVis: DocVisibility) => {
+    await saveDocWithFeedback(
       {
         ...doc,
         visibility: newVis,
@@ -257,47 +275,43 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             ? doc.unlistedKey || Math.random().toString(36).slice(2, 10)
             : undefined,
       },
-      `修改可见性为 ${newVis}`
+      `修改可见性为 ${newVis}`,
+      `已更新「${doc.title}」为 ${newVis}`
     );
-    onRefreshData();
-    showStatus(`已更新「${doc.title}」为 ${newVis}`);
   };
 
-  const handleQuickCategoryChange = (doc: KnowledgeDoc, newCat: string) => {
-    storage.saveDoc(
+  const handleQuickCategoryChange = async (doc: KnowledgeDoc, newCat: string) => {
+    await saveDocWithFeedback(
       {
         ...doc,
         category: newCat,
       },
-      `修改分类为 ${newCat}`
+      `修改分类为 ${newCat}`,
+      `已更新「${doc.title}」分类为「${newCat}」`
     );
-    onRefreshData();
-    showStatus(`已更新「${doc.title}」分类为「${newCat}」`);
   };
 
-  const handleQuickStatusChange = (doc: KnowledgeDoc, newStatus: DocStatus) => {
-    storage.saveDoc(
+  const handleQuickStatusChange = async (doc: KnowledgeDoc, newStatus: DocStatus) => {
+    await saveDocWithFeedback(
       {
         ...doc,
         status: newStatus,
       },
-      `修改发布状态为 ${newStatus}`
+      `修改发布状态为 ${newStatus}`,
+      `已更新「${doc.title}」为「${DOC_STATUS_LABELS[newStatus]}」`
     );
-    onRefreshData();
-    showStatus(`已更新「${doc.title}」为「${DOC_STATUS_LABELS[newStatus]}」`);
   };
 
-  const handleQuickPinToggle = (doc: KnowledgeDoc) => {
+  const handleQuickPinToggle = async (doc: KnowledgeDoc) => {
     const nextPinned = !doc.pinned;
-    storage.saveDoc(
+    await saveDocWithFeedback(
       {
         ...doc,
         pinned: nextPinned,
       },
-      nextPinned ? '置顶文档' : '取消置顶'
+      nextPinned ? '置顶文档' : '取消置顶',
+      nextPinned ? `已置顶「${doc.title}」` : `已取消置顶「${doc.title}」`
     );
-    onRefreshData();
-    showStatus(nextPinned ? `已置顶「${doc.title}」` : `已取消置顶「${doc.title}」`);
   };
 
   const handleDeleteDoc = (id: string, title: string) => {
@@ -381,61 +395,84 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     });
   };
 
-  const handleBatchSetVisibility = (newVis: DocVisibility) => {
-    if (selectedDocIds.length === 0) return;
-    selectedDocIds.forEach(id => {
+  const runBatchSave = async (
+    ids: string[],
+    buildInput: (doc: KnowledgeDoc) => Parameters<typeof storage.saveDoc>[0],
+    note: string
+  ): Promise<{ succeeded: number; failed: number }> => {
+    let succeeded = 0;
+    let failed = 0;
+    // Sequential: each save waits for the server so version numbers stay ordered.
+    for (const id of ids) {
       const doc = storage.getDocById(id);
-      if (doc) {
-        storage.saveDoc({
-          ...doc,
-          visibility: newVis,
-          unlistedKey:
-            newVis === 'unlisted'
-              ? doc.unlistedKey || Math.random().toString(36).slice(2, 10)
-              : undefined,
-        });
+      if (!doc) continue;
+      const result = await storage.saveDoc(buildInput(doc), note);
+      if (result.success) succeeded++;
+      else {
+        failed++;
+        console.error(`Batch save failed for ${id}:`, result.error);
       }
-    });
-    setSelectedDocIds([]);
+    }
     onRefreshData();
-    showStatus(`已将选中的 ${selectedDocIds.length} 篇文档批量设为 ${newVis}`);
+    return { succeeded, failed };
   };
 
-  const handleBatchSetStatus = (newStatus: DocStatus) => {
+  const handleBatchSetVisibility = async (newVis: DocVisibility) => {
     if (selectedDocIds.length === 0) return;
-    selectedDocIds.forEach(id => {
-      const doc = storage.getDocById(id);
-      if (doc) {
-        storage.saveDoc(
-          {
-            ...doc,
-            status: newStatus,
-          },
-          `批量修改发布状态为 ${newStatus}`
-        );
-      }
-    });
+    const ids = [...selectedDocIds];
+    const { succeeded, failed } = await runBatchSave(
+      ids,
+      doc => ({
+        ...doc,
+        visibility: newVis,
+        unlistedKey:
+          newVis === 'unlisted'
+            ? doc.unlistedKey || Math.random().toString(36).slice(2, 10)
+            : undefined,
+      }),
+      `批量修改可见性为 ${newVis}`
+    );
+    setSelectedDocIds([]);
+    showStatus(
+      failed === 0
+        ? `已将选中的 ${succeeded} 篇文档批量设为 ${newVis}`
+        : `批量更新完成：成功 ${succeeded} 篇，失败 ${failed} 篇（失败项未修改）`
+    );
+  };
+
+  const handleBatchSetStatus = async (newStatus: DocStatus) => {
+    if (selectedDocIds.length === 0) return;
+    const ids = [...selectedDocIds];
+    const { succeeded, failed } = await runBatchSave(
+      ids,
+      doc => ({ ...doc, status: newStatus }),
+      `批量修改发布状态为 ${newStatus}`
+    );
     setSelectedDocIds([]);
     setBatchStatus('');
-    onRefreshData();
-    showStatus(`已将选中的 ${selectedDocIds.length} 篇文档批量设为「${DOC_STATUS_LABELS[newStatus]}」`);
+    showStatus(
+      failed === 0
+        ? `已将选中的 ${succeeded} 篇文档批量设为「${DOC_STATUS_LABELS[newStatus]}」`
+        : `批量更新完成：成功 ${succeeded} 篇，失败 ${failed} 篇（失败项未修改）`
+    );
   };
 
-  const handleBatchMoveCategory = () => {
+  const handleBatchMoveCategory = async () => {
     if (selectedDocIds.length === 0 || !batchMoveCat) return;
-    selectedDocIds.forEach(id => {
-      const doc = storage.getDocById(id);
-      if (doc) {
-        storage.saveDoc({
-          ...doc,
-          category: batchMoveCat,
-        });
-      }
-    });
-    showStatus(`已将选中的 ${selectedDocIds.length} 篇文档移动至「${batchMoveCat}」`);
-    setSelectedDocIds([]);
+    const ids = [...selectedDocIds];
+    const targetCategory = batchMoveCat;
+    const { succeeded, failed } = await runBatchSave(
+      ids,
+      doc => ({ ...doc, category: targetCategory }),
+      `批量移动到分类 ${targetCategory}`
+    );
     setBatchMoveCat('');
-    onRefreshData();
+    setSelectedDocIds([]);
+    showStatus(
+      failed === 0
+        ? `已将选中的 ${succeeded} 篇文档移动至「${targetCategory}」`
+        : `批量移动完成：成功 ${succeeded} 篇，失败 ${failed} 篇（失败项未修改）`
+    );
   };
 
   const handleBatchExportZip = async () => {

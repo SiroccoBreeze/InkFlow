@@ -167,7 +167,23 @@ const INITIAL_FORUM_REPLIES: ForumReply[] = [
   },
 ];
 
-class StorageService {
+export interface SaveDocError {
+  code: string;
+  message: string;
+  status?: number;
+  retryable: boolean;
+  details?: any;
+}
+
+export interface SaveDocResult {
+  success: boolean;
+  serverSaved: boolean;
+  /** Candidate doc built from the input; on success, the server-adopted document. */
+  doc: KnowledgeDoc;
+  error?: SaveDocError;
+}
+
+export class StorageService {
   private docsCache: KnowledgeDoc[] | null = null;
   private categoriesCache: Category[] | null = null;
   private versionsCache: DocVersion[] | null = null;
@@ -262,19 +278,88 @@ class StorageService {
     );
   }
 
-  public saveDoc(docInput: Partial<KnowledgeDoc> & { rawMarkdown: string }, note?: string): KnowledgeDoc {
+  // Serialises saves per document: each queued save starts only after the previous
+  // one settled, so two clicks cannot race each other with the same version number.
+  private saveQueues = new Map<string, Promise<SaveDocResult>>();
+  private inFlightSaves = new Map<string, { signature: string; promise: Promise<SaveDocResult> }>();
+
+  /**
+   * Persists a document.
+   *
+   * Local cache is updated ONLY after the server confirms the write, so a failed
+   * save never masquerades as success. The returned `doc` is the candidate built
+   * from the editor input and is useful for error reporting; on success it is the
+   * server-adopted document (including the new versionCount/updatedAt).
+   */
+  public saveDoc(
+    docInput: Partial<KnowledgeDoc> & { rawMarkdown: string },
+    note?: string
+  ): Promise<SaveDocResult> {
+    const docId =
+      docInput.id || `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const input = { ...docInput, id: docId };
+
+    const signature = JSON.stringify({
+      id: docId,
+      title: input.title,
+      rawMarkdown: input.rawMarkdown,
+      category: input.category,
+      tags: input.tags,
+      visibility: input.visibility,
+      status: input.status,
+      pinned: input.pinned,
+      author: input.author,
+      note: note || '',
+    });
+
+    // Identical request already in flight → share its promise instead of sending twice.
+    const inFlight = this.inFlightSaves.get(docId);
+    if (inFlight && inFlight.signature === signature) {
+      return inFlight.promise;
+    }
+
+    const previous = this.saveQueues.get(docId);
+    const promise = (previous ? previous.catch(() => null) : Promise.resolve(null))
+      .then(() => this.performSave(input as Partial<KnowledgeDoc> & { rawMarkdown: string }, note))
+      .catch(err => ({
+        success: false,
+        serverSaved: false,
+        doc: (this.getDocById(docId) || (input as unknown as KnowledgeDoc)),
+        error: {
+          code: 'CLIENT_ERROR',
+          message: `保存时发生未知错误：${err?.message || '请重试'}`,
+          retryable: true,
+        },
+      }));
+
+    this.saveQueues.set(docId, promise);
+    this.inFlightSaves.set(docId, { signature, promise });
+
+    const cleanup = () => {
+      if (this.saveQueues.get(docId) === promise) this.saveQueues.delete(docId);
+      const current = this.inFlightSaves.get(docId);
+      if (current?.promise === promise) this.inFlightSaves.delete(docId);
+    };
+    void promise.then(cleanup, cleanup);
+
+    return promise;
+  }
+
+  private async performSave(
+    docInput: Partial<KnowledgeDoc> & { rawMarkdown: string },
+    note?: string
+  ): Promise<SaveDocResult> {
     const docs = this.getDocs();
     const now = new Date().toISOString();
     const stats = calculateReadingStats(docInput.rawMarkdown);
     const existingIndex = docs.findIndex(d => d.id === docInput.id);
+    const existing = existingIndex >= 0 ? docs[existingIndex] : undefined;
+    const contentChanged = existing ? existing.rawMarkdown !== docInput.rawMarkdown : true;
 
-    let finalDoc: KnowledgeDoc;
+    let candidate: KnowledgeDoc;
 
-    if (existingIndex >= 0) {
-      const existing = docs[existingIndex];
-      const contentChanged = existing.rawMarkdown !== docInput.rawMarkdown;
-
-      finalDoc = {
+    if (existing) {
+      candidate = {
         ...existing,
         ...docInput,
         title: docInput.title || existing.title || extractTitle(docInput.rawMarkdown),
@@ -283,76 +368,172 @@ class StorageService {
         tags: docInput.tags || existing.tags || [],
         visibility: docInput.visibility || existing.visibility || 'private',
         status: docInput.status || existing.status || 'draft',
-        unlistedKey: docInput.visibility === 'unlisted' ? (existing.unlistedKey || Math.random().toString(36).slice(2, 10)) : undefined,
+        unlistedKey:
+          docInput.visibility === 'unlisted'
+            ? existing.unlistedKey || Math.random().toString(36).slice(2, 10)
+            : undefined,
         updatedAt: now,
         wordCount: stats.wordCount,
         readingTimeMinutes: stats.readingTimeMinutes,
-        versionCount: contentChanged ? existing.versionCount + 1 : existing.versionCount,
+        // The server owns the version counter; adopt it in the success branch.
+        versionCount: existing.versionCount,
       };
-
-      docs[existingIndex] = finalDoc;
-
-      if (contentChanged) {
-        this.createVersionSnapshot(finalDoc, note || '更新文档内容');
-      }
     } else {
-      const newId = docInput.id || `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
       const title = docInput.title || extractTitle(docInput.rawMarkdown);
-      const slug = docInput.slug || generateSlug(title);
-
-      finalDoc = {
-        id: newId,
-        slug,
+      candidate = {
+        id: docInput.id as string,
+        slug: docInput.slug || generateSlug(title),
         title,
         rawMarkdown: docInput.rawMarkdown,
         category: docInput.category || '架构与系统',
         tags: docInput.tags || [],
         visibility: docInput.visibility || 'private',
         status: docInput.status || 'draft',
-        unlistedKey: docInput.visibility === 'unlisted' ? Math.random().toString(36).slice(2, 10) : undefined,
+        unlistedKey:
+          docInput.visibility === 'unlisted' ? Math.random().toString(36).slice(2, 10) : undefined,
         author: docInput.author || 'Owner',
         createdAt: now,
         updatedAt: now,
-        versionCount: 1,
+        versionCount: 0,
         wordCount: stats.wordCount,
         readingTimeMinutes: stats.readingTimeMinutes,
         pinned: docInput.pinned || false,
         attachments: docInput.attachments || [],
       };
-
-      docs.unshift(finalDoc);
-      this.createVersionSnapshot(finalDoc, note || '创建文档初始化版本');
     }
 
+    const res = await apiClient.saveDocument(
+      {
+        id: candidate.id,
+        title: candidate.title,
+        slug: candidate.slug,
+        rawMarkdown: candidate.rawMarkdown,
+        category: candidate.category,
+        tags: candidate.tags,
+        visibility: candidate.visibility,
+        status: candidate.status,
+        pinned: candidate.pinned,
+        author: candidate.author,
+        expectedVersionCount: existing ? existing.versionCount : undefined,
+      },
+      note,
+      { create: !existing }
+    );
+
+    if (res.error || !res.data) {
+      return {
+        success: false,
+        serverSaved: false,
+        doc: candidate,
+        error: StorageService.toSaveError(res.error),
+      };
+    }
+
+    const serverDoc = res.data;
+    const adopted: KnowledgeDoc = {
+      ...candidate,
+      id: serverDoc.id || candidate.id,
+      slug: serverDoc.slug || candidate.slug,
+      title: serverDoc.title || candidate.title,
+      category: serverDoc.category || candidate.category,
+      tags: Array.isArray(serverDoc.tags) ? serverDoc.tags : candidate.tags,
+      visibility: serverDoc.visibility || candidate.visibility,
+      status: serverDoc.status || candidate.status,
+      pinned: Boolean(serverDoc.pinned ?? candidate.pinned),
+      author: serverDoc.author || candidate.author,
+      rawMarkdown: serverDoc.rawMarkdown || candidate.rawMarkdown,
+      createdAt: serverDoc.createdAt || candidate.createdAt,
+      updatedAt: serverDoc.updatedAt || candidate.updatedAt,
+      versionCount: Number(serverDoc.versionCount) || candidate.versionCount,
+      wordCount: Number(serverDoc.wordCount) || candidate.wordCount,
+      readingTimeMinutes: Number(serverDoc.readingTime) || candidate.readingTimeMinutes,
+      unlistedKey: candidate.unlistedKey,
+      attachments: candidate.attachments,
+    };
+
+    // Only now is the local cache allowed to reflect the change.
+    const latest = this.getDocs();
+    const index = latest.findIndex(d => d.id === adopted.id);
+    if (index >= 0) latest[index] = adopted;
+    else latest.unshift(adopted);
+    this.persistDocs(latest);
+
+    if (contentChanged) {
+      this.createVersionSnapshot(adopted, note || (existing ? '更新文档内容' : '创建文档初始化版本'));
+    }
+
+    return { success: true, serverSaved: true, doc: adopted };
+  }
+
+  /** Pulls an authoritative server document into the local cache (e.g. after rollback). */
+  public adoptServerDoc(doc: KnowledgeDoc): KnowledgeDoc {
+    const docs = this.getDocs();
+    const index = docs.findIndex(d => d.id === doc.id);
+    const merged = index >= 0 ? { ...docs[index], ...doc } : doc;
+    if (index >= 0) docs[index] = merged;
+    else docs.unshift(merged);
     this.persistDocs(docs);
+    return merged;
+  }
 
-    // Explicit FileSystem API & SQLite sync
-    apiClient
-      .saveDocument(
-        {
-          id: finalDoc.id,
-          title: finalDoc.title,
-          slug: finalDoc.slug,
-          rawMarkdown: finalDoc.rawMarkdown,
-          category: finalDoc.category,
-          tags: finalDoc.tags,
-          visibility: finalDoc.visibility,
-          status: finalDoc.status,
-          pinned: finalDoc.pinned,
-          author: finalDoc.author,
-        },
-        note
-      )
-      .then(res => {
-        if (res.error) {
-          console.error('[InkFlow Storage] Server disk save error:', res.error.message);
-        }
-      })
-      .catch(err => {
-        console.error('[InkFlow Storage] Server disk save error:', err);
-      });
+  private static toSaveError(error?: {
+    code?: string;
+    message?: string;
+    status?: number;
+    details?: any;
+  }): SaveDocError {
+    const status = error?.status;
+    const code = error?.code || 'SAVE_FAILED';
 
-    return finalDoc;
+    if (status === 409 || code === 'VERSION_CONFLICT') {
+      return {
+        code: 'VERSION_CONFLICT',
+        message: '文档已被其他客户端修改，你的编辑内容仍保留。请刷新页面载入最新版本后重试。',
+        status,
+        retryable: false,
+        details: error?.details,
+      };
+    }
+    if (status === 401 || status === 403 || code === 'UNAUTHORIZED') {
+      return {
+        code: 'AUTH_ERROR',
+        message: '登录状态已失效或权限不足，请重新登录后重试。',
+        status,
+        retryable: false,
+      };
+    }
+    if (status === 428) {
+      return {
+        code: 'VERSION_REQUIRED',
+        message: '缺少文档版本号，请刷新页面后重试保存。',
+        status,
+        retryable: false,
+      };
+    }
+    if (code === 'NETWORK_ERROR' || status === 0) {
+      return {
+        code: 'NETWORK_ERROR',
+        message: '网络连接失败，内容仍保留在编辑器中，请检查网络后重试。',
+        status: 0,
+        retryable: true,
+      };
+    }
+    if (!status || status >= 500) {
+      return {
+        code: 'SERVER_ERROR',
+        message: error?.message
+          ? `服务器保存失败：${error.message}。内容仍保留在编辑器中，请稍后重试。`
+          : '服务器保存失败，内容仍保留在编辑器中，请稍后重试。',
+        status,
+        retryable: true,
+      };
+    }
+    return {
+      code,
+      message: error?.message || '保存失败，内容仍保留在编辑器中。',
+      status,
+      retryable: false,
+    };
   }
 
   public async deleteDoc(id: string): Promise<boolean> {
@@ -726,6 +907,7 @@ class StorageService {
           visibility: d.visibility,
           pinned: d.pinned,
           author: d.author,
+          expectedVersionCount: d.versionCount,
         }).catch(() => {});
       }
     });
@@ -838,7 +1020,7 @@ class StorageService {
     return newSnapshot;
   }
 
-  public revertToVersion(docId: string, versionId: string): KnowledgeDoc | null {
+  public async revertToVersion(docId: string, versionId: string): Promise<SaveDocResult | null> {
     const version = this.getVersions().find(v => v.id === versionId && v.docId === docId);
     if (!version) return null;
 
@@ -1043,7 +1225,10 @@ class StorageService {
 
   // --- Import / Export ---
 
-  public importMarkdownText(content: string, filename?: string): KnowledgeDoc {
+  public async importMarkdownText(
+    content: string,
+    filename?: string
+  ): Promise<SaveDocResult> {
     const { frontmatter } = parseFrontmatter(content);
     const title = frontmatter.title || (filename ? filename.replace(/\.md$/i, '') : extractTitle(content));
     const category = frontmatter.category || '未分类';
@@ -1077,8 +1262,9 @@ class StorageService {
       const file = files[i];
       try {
         const text = await file.text();
-        const doc = this.importMarkdownText(text, file.name);
-        results.push(doc);
+        const result = await this.importMarkdownText(text, file.name);
+        if (result.success) results.push(result.doc);
+        else console.error('Failed importing file', file.name, result.error);
       } catch (e) {
         console.error('Failed reading file', file.name, e);
       }

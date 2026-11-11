@@ -13,6 +13,8 @@ export interface ApiResponse<T = any> {
     code: string;
     message: string;
     details?: any;
+    /** HTTP status (0 for network failures). Used to distinguish 409 / retryable errors. */
+    status?: number;
   };
 }
 
@@ -66,13 +68,31 @@ class ApiClient {
         headers,
       });
 
-      const data = await response.json();
-      return data;
+      let data: any = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = null;
+      }
+
+      if (!response.ok) {
+        return {
+          error: {
+            code: data?.error?.code || `HTTP_${response.status}`,
+            message: data?.error?.message || `请求失败（HTTP ${response.status}）`,
+            details: data?.error?.details,
+            status: response.status,
+          },
+        };
+      }
+
+      return data ?? {};
     } catch (err: any) {
       return {
         error: {
           code: 'NETWORK_ERROR',
           message: err?.message || '无法连接到后端持久化服务',
+          status: 0,
         },
       };
     }
@@ -163,10 +183,14 @@ class ApiClient {
     return this.request(`/documents/${id}`);
   }
 
-  public async saveDocument(docInput: any, note?: string) {
-    const isUpdate = Boolean(docInput.id);
-    const method = isUpdate ? 'PUT' : 'POST';
-    const endpoint = isUpdate ? `/documents/${docInput.id}` : '/documents';
+  /**
+   * @param options.create force POST semantics for a brand-new document even
+   *   though a client-generated id is present (the id is used as the queue key).
+   */
+  public async saveDocument(docInput: any, note?: string, options?: { create?: boolean }) {
+    const isCreate = options?.create === true;
+    const method = isCreate ? 'POST' : 'PUT';
+    const endpoint = isCreate ? '/documents' : `/documents/${docInput.id}`;
 
     return this.request(endpoint, {
       method,

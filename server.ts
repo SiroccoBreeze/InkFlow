@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { apiRouter } from './server/routes/api';
 import { ensureInitialPhysicalDocs, ensureAssetReferences } from './server/services/seedData';
+import { documentService } from './server/services/documentService';
 import { getDatabase } from './server/db/sqlite';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -49,6 +50,12 @@ async function startServer() {
   // Ensure storage directories & initial physical markdown files
   try {
     getDatabase();
+    // Reconcile any save that was interrupted between the Markdown rename and the
+    // SQLite commit before seeding/rebuilding anything from disk.
+    const recovered = await documentService.recoverPendingSaves();
+    if (recovered > 0) {
+      console.log(`[InkFlow Save Recovery] Recovered ${recovered} interrupted document save(s).`);
+    }
     await ensureInitialPhysicalDocs();
   } catch (err) {
     console.error('[Storage Init Error]:', err);

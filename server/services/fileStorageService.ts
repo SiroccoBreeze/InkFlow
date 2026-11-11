@@ -109,6 +109,197 @@ export class FileStorageService {
     return path.relative(this.rootDir, filePath);
   }
 
+  // --- Crash-safe document save helpers ---------------------------------
+  // The Markdown file and SQLite row cannot be committed atomically. A save
+  // therefore stages the new Markdown, keeps a `.bak` of the previous file and
+  // writes a `.save.pending` marker. On any failure the backup is restored; on
+  // a crash the marker lets `recoverPendingDocumentSaves()` decide from the DB
+  // content hash whether the file or the DB represents the committed state.
+
+  private getDocFolderSafe(documentId: string): string | null {
+    try {
+      return path.join(this.documentsDir, this.assertSafeId(documentId));
+    } catch {
+      return null;
+    }
+  }
+
+  public getDocumentIndexPath(documentId: string): string | null {
+    const folder = this.getDocFolderSafe(documentId);
+    return folder ? path.join(folder, 'index.md') : null;
+  }
+
+  /** Path relative to the storage root, as persisted in the documents table. */
+  public toStorageRelativePath(absolutePath: string): string {
+    return path.relative(this.rootDir, absolutePath);
+  }
+
+  /** True when a previous save for this document left a marker or backup behind. */
+  public async hasPendingDocumentSave(documentId: string): Promise<boolean> {
+    const artifacts = this.getSaveArtifacts(documentId);
+    if (!artifacts) return false;
+    return fsSync.existsSync(artifacts.markerPath) || fsSync.existsSync(artifacts.backupPath);
+  }
+
+  private getSaveArtifacts(documentId: string): {
+    folder: string;
+    finalPath: string;
+    backupPath: string;
+    markerPath: string;
+  } | null {
+    const folder = this.getDocFolderSafe(documentId);
+    if (!folder) return null;
+    const finalPath = path.join(folder, 'index.md');
+    return {
+      folder,
+      finalPath,
+      backupPath: `${finalPath}.bak`,
+      markerPath: path.join(folder, '.save.pending'),
+    };
+  }
+
+  /**
+   * Prepares a save without touching index.md:
+   * 1. writes the pending marker, 2. backs up the previous content (if any),
+   * 3. writes the new content to a temp file that is committed by rename.
+   */
+  public async prepareDocumentSave(
+    documentId: string,
+    previousContent: string | null,
+    newContent: string
+  ): Promise<{ stagedPath: string; finalPath: string; backupPath: string; markerPath: string } | null> {
+    const artifacts = this.getSaveArtifacts(documentId);
+    if (!artifacts) return null;
+
+    await fs.mkdir(artifacts.folder, { recursive: true });
+    // Remove stale temp files from a crashed previous attempt (backup/marker are
+    // handled by recovery, never blindly deleted here).
+    const entries = await fs.readdir(artifacts.folder).catch(() => [] as string[]);
+    for (const name of entries) {
+      if (name.startsWith('index.md.') && name.endsWith('.tmp')) {
+        await fs.rm(path.join(artifacts.folder, name), { force: true }).catch(() => {});
+      }
+    }
+
+    await fs.writeFile(artifacts.markerPath, new Date().toISOString(), 'utf-8');
+    if (previousContent !== null) {
+      await fs.writeFile(artifacts.backupPath, previousContent, 'utf-8');
+    } else {
+      await fs.rm(artifacts.backupPath, { force: true }).catch(() => {});
+    }
+
+    const stagedPath = `${artifacts.finalPath}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    await fs.writeFile(stagedPath, newContent, 'utf-8');
+
+    return { stagedPath, ...artifacts };
+  }
+
+  /** Atomically makes the staged Markdown the live index.md. */
+  public async commitStagedDocumentSave(stagedPath: string, finalPath: string): Promise<void> {
+    await fs.rename(stagedPath, finalPath);
+  }
+
+  /** Removes the pending marker/backup after the DB transaction committed. */
+  public async finalizeDocumentSave(artifacts: {
+    backupPath: string;
+    markerPath: string;
+    stagedPath: string;
+  }): Promise<void> {
+    await fs.rm(artifacts.markerPath, { force: true }).catch(() => {});
+    await fs.rm(artifacts.backupPath, { force: true }).catch(() => {});
+    await fs.rm(artifacts.stagedPath, { force: true }).catch(() => {});
+  }
+
+  /**
+   * Restores the pre-save state after a failed save: previous index.md comes back
+   * from `.bak`, or a brand-new document's file is removed. Always clears artifacts.
+   */
+  public async rollbackDocumentSave(
+    documentId: string,
+    artifacts: { backupPath: string; markerPath: string; stagedPath: string; finalPath: string }
+  ): Promise<void> {
+    const artifactsInfo = this.getSaveArtifacts(documentId);
+    if (!artifactsInfo) return;
+
+    const hasBackup = fsSync.existsSync(artifactsInfo.backupPath);
+    if (hasBackup) {
+      try {
+        await fs.rename(artifactsInfo.backupPath, artifactsInfo.finalPath);
+      } catch {
+        // Keep backup + marker so startup/next-save recovery can retry; deleting
+        // them here would lose the only copy of the previous committed content.
+        await fs.rm(artifacts.stagedPath, { force: true }).catch(() => {});
+        return;
+      }
+    } else {
+      await fs.rm(artifactsInfo.finalPath, { force: true }).catch(() => {});
+    }
+    await fs.rm(artifacts.markerPath, { force: true }).catch(() => {});
+    await fs.rm(artifacts.stagedPath, { force: true }).catch(() => {});
+    await fs.rm(artifactsInfo.backupPath, { force: true }).catch(() => {});
+  }
+
+  /** Document ids with a pending marker or backup left by an interrupted save. */
+  public async listPendingSaveDocumentIds(): Promise<string[]> {
+    const ids: string[] = [];
+    try {
+      const entries = await fs.readdir(this.documentsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const folder = path.join(this.documentsDir, entry.name);
+        try {
+          const names = await fs.readdir(folder);
+          if (names.includes('.save.pending') || names.includes('index.md.bak')) {
+            ids.push(entry.name);
+          }
+        } catch {
+          // unreadable folder: skip
+        }
+      }
+    } catch {
+      return [];
+    }
+    return ids;
+  }
+
+  public async readDocumentSaveBackup(documentId: string): Promise<string | null> {
+    const artifacts = this.getSaveArtifacts(documentId);
+    if (!artifacts) return null;
+    try {
+      return await fs.readFile(artifacts.backupPath, 'utf-8');
+    } catch {
+      return null;
+    }
+  }
+
+  public async restoreDocumentSaveBackup(documentId: string): Promise<boolean> {
+    const artifacts = this.getSaveArtifacts(documentId);
+    if (!artifacts || !fsSync.existsSync(artifacts.backupPath)) return false;
+    try {
+      await fs.rename(artifacts.backupPath, artifacts.finalPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public async clearDocumentSaveArtifacts(documentId: string): Promise<void> {
+    const artifacts = this.getSaveArtifacts(documentId);
+    if (!artifacts) return;
+    await fs.rm(artifacts.markerPath, { force: true }).catch(() => {});
+    await fs.rm(artifacts.backupPath, { force: true }).catch(() => {});
+    try {
+      const names = await fs.readdir(artifacts.folder);
+      for (const name of names) {
+        if (name.startsWith('index.md.') && name.endsWith('.tmp')) {
+          await fs.rm(path.join(artifacts.folder, name), { force: true }).catch(() => {});
+        }
+      }
+    } catch {
+      // folder missing: nothing to clean
+    }
+  }
+
   // Read document Markdown file
   public async readDocumentMarkdown(documentId: string): Promise<string | null> {
     let safeId: string;

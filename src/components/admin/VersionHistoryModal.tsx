@@ -119,26 +119,36 @@ export const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
     e.preventDefault();
     if (!newSnapshotNote.trim()) return;
 
-    // Trigger save on backend to generate a fresh physical snapshot
-    await apiClient.saveDocument(
-      {
-        id: doc.id,
-        title: doc.title,
-        slug: doc.slug,
-        rawMarkdown: doc.rawMarkdown,
-        category: doc.category,
-        tags: doc.tags,
-        visibility: doc.visibility,
-        pinned: doc.pinned,
-        author: doc.author,
-      },
-      newSnapshotNote.trim()
-    );
+    // Save through the same server-confirmed path as the editor. A failed save
+    // must not create a fake local snapshot.
+    try {
+      const result = await storage.saveDoc(
+        {
+          id: doc.id,
+          title: doc.title,
+          slug: doc.slug,
+          rawMarkdown: doc.rawMarkdown,
+          category: doc.category,
+          tags: doc.tags,
+          visibility: doc.visibility,
+          status: doc.status,
+          pinned: doc.pinned,
+          author: doc.author,
+        },
+        newSnapshotNote.trim()
+      );
 
-    storage.createVersionSnapshot(doc, newSnapshotNote.trim());
-    setNewSnapshotNote('');
-    setCreatingSnapshot(false);
-    await loadRevisions();
+      if (!result.success) {
+        setErrorMessage(`创建快照失败：${result.error?.message || '未知错误'}`);
+        return;
+      }
+
+      setNewSnapshotNote('');
+      setCreatingSnapshot(false);
+      await loadRevisions();
+    } catch (err: any) {
+      setErrorMessage(`创建快照失败：${err?.message || '未知错误'}`);
+    }
   };
 
   const handleRevert = (version: any) => {
@@ -161,7 +171,9 @@ export const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
               ...res.data,
               rawMarkdown: res.data.rawMarkdown || activeSnapshotContent || doc.rawMarkdown,
             };
-            storage.saveDoc(updatedDoc, `回滚至历史版本 v${version.versionNumber}`);
+            // The server already committed the rollback; adopt its document instead
+            // of sending a second save that would create a redundant revision.
+            storage.adoptServerDoc(updatedDoc);
             setRevertedSuccess(true);
             onReverted(updatedDoc);
             setTimeout(() => {
@@ -169,15 +181,17 @@ export const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
               onClose();
             }, 1200);
           } else {
-            // Fallback local revert
-            const updated = storage.revertToVersion(doc.id, version.id);
-            if (updated) {
+            // Local-only fallback: still persists through the server-confirmed path.
+            const result = await storage.revertToVersion(doc.id, version.id);
+            if (result?.success) {
               setRevertedSuccess(true);
-              onReverted(updated);
+              onReverted(result.doc);
               setTimeout(() => {
                 setRevertedSuccess(false);
                 onClose();
               }, 1200);
+            } else {
+              setErrorMessage(`回滚失败：${result?.error?.message || '本地版本不存在'}`);
             }
           }
         } catch (err: any) {
@@ -265,6 +279,18 @@ export const VersionHistoryModal: React.FC<VersionHistoryModalProps> = ({
           <div className="p-3 bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-xs flex items-center justify-center gap-2 font-medium shrink-0">
             <Check className="w-4 h-4" />
             <span>已成功回滚至选定版本！磁盘 Markdown 文件已自动更新。</span>
+          </div>
+        )}
+
+        {errorMessage && (
+          <div className="p-3 bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 text-xs flex items-center justify-between gap-2 font-medium shrink-0">
+            <span className="flex-1">{errorMessage}</span>
+            <button
+              onClick={() => setErrorMessage(null)}
+              className="px-2 py-0.5 rounded bg-rose-600 text-white"
+            >
+              关闭
+            </button>
           </div>
         )}
 
