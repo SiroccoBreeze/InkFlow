@@ -51,6 +51,18 @@ export class DocumentRecoveryRequiredError extends Error {
   }
 }
 
+/**
+ * Thrown when a document's disk folder is still awaiting deletion. Writing would
+ * recreate content in a folder that startup recovery must later remove, so saves
+ * for this id are blocked until cleanup succeeds.
+ */
+export class DocumentDeleteRecoveryRequiredError extends Error {
+  public readonly code = 'DELETE_RECOVERY_REQUIRED';
+  constructor(public readonly docId: string) {
+    super('文档存在未完成的删除任务，磁盘目录尚未清理；为避免数据复活，已暂停该文档的写入');
+  }
+}
+
 const MAX_MARKDOWN_BYTES = 5 * 1024 * 1024;
 const MAX_TITLE_LENGTH = 500;
 const MAX_CATEGORY_LENGTH = 120;
@@ -548,11 +560,84 @@ export class DocumentService {
   }
 
   /**
+   * Resolves a pending-deletion marker:
+   * - DB row still exists → the delete never committed; remove the marker and keep files.
+   * - DB row absent → delete committed; retry revision+document folder removal.
+   * Returns 'failed' (keeping the marker) when the folder cannot be removed or the
+   * marker is corrupt; callers must block writes for that document.
+   */
+  private async recoverPendingDeletion(
+    docId: string
+  ): Promise<'none' | 'recovered' | 'cancelled' | 'failed'> {
+    if (!fileStorage.isDocumentDeletePending(docId)) return 'none';
+
+    let marker: { docId: string; reason?: string } | null;
+    try {
+      marker = await fileStorage.readDocumentDeleteMarker(docId);
+    } catch (err) {
+      console.error(`[InkFlow Delete Recovery] Unreadable marker for ${docId}:`, err);
+      return 'failed';
+    }
+    if (!marker) return 'none';
+
+    // Safety: only ever delete the folder whose name matches this exact marker.
+    if (marker.docId !== docId || marker.reason !== 'document-deleted') {
+      console.error(`[InkFlow Delete Recovery] Invalid marker for ${docId}; refusing to delete.`);
+      return 'failed';
+    }
+
+    const db = this.getDb();
+    const row = db.prepare('SELECT 1 AS ok FROM documents WHERE id = ?').get(docId) as any;
+    if (row?.ok) {
+      // The crash happened before the SQLite commit: the document still exists.
+      await fileStorage.clearDocumentDeletePending(docId);
+      return 'cancelled';
+    }
+
+    try {
+      // Delete revisions first: if this fails, the document folder (and its marker)
+      // stays intact so recovery can retry the whole operation.
+      await fileStorage.deleteRevisionFolderStrict(docId);
+      await fileStorage.deleteDocumentFolderStrict(docId);
+      await fileStorage.clearDocumentDeletePending(docId);
+      return 'recovered';
+    } catch (err) {
+      console.error(`[InkFlow Delete Recovery] Failed deleting folders for ${docId}:`, err);
+      return 'failed';
+    }
+  }
+
+  /** Startup/periodic recovery for folders whose deletion failed after the DB commit. */
+  public async recoverPendingDeletions(): Promise<number> {
+    const ids = await fileStorage.listPendingDeletionDocumentIds();
+    let recovered = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        const result = await this.recoverPendingDeletion(id);
+        if (result === 'recovered' || result === 'cancelled') recovered++;
+        else if (result === 'failed') failed++;
+      } catch (err) {
+        console.error(`[InkFlow Delete Recovery] Failed recovering ${id}:`, err);
+        failed++;
+      }
+    }
+    if (failed > 0) {
+      console.error(
+        `[InkFlow Delete Recovery] ${failed} pending deletion(s) could not be completed; those folders will not be re-imported.`
+      );
+    }
+    return recovered;
+  }
+
+  /**
    * Recovers saves interrupted between the Markdown rename and the SQLite commit.
    * The DB content hash is the commit point: if index.md matches it the save is
    * kept, otherwise the previous file is restored (or an uncommitted new file removed).
    */
   private async recoverPendingSave(docId: string): Promise<'none' | 'recovered' | 'failed'> {
+    // A folder awaiting deletion must never be recovered as a live document.
+    if (fileStorage.isDocumentDeletePending(docId)) return 'failed';
     if (!(await fileStorage.hasPendingDocumentSave(docId))) return 'none';
 
     const db = this.getDb();
@@ -718,6 +803,16 @@ export class DocumentService {
 
     const docId = input.id || generateId('doc');
     return this.withSaveGate(() => this.withDocumentLock(docId, async () => {
+      // A pending deletion must finish first; resurrecting the folder would
+      // conflict with startup recovery and the delete's committed DB state.
+      const deletion = await this.recoverPendingDeletion(docId).catch(err => {
+        console.error(`[InkFlow Delete Recovery] Recovery failed for ${docId}:`, err);
+        return 'failed' as const;
+      });
+      if (deletion === 'failed') {
+        throw new DocumentDeleteRecoveryRequiredError(docId);
+      }
+
       // Heal a previously interrupted save for this document before touching it again.
       // If recovery cannot complete, refuse to write: continuing would overwrite
       // the only `.bak` / `.save.pending` that an administrator may need.
@@ -1042,12 +1137,21 @@ export class DocumentService {
   }
 
   // Delete document
-  public async deleteDocument(id: string) {
+  public async deleteDocument(id: string): Promise<{ diskCleanupPending: boolean }> {
     // Same gate + per-document lock as saveDocument: a save and a delete for the
     // same document can never interleave, and global tag/revision maintenance
     // cannot observe a half-deleted document.
     return this.withSaveGate(() =>
       this.withDocumentLock(id, async () => {
+        // 0. Finish a previous failed disk cleanup for this id (idempotent).
+        const deletion = await this.recoverPendingDeletion(id).catch(err => {
+          console.error(`[InkFlow Delete Recovery] Recovery failed for ${id}:`, err);
+          return 'failed' as const;
+        });
+        if (deletion === 'failed') {
+          throw new DocumentDeleteRecoveryRequiredError(id);
+        }
+
         // Deletion must not run while a save is awaiting recovery: it would remove
         // the backup/marker files that contain the last committed content.
         const recovery = await this.recoverPendingSave(id).catch(err => {
@@ -1062,11 +1166,21 @@ export class DocumentService {
         // 1. Read document markdown to check for attached assets before deleting
         const rawMarkdown = await fileStorage.readDocumentMarkdown(id);
 
-        // 2. Remove SQLite records first, in one transaction. If this fails the
-        //    Markdown folder is untouched (consistent). The reverse order could
-        //    leave a DB row pointing at a folder that was already deleted.
-        db.exec('BEGIN IMMEDIATE');
+        // 2. Mark the folder as pending deletion BEFORE the DB commit. If the DB
+        //    commit fails, the marker is removed and the folder stays untouched;
+        //    if the process dies after the commit, startup recovery sees the
+        //    marker and removes the folder instead of re-importing it.
+        let markerCreated = false;
         try {
+          markerCreated = await fileStorage.markDocumentDeletePending(id);
+        } catch (err: any) {
+          throw new Error(`无法写入删除标记，已取消删除：${err?.message || err}`);
+        }
+
+        // 3. Remove SQLite records first, in one transaction. If this fails the
+        //    Markdown folder is untouched (consistent).
+        try {
+          db.exec('BEGIN IMMEDIATE');
           db.prepare('DELETE FROM documents_fts WHERE document_id = ?').run(id);
           db.prepare('DELETE FROM document_tags WHERE document_id = ?').run(id);
           db.prepare('DELETE FROM document_revisions WHERE document_id = ?').run(id);
@@ -1082,25 +1196,41 @@ export class DocumentService {
           } catch {
             // may already be rolled back
           }
+          if (markerCreated) {
+            await fileStorage.clearDocumentDeletePending(id).catch(() => {});
+          }
           throw err;
         }
 
-        // 3. Delete physical document folder and revisions folder. If a filesystem
-        //    deletion fails, only orphan files remain (no live DB record).
-        await fileStorage.deleteDocumentFolder(id);
-        await fileStorage.deleteRevisionFolder(id);
+        // 4. Delete physical folders with strict error reporting. If this fails the
+        //    marker (inside the document folder) remains; startup recovery retries
+        //    and the folder is excluded from disk re-import in the meantime.
+        let diskCleanupPending = false;
+        try {
+          // Revisions first: if this fails, the document folder + marker stay intact.
+          await fileStorage.deleteRevisionFolderStrict(id);
+          await fileStorage.deleteDocumentFolderStrict(id);
+        } catch (err) {
+          diskCleanupPending = true;
+          console.error(`[InkFlow Delete] Disk cleanup failed for ${id}; pending marker retained:`, err);
+        }
 
-        // 4. Clean up any assets that were only in this document
+        if (!diskCleanupPending) {
+          await fileStorage.clearDocumentDeletePending(id).catch(() => {});
+        }
+
+        // 5. Clean up assets that were only in this document. If the folder could
+        //    not be removed its Markdown is still present, so assets are retained.
         if (rawMarkdown) {
           try {
             await assetService.cleanupUnreferencedAssets();
           } catch {}
         }
 
-        // 5. Clean up any orphaned revisions
+        // 6. Clean up any orphaned revisions
         await fileStorage.cleanupOrphanRevisions();
 
-        return true;
+        return { diskCleanupPending };
       })
     );
   }

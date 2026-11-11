@@ -655,15 +655,17 @@ describe('Document save reliability', () => {
       return originalPrepare(...(args as [string, string | null, string]));
     });
 
-    const originalDeleteFolder = fileStorage.deleteDocumentFolder.bind(fileStorage);
+    const originalDeleteFolder = fileStorage.deleteDocumentFolderStrict.bind(fileStorage);
     let pendingAtDelete = true;
-    const deleteFolderSpy = vi.spyOn(fileStorage, 'deleteDocumentFolder').mockImplementation(async (docId: string) => {
+    const deleteFolderSpy = vi
+      .spyOn(fileStorage, 'deleteDocumentFolderStrict')
+      .mockImplementation(async (docId: string) => {
       events.push('delete-folder');
       // The save finished (and its artifacts were finalized) before the lock
       // was released, so nothing in-use can be deleted here.
-      pendingAtDelete = await fileStorage.hasPendingDocumentSave(docId);
-      return originalDeleteFolder(docId);
-    });
+        pendingAtDelete = await fileStorage.hasPendingDocumentSave(docId);
+        return originalDeleteFolder(docId);
+      });
 
     try {
       const savePromise = updateDoc(created.id, '# 保存删除竞争\n\nsaved', created.versionCount);
@@ -699,18 +701,20 @@ describe('Document save reliability', () => {
     const folder = path.join(testDataDir, 'documents', created.id);
     const events: string[] = [];
 
-    const originalDeleteFolder = fileStorage.deleteDocumentFolder.bind(fileStorage);
+    const originalDeleteFolder = fileStorage.deleteDocumentFolderStrict.bind(fileStorage);
     let releaseDelete!: () => void;
     const deleteGate = new Promise<void>(resolve => (releaseDelete = resolve));
     let markDeleteStarted!: () => void;
     const deleteStarted = new Promise<void>(resolve => (markDeleteStarted = resolve));
-    const deleteFolderSpy = vi.spyOn(fileStorage, 'deleteDocumentFolder').mockImplementation(async (docId: string) => {
-      events.push('delete-folder:start');
-      markDeleteStarted();
-      await deleteGate;
-      events.push('delete-folder:end');
-      return originalDeleteFolder(docId);
-    });
+    const deleteFolderSpy = vi
+      .spyOn(fileStorage, 'deleteDocumentFolderStrict')
+      .mockImplementation(async (docId: string) => {
+        events.push('delete-folder:start');
+        markDeleteStarted();
+        await deleteGate;
+        events.push('delete-folder:end');
+        return originalDeleteFolder(docId);
+      });
 
     const originalPrepare = fileStorage.prepareDocumentSave.bind(fileStorage);
     const prepareSpy = vi.spyOn(fileStorage, 'prepareDocumentSave').mockImplementation(async (...args: any[]) => {

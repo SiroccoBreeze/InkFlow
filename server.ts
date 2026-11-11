@@ -67,6 +67,13 @@ async function startServer() {
   // Non-fatal storage maintenance. Save/delete operations still run their own
   // recovery guard if a document could not be reconciled here.
   try {
+    // Finish committed deletions whose folder removal failed before any disk
+    // rebuild/seed, so deleted documents cannot be re-imported.
+    const deletedRecovered = await documentService.recoverPendingDeletions();
+    if (deletedRecovered > 0) {
+      console.log(`[InkFlow Delete Recovery] Completed ${deletedRecovered} pending deletion(s).`);
+    }
+
     // Reconcile any save that was interrupted between the Markdown rename and the
     // SQLite commit before seeding/rebuilding anything from disk.
     const recovered = await documentService.recoverPendingSaves();

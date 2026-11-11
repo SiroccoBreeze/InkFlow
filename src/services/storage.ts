@@ -521,6 +521,16 @@ export class StorageService {
         retryable: false,
       };
     }
+    if (code === 'DELETE_RECOVERY_REQUIRED') {
+      return {
+        code: 'DELETE_RECOVERY_REQUIRED',
+        message:
+          '保存已暂停：该文档存在未完成的删除清理任务，为避免数据复活，需要管理员处理后再保存。你的编辑内容仍保留。',
+        status,
+        retryable: false,
+        details: error?.details,
+      };
+    }
     if (code === 'SAVE_RECOVERY_REQUIRED' || status === 503) {
       return {
         code: 'RECOVERY_REQUIRED',
@@ -557,13 +567,15 @@ export class StorageService {
     };
   }
 
-  public async deleteDoc(id: string): Promise<boolean> {
+  public async deleteDoc(id: string): Promise<{ success: true; diskCleanupPending: boolean }> {
     // 1. Direct explicit server physical disk & SQLite deletion
+    let diskCleanupPending = false;
     try {
       const res = await apiClient.deleteDocument(id);
       if (res.error) {
         throw new Error(`磁盘 I/O 异常: ${res.error.message || '无法删除物理文件'}`);
       }
+      diskCleanupPending = Boolean(res.data?.diskCleanupPending);
     } catch (err: any) {
       console.error('[InkFlow Storage] Server disk delete error:', err);
       throw new Error(`服务器磁盘文件删除失败: ${err.message || 'I/O 异常'}`);
@@ -574,16 +586,21 @@ export class StorageService {
     this.persistDocs(docs);
     const versions = this.getVersions().filter(v => v.docId !== id);
     this.persistVersions(versions);
-    return true;
+    return { success: true, diskCleanupPending };
   }
 
-  public async batchDeleteDocs(ids: string[]): Promise<boolean> {
+  public async batchDeleteDocs(
+    ids: string[]
+  ): Promise<{ success: true; diskCleanupPending: number }> {
     const errors: string[] = [];
+    let diskCleanupPending = 0;
     for (const id of ids) {
       try {
         const res = await apiClient.deleteDocument(id);
         if (res.error) {
           errors.push(res.error.message || `文档 ${id} 删除失败`);
+        } else if (res.data?.diskCleanupPending) {
+          diskCleanupPending++;
         }
       } catch (err: any) {
         errors.push(err.message || `文档 ${id} 物理删除异常`);
@@ -599,7 +616,7 @@ export class StorageService {
     if (errors.length > 0) {
       throw new Error(`部分文档磁盘删除异常: ${errors.join('; ')}`);
     }
-    return true;
+    return { success: true, diskCleanupPending };
   }
 
   private persistDocs(docs: KnowledgeDoc[]): void {

@@ -5,6 +5,7 @@ import {
   DocumentConflictError,
   DocumentValidationError,
   DocumentRecoveryRequiredError,
+  DocumentDeleteRecoveryRequiredError,
   parseFrontmatter,
 } from '../services/documentService';
 import { searchService } from '../services/searchService';
@@ -421,6 +422,16 @@ function respondDocumentSaveError(res: Response, err: any): void {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: err.message } });
     return;
   }
+  if (err instanceof DocumentDeleteRecoveryRequiredError) {
+    res.status(503).json({
+      error: {
+        code: 'DELETE_RECOVERY_REQUIRED',
+        message: err.message,
+        details: { docId: err.docId },
+      },
+    });
+    return;
+  }
   if (err instanceof DocumentRecoveryRequiredError) {
     res.status(503).json({
       error: {
@@ -437,8 +448,8 @@ function respondDocumentSaveError(res: Response, err: any): void {
 
 apiRouter.delete('/documents/:id', requireOwner, async (req, res) => {
   try {
-    await documentService.deleteDocument(req.params.id);
-    res.json({ data: { success: true } });
+    const result = await documentService.deleteDocument(req.params.id);
+    res.json({ data: { success: true, diskCleanupPending: result.diskCleanupPending } });
   } catch (err: any) {
     respondDocumentSaveError(res, err);
   }
@@ -707,9 +718,9 @@ apiRouter.delete('/tags/:name', requireOwner, async (req, res) => {
       // The client cache may be incomplete, so check the Markdown SSOT too.
       let markdownReferences = 0;
       try {
-        const docIds = await fileStorage.listAllDiskDocumentIds();
+        const docIds = await fileStorage.listAllDiskDocumentIdsStrict();
         for (const docId of docIds) {
-          const raw = await fileStorage.readDocumentMarkdown(docId);
+          const raw = await fileStorage.readDocumentMarkdownStrict(docId);
           if (!raw) continue;
           const { frontmatter } = parseFrontmatter(raw);
           if (

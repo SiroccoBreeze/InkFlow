@@ -156,14 +156,14 @@ describe('Tag dictionary cleanup guard', () => {
       new Date().toISOString()
     );
 
-    const originalRead = fileStorage.readDocumentMarkdown.bind(fileStorage);
+    const originalRead = fileStorage.readDocumentMarkdownStrict.bind(fileStorage);
     let markScanStarted!: () => void;
     const scanStarted = new Promise<void>(resolve => (markScanStarted = resolve));
     let releaseScan!: () => void;
     const scanGate = new Promise<void>(resolve => (releaseScan = resolve));
     let pausedFirstRead = false;
 
-    const readSpy = vi.spyOn(fileStorage, 'readDocumentMarkdown').mockImplementation(async (docId: string) => {
+    const readSpy = vi.spyOn(fileStorage, 'readDocumentMarkdownStrict').mockImplementation(async (docId: string) => {
       if (!pausedFirstRead) {
         pausedFirstRead = true;
         markScanStarted();
@@ -228,6 +228,85 @@ describe('Tag dictionary cleanup guard', () => {
     }
   });
 
+  it('treats a real documents-directory read failure as unknown references (keeps tag)', async () => {
+    const tagName = `dir-fail-${Date.now().toString(36)}`;
+    const tagId = `tag_dir_${Date.now().toString(36)}`;
+    db.prepare('INSERT INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
+      tagId,
+      ownerId,
+      tagName,
+      tagName,
+      new Date().toISOString()
+    );
+
+    const documentsDir = path.join(testDataDir, 'documents');
+    const movedDir = `${documentsDir}_moved_${Date.now().toString(36)}`;
+    fs.renameSync(documentsDir, movedDir);
+    // A regular file where the directory should be makes readdir throw ENOTDIR
+    // on both Linux and Windows (real filesystem fault, not a method mock).
+    fs.writeFileSync(documentsDir, 'not a directory');
+
+    try {
+      const res = await request(app).delete(`/api/v1/tags/${encodeURIComponent(tagName)}`).set(auth());
+      expect(res.status).toBe(200);
+      expect(res.body.data.tagDeleted).toBe(false);
+      expect(res.body.data.reason).toBe('markdown_scan_failed');
+      expect((db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any)?.id).toBeTruthy();
+    } finally {
+      fs.rmSync(documentsDir, { force: true });
+      fs.renameSync(movedDir, documentsDir);
+    }
+  });
+
+  it('treats a real unreadable index.md as unknown references (keeps tag)', async () => {
+    const tagName = `file-fail-${Date.now().toString(36)}`;
+    const tagId = `tag_file_${Date.now().toString(36)}`;
+    db.prepare('INSERT INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
+      tagId,
+      ownerId,
+      tagName,
+      tagName,
+      new Date().toISOString()
+    );
+
+    const docDir = path.join(testDataDir, 'documents', `doc_unreadable_${Date.now().toString(36)}`);
+    fs.mkdirSync(path.join(docDir, 'index.md'), { recursive: true }); // index.md is a directory
+
+    try {
+      const res = await request(app).delete(`/api/v1/tags/${encodeURIComponent(tagName)}`).set(auth());
+      expect(res.status).toBe(200);
+      expect(res.body.data.tagDeleted).toBe(false);
+      expect(res.body.data.reason).toBe('markdown_scan_failed');
+      expect((db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any)?.id).toBeTruthy();
+    } finally {
+      fs.rmSync(docDir, { recursive: true, force: true });
+    }
+  });
+
+  it('distinguishes a missing index.md (no reference) from a read failure', async () => {
+    const tagName = `missing-index-${Date.now().toString(36)}`;
+    const tagId = `tag_missing_${Date.now().toString(36)}`;
+    db.prepare('INSERT INTO tags (id, owner_id, name, slug, created_at) VALUES (?, ?, ?, ?, ?)').run(
+      tagId,
+      ownerId,
+      tagName,
+      tagName,
+      new Date().toISOString()
+    );
+
+    const docDir = path.join(testDataDir, 'documents', `doc_no_index_${Date.now().toString(36)}`);
+    fs.mkdirSync(docDir, { recursive: true }); // no index.md
+
+    try {
+      const res = await request(app).delete(`/api/v1/tags/${encodeURIComponent(tagName)}`).set(auth());
+      expect(res.status).toBe(200);
+      expect(res.body.data.tagDeleted).toBe(true);
+      expect(db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName)).toBeUndefined();
+    } finally {
+      fs.rmSync(docDir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the tag dictionary when the Markdown scan fails', async () => {
     const tagName = `scan-fail-${Date.now().toString(36)}`;
     const tagId = `tag_scan_${Date.now().toString(36)}`;
@@ -240,7 +319,7 @@ describe('Tag dictionary cleanup guard', () => {
     );
 
     const readSpy = vi
-      .spyOn(fileStorage, 'readDocumentMarkdown')
+      .spyOn(fileStorage, 'readDocumentMarkdownStrict')
       .mockRejectedValueOnce(new Error('simulated EACCES while scanning Markdown'));
 
     try {

@@ -9,7 +9,20 @@ export async function ensureInitialPhysicalDocs(): Promise<void> {
   const ownerId = owner?.id || 'usr_owner_default';
 
   const docCount = (db.prepare('SELECT COUNT(*) as c FROM documents').get() as any)?.c || 0;
+  // listAllDiskDocumentIds() excludes folders with a pending-deletion marker, so
+  // a deleted document cannot be re-imported even if physical removal failed.
   const diskIds = await fileStorage.listAllDiskDocumentIds();
+  const pendingDeletions = await fileStorage.listPendingDeletionDocumentIds();
+
+  if (pendingDeletions.length > 0 && diskIds.length === 0) {
+    // The database is empty because deletes were committed; the remaining folders
+    // are pending cleanup. Do not seed starter docs or rebuild them as live docs.
+    console.warn(
+      `[InkFlow Storage] ${pendingDeletions.length} folder(s) await deletion cleanup; ` +
+        'skipping disk rebuild/seed to avoid resurrecting deleted documents.'
+    );
+    return;
+  }
 
   // If disk has markdown files but SQLite index is empty, restore index from physical disk!
   if (diskIds.length > 0 && docCount === 0) {

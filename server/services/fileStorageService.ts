@@ -256,6 +256,9 @@ export class FileStorageService {
         const folder = path.join(this.documentsDir, entry.name);
         try {
           const names = await fs.readdir(folder);
+          // Pending deletion wins: a folder awaiting deletion must not be
+          // recovered as a live document.
+          if (names.includes('.delete.pending')) continue;
           if (names.includes('.save.pending') || names.includes('index.md.bak')) {
             ids.push(entry.name);
           }
@@ -335,6 +338,23 @@ export class FileStorageService {
     }
   }
 
+  /**
+   * Strict read for consistency-critical scans (e.g. tag cleanup):
+   * - missing index.md → null (a document may legitimately have no file)
+   * - unreadable directory/file, EISDIR, EACCES, etc. → throw
+   *   The caller must treat any throw as "references unknown" and fail safe.
+   */
+  public async readDocumentMarkdownStrict(documentId: string): Promise<string | null> {
+    const safeId = this.assertSafeId(documentId);
+    const filePath = path.join(this.documentsDir, safeId, 'index.md');
+    try {
+      return await fs.readFile(filePath, 'utf-8');
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') return null;
+      throw err;
+    }
+  }
+
   // Delete document folder
   public async deleteDocumentFolder(documentId: string): Promise<void> {
     let safeId: string;
@@ -365,6 +385,84 @@ export class FileStorageService {
     } catch (err) {
       console.error(`Failed deleting revision folder ${documentId}:`, err);
     }
+  }
+
+  /** Deletes the document folder and reports failure to the caller. */
+  public async deleteDocumentFolderStrict(documentId: string): Promise<void> {
+    const safeId = this.assertSafeId(documentId);
+    await fs.rm(path.join(this.documentsDir, safeId), { recursive: true, force: true });
+  }
+
+  /** Deletes the revisions folder and reports failure to the caller. */
+  public async deleteRevisionFolderStrict(documentId: string): Promise<void> {
+    const safeId = this.assertSafeId(documentId);
+    await fs.rm(path.join(this.revisionsDir, safeId), { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // Pending-deletion markers
+  // A marker lives inside the document folder, so deleting the folder removes
+  // it atomically. It is written BEFORE the SQLite row is deleted; recovery
+  // uses the DB row presence to decide whether the deletion actually committed.
+  // -------------------------------------------------------------------------
+
+  private getDeleteMarkerPath(documentId: string): string | null {
+    const folder = this.getDocFolderSafe(documentId);
+    return folder ? path.join(folder, '.delete.pending') : null;
+  }
+
+  public isDocumentDeletePending(documentId: string): boolean {
+    const marker = this.getDeleteMarkerPath(documentId);
+    return marker ? fsSync.existsSync(marker) : false;
+  }
+
+  /** Creates the pending-deletion marker (returns false if the folder is already gone). */
+  public async markDocumentDeletePending(documentId: string): Promise<boolean> {
+    const folder = this.getDocFolderSafe(documentId);
+    const marker = this.getDeleteMarkerPath(documentId);
+    if (!folder || !marker) throw new Error('非法的存储标识符');
+    if (!fsSync.existsSync(folder)) return false;
+    await this.atomicWriteFile(
+      marker,
+      JSON.stringify({ docId: documentId, reason: 'document-deleted', requestedAt: new Date().toISOString() })
+    );
+    return true;
+  }
+
+  public async clearDocumentDeletePending(documentId: string): Promise<void> {
+    const marker = this.getDeleteMarkerPath(documentId);
+    if (marker) await fs.rm(marker, { force: true }).catch(() => {});
+  }
+
+  /** Reads and parses the marker; null when missing. Throws on unreadable/corrupt file. */
+  public async readDocumentDeleteMarker(
+    documentId: string
+  ): Promise<{ docId: string; reason?: string; requestedAt?: string } | null> {
+    const marker = this.getDeleteMarkerPath(documentId);
+    if (!marker) throw new Error('非法的存储标识符');
+    let raw: string;
+    try {
+      raw = await fs.readFile(marker, 'utf-8');
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') return null;
+      throw err;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') throw new Error('删除标记格式无效');
+    return parsed;
+  }
+
+  /** Document ids that still have a pending-deletion marker. Strict: readdir errors throw. */
+  public async listPendingDeletionDocumentIds(): Promise<string[]> {
+    const ids: string[] = [];
+    const entries = await fs.readdir(this.documentsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (fsSync.existsSync(path.join(this.documentsDir, entry.name, '.delete.pending'))) {
+        ids.push(entry.name);
+      }
+    }
+    return ids;
   }
 
   // Clean up any revision folders whose document folder no longer exists
@@ -418,13 +516,33 @@ export class FileStorageService {
   }
 
   // List all document folder IDs on physical disk
+  /**
+   * Lists document folders, excluding folders that are pending deletion: they
+   * are logically deleted and must never be re-imported/rebuild-indexed even if
+   * their physical removal failed.
+   */
   public async listAllDiskDocumentIds(): Promise<string[]> {
     try {
       const entries = await fs.readdir(this.documentsDir, { withFileTypes: true });
-      return entries.filter(e => e.isDirectory()).map(e => e.name);
+      return entries
+        .filter(e => e.isDirectory())
+        .filter(e => !fsSync.existsSync(path.join(this.documentsDir, e.name, '.delete.pending')))
+        .map(e => e.name);
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Strict variant for consistency-critical scans. Directory read failures throw
+   * instead of being interpreted as "no documents".
+   */
+  public async listAllDiskDocumentIdsStrict(): Promise<string[]> {
+    const entries = await fs.readdir(this.documentsDir, { withFileTypes: true });
+    return entries
+      .filter(e => e.isDirectory())
+      .filter(e => !fsSync.existsSync(path.join(this.documentsDir, e.name, '.delete.pending')))
+      .map(e => e.name);
   }
 
   // Get full disk stats of revisions/ folder

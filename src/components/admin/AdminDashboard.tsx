@@ -326,10 +326,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         try {
-          await storage.deleteDoc(id);
+          const result = await storage.deleteDoc(id);
           setSelectedDocIds(prev => prev.filter(i => i !== id));
           onRefreshData();
-          showStatus('文档及关联历史快照、未引用物理附件已彻底清理');
+          showStatus(
+            result.diskCleanupPending
+              ? '文档已从数据库删除；磁盘目录清理未完成，已标记为待删除，下次启动会自动重试'
+              : '文档及关联历史快照、未引用物理附件已彻底清理'
+          );
         } catch (err: any) {
           showStatus(`删除失败: ${err?.message || '磁盘 I/O 异常'}`);
         }
@@ -351,10 +355,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         try {
-          await storage.batchDeleteDocs(selectedDocIds);
+          const result = await storage.batchDeleteDocs(selectedDocIds);
           setSelectedDocIds([]);
           onRefreshData();
-          showStatus(`已安全批量删除 ${selectedDocIds.length} 篇文档`);
+          showStatus(
+            result.diskCleanupPending > 0
+              ? `已删除 ${selectedDocIds.length} 篇文档；其中 ${result.diskCleanupPending} 篇磁盘清理待下次启动重试`
+              : `已安全批量删除 ${selectedDocIds.length} 篇文档`
+          );
         } catch (err: any) {
           showStatus(`批量删除失败: ${err?.message || '网络或磁盘异常'}`);
         }

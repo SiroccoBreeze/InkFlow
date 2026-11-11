@@ -206,6 +206,43 @@ describe('StorageService save reliability (client side)', () => {
     expect(svc.getDocById(BASE_DOC.id)!.rawMarkdown).toBe(BASE_DOC.rawMarkdown);
   });
 
+  it('reports a pending disk cleanup from the delete API', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(200, { data: { success: true, diskCleanupPending: true } })
+    );
+
+    const svc = new StorageServiceClass();
+    const result = await svc.deleteDoc(BASE_DOC.id);
+
+    expect(result.success).toBe(true);
+    expect(result.diskCleanupPending).toBe(true);
+    expect(svc.getDocById(BASE_DOC.id)).toBeUndefined();
+  });
+
+  it('blocks save retry when a pending deletion cleanup must finish first', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(503, {
+        error: {
+          code: 'DELETE_RECOVERY_REQUIRED',
+          message: '文档存在未完成的删除任务',
+          details: { docId: BASE_DOC.id },
+        },
+      })
+    );
+
+    const svc = new StorageServiceClass();
+    const result = await svc.saveDoc(
+      { id: BASE_DOC.id, title: BASE_DOC.title, rawMarkdown: '# 客户端保存测试\n\nnew' },
+      '测试保存'
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('DELETE_RECOVERY_REQUIRED');
+    expect(result.error?.retryable).toBe(false);
+    expect(result.error?.message).toContain('删除');
+    expect(svc.getDocById(BASE_DOC.id)!.rawMarkdown).toBe(BASE_DOC.rawMarkdown);
+  });
+
   it('queues concurrent saves for the same document so versions stay ordered', async () => {
     fetchMock.mockImplementation(async (_url: string, init: any) => {
       const body = JSON.parse(init.body);
