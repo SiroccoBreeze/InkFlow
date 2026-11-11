@@ -566,7 +566,7 @@ export class DocumentService {
    * Returns 'failed' (keeping the marker) when the folder cannot be removed or the
    * marker is corrupt; callers must block writes for that document.
    */
-  private async recoverPendingDeletion(
+  public async recoverPendingDeletion(
     docId: string
   ): Promise<'none' | 'recovered' | 'cancelled' | 'failed'> {
     if (!fileStorage.isDocumentDeletePending(docId)) return 'none';
@@ -590,7 +590,14 @@ export class DocumentService {
     const row = db.prepare('SELECT 1 AS ok FROM documents WHERE id = ?').get(docId) as any;
     if (row?.ok) {
       // The crash happened before the SQLite commit: the document still exists.
-      await fileStorage.clearDocumentDeletePending(docId);
+      // The marker must actually be gone before we report cancellation; otherwise
+      // the folder would remain hidden from disk scans with no way to retry safely.
+      try {
+        await fileStorage.clearDocumentDeletePendingStrict(docId);
+      } catch (err) {
+        console.error(`[InkFlow Delete Recovery] Could not clear marker for ${docId}:`, err);
+        return 'failed';
+      }
       return 'cancelled';
     }
 
@@ -599,6 +606,7 @@ export class DocumentService {
       // stays intact so recovery can retry the whole operation.
       await fileStorage.deleteRevisionFolderStrict(docId);
       await fileStorage.deleteDocumentFolderStrict(docId);
+      // Folder (and thus marker) is gone; this is a best-effort no-op.
       await fileStorage.clearDocumentDeletePending(docId);
       return 'recovered';
     } catch (err) {
@@ -1197,7 +1205,17 @@ export class DocumentService {
             // may already be rolled back
           }
           if (markerCreated) {
-            await fileStorage.clearDocumentDeletePending(id).catch(() => {});
+            // Strict: if the marker cannot be removed, leave it in place. Recovery
+            // will find the still-existing DB row and cancel/retry; this delete is
+            // already reported as failed, so it is never treated as complete.
+            try {
+              await fileStorage.clearDocumentDeletePendingStrict(id);
+            } catch (clearErr) {
+              console.error(
+                `[InkFlow Delete] Could not clear delete marker for ${id}; recovery will retry:`,
+                clearErr
+              );
+            }
           }
           throw err;
         }
@@ -1216,6 +1234,8 @@ export class DocumentService {
         }
 
         if (!diskCleanupPending) {
+          // The marker lives inside the document folder and was removed together
+          // with it; this is a best-effort no-op (ENOENT is expected and ignorable).
           await fileStorage.clearDocumentDeletePending(id).catch(() => {});
         }
 

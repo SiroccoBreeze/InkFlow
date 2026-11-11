@@ -172,6 +172,92 @@ describe('Document deletion recovery', () => {
     fs.rmSync(folder, { recursive: true, force: true });
   });
 
+  it('reports failed (not cancelled) when the marker cannot be cleared after a DB rollback', async () => {
+    const created = await createDoc();
+    const originalRaw = fs.readFileSync(path.join(docFolder(created.id), 'index.md'), 'utf-8');
+    const triggerName = `fail_delete_${created.id.replace(/[^A-Za-z0-9_]/g, '_')}`;
+
+    // Make the SQLite delete transaction fail, so the document row must survive.
+    db.exec(`
+      CREATE TRIGGER ${triggerName}
+      BEFORE DELETE ON documents
+      WHEN OLD.id = '${created.id}'
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated delete transaction failure');
+      END;
+    `);
+
+    const clearSpy = vi
+      .spyOn(fileStorage, 'clearDocumentDeletePendingStrict')
+      .mockRejectedValue(new Error('simulated EACCES clearing delete marker'));
+
+    try {
+      const deleted = await request(app).delete(`/api/v1/documents/${created.id}`).set(auth());
+      expect(deleted.status).toBe(500);
+
+      // DB row, Markdown and marker all remain after the failed delete.
+      expect((db.prepare('SELECT id FROM documents WHERE id = ?').get(created.id) as any)?.id).toBe(created.id);
+      expect(fs.readFileSync(path.join(docFolder(created.id), 'index.md'), 'utf-8')).toBe(originalRaw);
+      expect(fs.existsSync(markerPath(created.id))).toBe(true);
+
+      // Marker cleanup failure must be reported as failed, not cancelled.
+      expect(await documentService.recoverPendingDeletion(created.id)).toBe('failed');
+      // Repeated recovery must not change data.
+      expect(await documentService.recoverPendingDeletion(created.id)).toBe('failed');
+      expect((db.prepare('SELECT id FROM documents WHERE id = ?').get(created.id) as any)?.id).toBe(created.id);
+      expect(fs.readFileSync(path.join(docFolder(created.id), 'index.md'), 'utf-8')).toBe(originalRaw);
+      expect(fs.existsSync(markerPath(created.id))).toBe(true);
+
+      // Saves are blocked while the marker cannot be cleared.
+      const blocked = await request(app)
+        .put(`/api/v1/documents/${created.id}`)
+        .set(auth())
+        .send({
+          title: created.title,
+          slug: created.slug,
+          rawMarkdown: '# 不应写入\n\nblocked',
+          category: '安全与数据主权',
+          tags: [],
+          visibility: 'private',
+          status: 'draft',
+          expectedVersionCount: created.versionCount,
+        });
+      expect(blocked.status).toBe(503);
+      expect(blocked.body.error.code).toBe('DELETE_RECOVERY_REQUIRED');
+      expect(fs.readFileSync(path.join(docFolder(created.id), 'index.md'), 'utf-8')).toBe(originalRaw);
+      expect(fs.existsSync(markerPath(created.id))).toBe(true);
+    } finally {
+      db.exec(`DROP TRIGGER IF EXISTS ${triggerName}`);
+      clearSpy.mockRestore();
+    }
+
+    // Filesystem healthy again: the still-existing DB row means deletion is
+    // cancelled (not completed); no Markdown row is deleted.
+    expect(await documentService.recoverPendingDeletion(created.id)).toBe('cancelled');
+    expect(fs.existsSync(markerPath(created.id))).toBe(false);
+    expect((db.prepare('SELECT id FROM documents WHERE id = ?').get(created.id) as any)?.id).toBe(created.id);
+    expect(fs.readFileSync(path.join(docFolder(created.id), 'index.md'), 'utf-8')).toBe(originalRaw);
+
+    // Saving is allowed again and does not lose the document.
+    const saved = await request(app)
+      .put(`/api/v1/documents/${created.id}`)
+      .set(auth())
+      .send({
+        title: created.title,
+        slug: created.slug,
+        rawMarkdown: '# 恢复后保存\n\nok',
+        category: '安全与数据主权',
+        tags: [],
+        visibility: 'private',
+        status: 'draft',
+        expectedVersionCount: created.versionCount,
+      });
+    expect(saved.status).toBe(200);
+    expect(saved.body.data.versionCount).toBe(created.versionCount + 1);
+    expect(fs.existsSync(markerPath(created.id))).toBe(false);
+    expect(fs.readFileSync(path.join(docFolder(created.id), 'index.md'), 'utf-8')).toContain('恢复后保存');
+  });
+
   it('blocks saves while deletion recovery is still failing (prevents resurrection)', async () => {
     const created = await createDoc();
     await fileStorage.markDocumentDeletePending(created.id);

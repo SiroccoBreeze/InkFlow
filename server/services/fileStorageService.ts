@@ -429,9 +429,25 @@ export class FileStorageService {
     return true;
   }
 
+  /**
+   * Best-effort marker removal. Only safe when the surrounding folder has already
+   * been deleted (the marker disappears with it) or when failure is tolerated by
+   * the caller. Recovery of a still-existing document must use the strict variant.
+   */
   public async clearDocumentDeletePending(documentId: string): Promise<void> {
     const marker = this.getDeleteMarkerPath(documentId);
     if (marker) await fs.rm(marker, { force: true }).catch(() => {});
+  }
+
+  /**
+   * Strict marker removal: missing marker is a no-op, but permission/IO errors
+   * are propagated. Recovery must not report success while the marker still
+   * exists, otherwise the folder stays excluded from re-import forever.
+   */
+  public async clearDocumentDeletePendingStrict(documentId: string): Promise<void> {
+    const marker = this.getDeleteMarkerPath(documentId);
+    if (!marker) throw new Error('非法的存储标识符');
+    await fs.rm(marker, { force: true });
   }
 
   /** Reads and parses the marker; null when missing. Throws on unreadable/corrupt file. */
