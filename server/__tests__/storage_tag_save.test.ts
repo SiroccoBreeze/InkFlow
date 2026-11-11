@@ -157,6 +157,27 @@ describe('StorageService tag maintenance save path', () => {
     expect(JSON.parse(localStorageMock.getItem('inkflow_custom_tags_v1')!)).toEqual(['old', 'keep']);
   });
 
+  it('keeps the local tag dictionary when the server still reports document references', async () => {
+    const baseImpl = fetchMock.getMockImplementation() as (url: string, init: any) => Promise<Response>;
+    fetchMock.mockImplementation(async (url: string, init: any = {}) => {
+      if ((init.method || 'GET') === 'DELETE') {
+        return jsonResponse(200, {
+          data: { success: true, tagDeleted: false, referencedDocuments: 2 },
+        });
+      }
+      return baseImpl(url, init);
+    });
+
+    const svc = new StorageServiceClass();
+    const result = await svc.deleteTag('old');
+
+    expect(result.failed).toBe(0);
+    expect(result.succeeded).toBe(2);
+    expect(result.dictionaryRetained).toBe(true);
+    // The server refused cleanup, so the local custom dictionary is not changed.
+    expect(JSON.parse(localStorageMock.getItem('inkflow_custom_tags_v1')!)).toEqual(['old', 'keep']);
+  });
+
   it('leaves every document untouched when all renames conflict', async () => {
     conflictIds.add('doc_a');
     conflictIds.add('doc_b');

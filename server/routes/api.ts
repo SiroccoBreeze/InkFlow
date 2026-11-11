@@ -4,10 +4,13 @@ import {
   documentService,
   DocumentConflictError,
   DocumentValidationError,
+  DocumentRecoveryRequiredError,
+  parseFrontmatter,
 } from '../services/documentService';
 import { searchService } from '../services/searchService';
 import { shareService } from '../services/shareService';
 import { assetService } from '../services/assetService';
+import { fileStorage } from '../services/fileStorageService';
 import { ensureInitialPhysicalDocs } from '../services/seedData';
 import { getDatabase, generateId } from '../db/sqlite';
 
@@ -418,13 +421,27 @@ function respondDocumentSaveError(res: Response, err: any): void {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: err.message } });
     return;
   }
+  if (err instanceof DocumentRecoveryRequiredError) {
+    res.status(503).json({
+      error: {
+        code: 'SAVE_RECOVERY_REQUIRED',
+        message: err.message,
+        details: { docId: err.docId },
+      },
+    });
+    return;
+  }
   console.error('[InkFlow Document Save]', err);
   res.status(500).json({ error: { code: 'SAVE_FAILED', message: err?.message || '保存文档失败' } });
 }
 
 apiRouter.delete('/documents/:id', requireOwner, async (req, res) => {
-  await documentService.deleteDocument(req.params.id);
-  res.json({ data: { success: true } });
+  try {
+    await documentService.deleteDocument(req.params.id);
+    res.json({ data: { success: true } });
+  } catch (err: any) {
+    respondDocumentSaveError(res, err);
+  }
 });
 
 // ---------------- REVISIONS & SNAPSHOTS ROUTES ----------------
@@ -661,22 +678,66 @@ apiRouter.get('/tags', (req, res) => {
   res.json({ data: rows });
 });
 
-apiRouter.delete('/tags/:name', requireOwner, (req, res) => {
+apiRouter.delete('/tags/:name', requireOwner, async (req, res) => {
   const tagName = decodeURIComponent(req.params.name).trim();
   const db = getDatabase();
 
   // Dictionary cleanup only. Removing the tag from each document's Markdown is
   // handled by the versioned saveDocument() path (client saveDoc), so this route
   // must not rewrite Markdown behind the optimistic lock or skip revision/FTS
-  // updates. Markdown remains the SSOT: a tag still present in a document file
-  // will simply be re-indexed into the dictionary on that document's next save.
+  // updates. Markdown remains the SSOT.
+
   const tagRow = db.prepare('SELECT id FROM tags WHERE name = ?').get(tagName) as any;
-  if (tagRow) {
-    db.prepare('DELETE FROM document_tags WHERE tag_id = ?').run(tagRow.id);
-    db.prepare('DELETE FROM tags WHERE id = ?').run(tagRow.id);
+  if (!tagRow) {
+    res.json({ data: { success: true, tagDeleted: false, referencedDocuments: 0 } });
+    return;
   }
 
-  res.json({ data: { success: true } });
+  const dbAssociations = Number(
+    (db.prepare('SELECT COUNT(*) AS c FROM document_tags WHERE tag_id = ?').get(tagRow.id) as any)?.c || 0
+  );
+
+  // The client cache may be incomplete, so also check the Markdown SSOT before
+  // deleting the dictionary entry. If any file still references the tag, keep
+  // the tag row and its associations; deleting them would silently diverge from
+  // the documents on disk.
+  let markdownReferences = 0;
+  try {
+    const docIds = await fileStorage.listAllDiskDocumentIds();
+    for (const docId of docIds) {
+      const raw = await fileStorage.readDocumentMarkdown(docId);
+      if (!raw) continue;
+      const { frontmatter } = parseFrontmatter(raw);
+      if (
+        Array.isArray(frontmatter.tags) &&
+        frontmatter.tags.map((tag: any) => String(tag)).includes(tagName)
+      ) {
+        markdownReferences++;
+      }
+    }
+  } catch (err) {
+    console.error('[InkFlow Tag Cleanup] Markdown reference scan failed:', err);
+    res.json({
+      data: {
+        success: true,
+        tagDeleted: false,
+        referencedDocuments: dbAssociations,
+        reason: 'markdown_scan_failed',
+      },
+    });
+    return;
+  }
+
+  const referencedDocuments = Math.max(dbAssociations, markdownReferences);
+  if (referencedDocuments > 0) {
+    res.json({ data: { success: true, tagDeleted: false, referencedDocuments } });
+    return;
+  }
+
+  db.prepare('DELETE FROM document_tags WHERE tag_id = ?').run(tagRow.id);
+  db.prepare('DELETE FROM tags WHERE id = ?').run(tagRow.id);
+
+  res.json({ data: { success: true, tagDeleted: true, referencedDocuments: 0 } });
 });
 
 // ---------------- SEARCH ROUTE ----------------

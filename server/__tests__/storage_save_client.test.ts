@@ -182,6 +182,30 @@ describe('StorageService save reliability (client side)', () => {
     expect(svc.getDocById(BASE_DOC.id)!.versionCount).toBe(3);
   });
 
+  it('blocks retry and preserves edits when the server requires recovery', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(503, {
+        error: {
+          code: 'SAVE_RECOVERY_REQUIRED',
+          message: '文档存在未完成的保存恢复任务',
+          details: { docId: BASE_DOC.id },
+        },
+      })
+    );
+
+    const svc = new StorageServiceClass();
+    const result = await svc.saveDoc(
+      { id: BASE_DOC.id, title: BASE_DOC.title, rawMarkdown: '# 客户端保存测试\n\nnew' },
+      '测试保存'
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(result.error?.retryable).toBe(false);
+    expect(result.error?.message).toContain('保存已暂停');
+    expect(svc.getDocById(BASE_DOC.id)!.rawMarkdown).toBe(BASE_DOC.rawMarkdown);
+  });
+
   it('queues concurrent saves for the same document so versions stay ordered', async () => {
     fetchMock.mockImplementation(async (_url: string, init: any) => {
       const body = JSON.parse(init.body);

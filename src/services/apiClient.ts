@@ -365,7 +365,13 @@ class ApiClient {
   }
 
   public async deleteTag(tagName: string) {
-    return this.request<{ success: boolean }>(`/tags/${encodeURIComponent(tagName)}`, {
+    return this.request<{
+      success: boolean;
+      /** false when the server still finds documents referencing the tag. */
+      tagDeleted?: boolean;
+      referencedDocuments?: number;
+      reason?: string;
+    }>(`/tags/${encodeURIComponent(tagName)}`, {
       method: 'DELETE',
     });
   }

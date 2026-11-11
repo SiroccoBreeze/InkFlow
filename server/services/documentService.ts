@@ -39,6 +39,18 @@ export class DocumentValidationError extends Error {
   public readonly code = 'VALIDATION_ERROR';
 }
 
+/**
+ * Thrown when an interrupted save could not be recovered. Continuing would
+ * overwrite the only remaining `.bak`, so creation/update/delete must stop until
+ * an administrator resolves the pending artifacts.
+ */
+export class DocumentRecoveryRequiredError extends Error {
+  public readonly code = 'SAVE_RECOVERY_REQUIRED';
+  constructor(public readonly docId: string) {
+    super('文档存在未完成的保存恢复任务，已暂停写入以避免覆盖恢复备份');
+  }
+}
+
 const MAX_MARKDOWN_BYTES = 5 * 1024 * 1024;
 const MAX_TITLE_LENGTH = 500;
 const MAX_CATEGORY_LENGTH = 120;
@@ -458,8 +470,8 @@ export class DocumentService {
    * The DB content hash is the commit point: if index.md matches it the save is
    * kept, otherwise the previous file is restored (or an uncommitted new file removed).
    */
-  private async recoverPendingSave(docId: string): Promise<boolean> {
-    if (!(await fileStorage.hasPendingDocumentSave(docId))) return false;
+  private async recoverPendingSave(docId: string): Promise<'none' | 'recovered' | 'failed'> {
+    if (!(await fileStorage.hasPendingDocumentSave(docId))) return 'none';
 
     const db = this.getDb();
     const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(docId) as any;
@@ -491,12 +503,19 @@ export class DocumentService {
             // Backup exists but could not be restored (I/O error). Leave every
             // artifact in place so a later recovery attempt can retry.
             console.error(`[InkFlow Save Recovery] Could not restore backup for ${docId}; will retry later.`);
-            return false;
+            return 'failed';
           }
           // No backup at all: index.md is ahead of the DB with nothing to restore.
           const indexPath = fileStorage.getDocumentIndexPath(docId);
           if (indexPath) {
-            await fs.rm(indexPath, { force: true }).catch(() => {});
+            try {
+              await fs.rm(indexPath, { force: true });
+            } catch (err) {
+              // Keep marker/backup: removing them now would erase the only trace
+              // that this document still needs administrator recovery.
+              console.error(`[InkFlow Save Recovery] Could not remove ${indexPath}:`, err);
+              return 'failed';
+            }
           }
         }
         await fileStorage.clearDocumentSaveArtifacts(docId);
@@ -505,9 +524,13 @@ export class DocumentService {
       // Interrupted create: no DB row means this Markdown was never committed.
       // The folder only contains the uncommitted index/artifacts, so remove it.
       await fileStorage.deleteDocumentFolder(docId);
+      if (fileStorage.documentFolderExists(docId)) {
+        console.error(`[InkFlow Save Recovery] Could not remove uncommitted folder for ${docId}; will retry later.`);
+        return 'failed';
+      }
     }
 
-    return true;
+    return 'recovered';
   }
 
   /**
@@ -561,12 +584,21 @@ export class DocumentService {
   public async recoverPendingSaves(): Promise<number> {
     const ids = await fileStorage.listPendingSaveDocumentIds();
     let recovered = 0;
+    let failed = 0;
     for (const id of ids) {
       try {
-        if (await this.recoverPendingSave(id)) recovered++;
+        const result = await this.recoverPendingSave(id);
+        if (result === 'recovered') recovered++;
+        else if (result === 'failed') failed++;
       } catch (err) {
         console.error(`[InkFlow Save Recovery] Failed recovering ${id}:`, err);
+        failed++;
       }
+    }
+    if (failed > 0) {
+      console.error(
+        `[InkFlow Save Recovery] ${failed} document(s) still require recovery; writes for them are blocked.`
+      );
     }
 
     // Upgrade legacy rows so future metadata-only saves can be recovered by
@@ -605,7 +637,15 @@ export class DocumentService {
     const docId = input.id || generateId('doc');
     return this.withDocumentLock(docId, async () => {
       // Heal a previously interrupted save for this document before touching it again.
-      await this.recoverPendingSave(docId);
+      // If recovery cannot complete, refuse to write: continuing would overwrite
+      // the only `.bak` / `.save.pending` that an administrator may need.
+      const recovery = await this.recoverPendingSave(docId).catch(err => {
+        console.error(`[InkFlow Save Recovery] Recovery failed for ${docId}:`, err);
+        return 'failed' as const;
+      });
+      if (recovery === 'failed') {
+        throw new DocumentRecoveryRequiredError(docId);
+      }
       return this.saveDocumentLocked(input, docId, ownerId, note);
     });
   }
@@ -916,7 +956,18 @@ export class DocumentService {
   }
 
   // Delete document
-  public async deleteDocument(id: string) {    const db = this.getDb();
+  public async deleteDocument(id: string) {
+    // Deletion must not run while a save is awaiting recovery: it would remove
+    // the backup/marker files that contain the last committed content.
+    const recovery = await this.recoverPendingSave(id).catch(err => {
+      console.error(`[InkFlow Save Recovery] Recovery failed for ${id}:`, err);
+      return 'failed' as const;
+    });
+    if (recovery === 'failed') {
+      throw new DocumentRecoveryRequiredError(id);
+    }
+
+    const db = this.getDb();
     // 1. Read document markdown to check for attached assets before deleting
     const rawMarkdown = await fileStorage.readDocumentMarkdown(id);
 

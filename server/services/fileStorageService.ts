@@ -171,6 +171,13 @@ export class FileStorageService {
     const artifacts = this.getSaveArtifacts(documentId);
     if (!artifacts) return null;
 
+    // Defense in depth: never overwrite an existing backup/marker. documentService
+    // blocks saves after a failed recovery, but this guard catches any future
+    // caller that forgets to run recovery first.
+    if (await this.hasPendingDocumentSave(documentId)) {
+      throw new Error('存在待恢复的保存产物，拒绝覆盖 .bak / .save.pending');
+    }
+
     await fs.mkdir(artifacts.folder, { recursive: true });
     // Remove stale temp files from a crashed previous attempt (backup/marker are
     // handled by recovery, never blindly deleted here).
@@ -287,6 +294,12 @@ export class FileStorageService {
     } catch {
       return false;
     }
+  }
+
+  /** Whether the document folder still exists on disk. */
+  public documentFolderExists(documentId: string): boolean {
+    const folder = this.getDocFolderSafe(documentId);
+    return folder ? fsSync.existsSync(folder) : false;
   }
 
   public async clearDocumentSaveArtifacts(documentId: string): Promise<void> {

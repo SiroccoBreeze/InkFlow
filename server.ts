@@ -59,9 +59,14 @@ async function startServer() {
     next();
   });
 
-  // Ensure storage directories & initial physical markdown files
+  // Database schema migration is a hard prerequisite. Do not swallow failures:
+  // starting without document_hash would make crash recovery unsafe. Throwing
+  // here aborts startServer() before listen() (see the top-level catch).
+  getDatabase();
+
+  // Non-fatal storage maintenance. Save/delete operations still run their own
+  // recovery guard if a document could not be reconciled here.
   try {
-    getDatabase();
     // Reconcile any save that was interrupted between the Markdown rename and the
     // SQLite commit before seeding/rebuilding anything from disk.
     const recovered = await documentService.recoverPendingSaves();

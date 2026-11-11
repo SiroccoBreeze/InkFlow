@@ -97,8 +97,20 @@ export function getDatabase(): DatabaseSync {
   }
 
   const db = new DatabaseSync(dbFilePath);
-  initDatabaseSchema(db);
-  seedDefaultDataIfEmpty(db);
+  try {
+    initDatabaseSchema(db);
+    seedDefaultDataIfEmpty(db);
+  } catch (err) {
+    // Do not leave a half-initialized connection open, and never delete the
+    // database to "fix" a migration failure.
+    try {
+      db.close();
+    } catch {
+      // ignore close failure
+    }
+    console.error(`[InkFlow Database] Initialization failed for ${dbFilePath}:`, err);
+    throw err;
+  }
 
   dbInstance = db;
   return dbInstance;

@@ -15,6 +15,7 @@ import {
   buildFrontmatterBlock,
 } from '../services/documentService';
 import { getDatabase, closeDatabase } from '../db/sqlite';
+import { fileStorage } from '../services/fileStorageService';
 
 // Isolated database + storage for this suite.
 const testDbPath = path.join(os.tmpdir(), `inkflow_save_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.sqlite`);
@@ -511,6 +512,109 @@ describe('Document save reliability', () => {
     expect(row.title).toBe('旧行已提交的新标题');
     expect(row.visibility).toBe('public');
     expect(row.document_hash).toBe(calculateDocumentHash(newRaw));
+  });
+
+  // -------------------------------------------------------------------------
+  it('completes recovery before allowing the new save', async () => {
+    const created = await createDoc('# 恢复后保存\n\nold', { visibility: 'private' });
+    const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+    const uncommitted = fullMarkdownWithMetadata(created.id, { title: '未提交的标题' });
+    simulateCrashBeforeCommit(created.id, uncommitted);
+
+    const res = await updateDoc(created.id, '# 恢复后保存\n\nnew', created.versionCount);
+
+    expect(res.status).toBe(200);
+    // The uncommitted file was rolled back first, then the new save was applied.
+    expect(readBody(created.id)).toBe('# 恢复后保存\n\nnew');
+    const row = db.prepare('SELECT * FROM documents WHERE id = ?').get(created.id) as any;
+    expect(row.title).not.toBe('未提交的标题');
+    expect(row.version_count).toBe(created.versionCount + 1);
+    expect(artifacts(created.id)).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  it('blocks saves when backup restore fails and preserves the only recovery files', async () => {
+    const created = await createDoc('# 恢复失败\n\nold', { visibility: 'private' });
+    const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+    const uncommitted = fullMarkdownWithMetadata(created.id, { title: '未提交且恢复失败' });
+    simulateCrashBeforeCommit(created.id, uncommitted);
+
+    const folder = path.join(testDataDir, 'documents', created.id);
+    const backupPath = path.join(folder, 'index.md.bak');
+    const markerPath = path.join(folder, '.save.pending');
+
+    // Rename inside the folder requires write permission; removing it simulates
+    // a filesystem EACCES during backup restore.
+    fs.chmodSync(folder, 0o500);
+    try {
+      const blocked = await updateDoc(created.id, '# 恢复失败\n\nnew', created.versionCount);
+      expect(blocked.status).toBe(503);
+      expect(blocked.body.error.code).toBe('SAVE_RECOVERY_REQUIRED');
+
+      // Original backup untouched, marker still present, uncommitted file untouched.
+      expect(fs.readFileSync(backupPath, 'utf-8')).toBe(oldRaw);
+      expect(fs.existsSync(markerPath)).toBe(true);
+      expect(fs.readFileSync(filePath(created.id), 'utf-8')).toBe(uncommitted);
+
+      // A second attempt must not overwrite the backup either.
+      const blockedAgain = await updateDoc(created.id, '# 恢复失败\n\nsecond-attempt', created.versionCount);
+      expect(blockedAgain.status).toBe(503);
+      expect(fs.readFileSync(backupPath, 'utf-8')).toBe(oldRaw);
+      expect(fs.existsSync(markerPath)).toBe(true);
+
+      const row = db.prepare('SELECT version_count, title FROM documents WHERE id = ?').get(created.id) as any;
+      expect(row.version_count).toBe(created.versionCount);
+      expect(row.title).not.toBe('未提交且恢复失败');
+    } finally {
+      fs.chmodSync(folder, 0o755);
+    }
+
+    // Once the filesystem is writable again, recovery succeeds and the save runs.
+    const retried = await updateDoc(created.id, '# 恢复失败\n\nnew', created.versionCount);
+    expect(retried.status).toBe(200);
+    expect(readBody(created.id)).toBe('# 恢复失败\n\nnew');
+    expect(artifacts(created.id)).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  it('blocks deletion while recovery cannot complete', async () => {
+    const created = await createDoc('# 恢复后删除\n\nold');
+    const oldRaw = fs.readFileSync(filePath(created.id), 'utf-8');
+    simulateCrashBeforeCommit(created.id, fullMarkdownWithMetadata(created.id, { title: '删除前的未提交标题' }));
+
+    const folder = path.join(testDataDir, 'documents', created.id);
+    fs.chmodSync(folder, 0o500);
+    try {
+      const blocked = await request(app).delete(`/api/v1/documents/${created.id}`).set(auth());
+      expect(blocked.status).toBe(503);
+      expect(blocked.body.error.code).toBe('SAVE_RECOVERY_REQUIRED');
+      expect(fs.existsSync(folder)).toBe(true);
+      expect(fs.readFileSync(path.join(folder, 'index.md.bak'), 'utf-8')).toBe(oldRaw);
+      expect(fs.existsSync(path.join(folder, '.save.pending'))).toBe(true);
+    } finally {
+      fs.chmodSync(folder, 0o755);
+    }
+
+    const deleted = await request(app).delete(`/api/v1/documents/${created.id}`).set(auth());
+    expect(deleted.status).toBe(200);
+    expect(fs.existsSync(folder)).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  it('refuses to stage a new save while recovery artifacts exist', async () => {
+    const created = await createDoc('# 直接调用保护\n\nold');
+    const folder = path.join(testDataDir, 'documents', created.id);
+    fs.writeFileSync(path.join(folder, '.save.pending'), new Date().toISOString(), 'utf-8');
+
+    await expect(
+      fileStorage.prepareDocumentSave(created.id, 'old', 'new')
+    ).rejects.toThrow(/待恢复/);
+
+    // A later recovery clears the marker and allows staging again.
+    await documentService.recoverPendingSaves();
+    await expect(
+      fileStorage.prepareDocumentSave(created.id, 'old', 'new')
+    ).resolves.toBeTruthy();
   });
 
   // -------------------------------------------------------------------------

@@ -579,7 +579,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     if (!result) return;
     if (result.failed === 0) {
       showStatus(
-        result.dictionaryCleanupFailed
+        result.dictionaryRetained
+          ? `已更新 ${result.succeeded} 篇文档；服务端仍检测到 #${oldTag} 的文档引用，旧标签字典已保留`
+          : result.dictionaryCleanupFailed
           ? `已将 #${oldTag} 重命名为 #${newTag}（${result.succeeded} 篇），旧标签字典清理失败`
           : `已将标签 #${oldTag} 重命名为 #${newTag}`
       );
@@ -604,7 +606,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         onRefreshData();
         if (result.failed === 0) {
           showStatus(
-            result.dictionaryCleanupFailed
+            result.dictionaryRetained
+              ? `已从 ${result.succeeded} 篇文档移除标签 #${tag}；服务端仍检测到该标签的文档引用，标签字典已保留`
+              : result.dictionaryCleanupFailed
               ? `已从 ${result.succeeded} 篇文档移除标签 #${tag}，但服务端标签字典清理失败`
               : `已移除标签 #${tag}`
           );
@@ -640,7 +644,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         if (!result) return;
         if (result.failed === 0) {
           showStatus(
-            result.dictionaryCleanupFailed
+            result.dictionaryRetained
+              ? `已更新 ${result.succeeded} 篇文档；服务端仍检测到 #${from} 的文档引用，旧标签字典已保留`
+              : result.dictionaryCleanupFailed
               ? `已将 #${from} 合并至 #${to}（${result.succeeded} 篇），旧标签字典清理失败`
               : `已合并标签 #${from} 至 #${to}`
           );

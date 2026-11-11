@@ -181,12 +181,23 @@ export function initDatabaseSchema(db: DatabaseSync): void {
 
   // Incremental migration for installations created before document_hash existed.
   // content_hash stays body-only; document_hash covers frontmatter + body.
+  // Migration failure is FATAL: starting without the commit marker would make
+  // crash recovery unsafe, so the error is propagated to abort startup.
+  const readDocumentColumns = () =>
+    (db.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map(c => c.name);
+
   try {
-    const columns = db.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>;
-    if (!columns.some(column => column.name === 'document_hash')) {
+    if (!readDocumentColumns().includes('document_hash')) {
       db.exec('ALTER TABLE documents ADD COLUMN document_hash TEXT');
     }
-  } catch (err) {
-    console.error('[InkFlow Schema Migration] Failed ensuring documents.document_hash:', err);
+    if (!readDocumentColumns().includes('document_hash')) {
+      throw new Error('ALTER 执行后仍未检测到 document_hash 列');
+    }
+  } catch (err: any) {
+    throw new Error(
+      `数据库结构迁移失败（documents.document_hash）：${err?.message || err}。` +
+        '已停止启动，请修复数据库权限/结构后重试；不要删除数据库或重新初始化以绕过迁移。',
+      { cause: err }
+    );
   }
 }

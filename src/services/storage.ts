@@ -180,8 +180,10 @@ export interface BulkSaveResult {
   succeeded: number;
   failed: number;
   errors: SaveDocError[];
-  /** Document saves succeeded but the server tag dictionary cleanup failed. */
+  /** Document saves succeeded but the server tag dictionary cleanup request failed. */
   dictionaryCleanupFailed?: boolean;
+  /** Server still found document references (or the Markdown scan failed), so the tag dictionary was kept. */
+  dictionaryRetained?: boolean;
 }
 
 export interface SaveDocResult {
@@ -517,6 +519,16 @@ export class StorageService {
         message: '缺少文档版本号，请刷新页面后重试保存。',
         status,
         retryable: false,
+      };
+    }
+    if (code === 'SAVE_RECOVERY_REQUIRED' || status === 503) {
+      return {
+        code: 'RECOVERY_REQUIRED',
+        message:
+          '保存已暂停：该文档存在未完成的恢复任务，为避免覆盖备份，需要管理员处理后再保存。你的编辑内容仍保留。',
+        status,
+        retryable: false,
+        details: error?.details,
       };
     }
     if (code === 'NETWORK_ERROR' || status === 0) {
@@ -903,6 +915,25 @@ export class StorageService {
     return { total: attempted, succeeded, failed: errors.length, errors };
   }
 
+  private applyTagCleanupResult(
+    result: BulkSaveResult,
+    cleanup: Awaited<ReturnType<typeof apiClient.deleteTag>>
+  ): void {
+    if (cleanup.error) {
+      result.dictionaryCleanupFailed = true;
+      return;
+    }
+    if (cleanup.data?.reason) {
+      // The server could not verify Markdown references; treat the dictionary as
+      // not cleaned so the local dictionary is not silently diverged.
+      result.dictionaryCleanupFailed = true;
+      return;
+    }
+    if (cleanup.data && cleanup.data.tagDeleted === false && (cleanup.data.referencedDocuments || 0) > 0) {
+      result.dictionaryRetained = true;
+    }
+  }
+
   private updateCustomTags(updater: (list: string[]) => string[]): void {
     try {
       const data = localStorage.getItem('inkflow_custom_tags_v1');
@@ -932,9 +963,12 @@ export class StorageService {
     );
 
     if (result.failed === 0) {
-      this.updateCustomTags(list => list.map(tag => (tag === cleanOld ? cleanNew : tag)));
-      const cleanup = await apiClient.deleteTag(cleanOld);
-      if (cleanup.error) result.dictionaryCleanupFailed = true;
+      this.applyTagCleanupResult(result, await apiClient.deleteTag(cleanOld));
+      // Only mirror the rename locally when the server actually removed the old
+      // dictionary entry; retained tags mean an unseen document still uses it.
+      if (!result.dictionaryCleanupFailed && !result.dictionaryRetained) {
+        this.updateCustomTags(list => list.map(tag => (tag === cleanOld ? cleanNew : tag)));
+      }
     }
 
     return result;
@@ -953,9 +987,10 @@ export class StorageService {
     );
 
     if (result.failed === 0) {
-      this.updateCustomTags(list => list.filter(tag => tag !== cleanTag));
-      const cleanup = await apiClient.deleteTag(cleanTag);
-      if (cleanup.error) result.dictionaryCleanupFailed = true;
+      this.applyTagCleanupResult(result, await apiClient.deleteTag(cleanTag));
+      if (!result.dictionaryCleanupFailed && !result.dictionaryRetained) {
+        this.updateCustomTags(list => list.filter(tag => tag !== cleanTag));
+      }
     }
 
     return result;
@@ -979,13 +1014,14 @@ export class StorageService {
     );
 
     if (result.failed === 0) {
-      this.updateCustomTags(list => {
-        const next = list.filter(tag => tag !== cleanFrom);
-        if (!next.includes(cleanTo)) next.push(cleanTo);
-        return next;
-      });
-      const cleanup = await apiClient.deleteTag(cleanFrom);
-      if (cleanup.error) result.dictionaryCleanupFailed = true;
+      this.applyTagCleanupResult(result, await apiClient.deleteTag(cleanFrom));
+      if (!result.dictionaryCleanupFailed && !result.dictionaryRetained) {
+        this.updateCustomTags(list => {
+          const next = list.filter(tag => tag !== cleanFrom);
+          if (!next.includes(cleanTo)) next.push(cleanTo);
+          return next;
+        });
+      }
     }
 
     return result;
