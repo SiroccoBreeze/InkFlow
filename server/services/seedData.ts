@@ -88,5 +88,8 @@ export async function ensureAssetReferences(): Promise<void> {
     }
   } catch (err) {
     console.error('[InkFlow Storage] Failed syncing asset references:', err);
+    // Startup treats this as a non-critical maintenance failure and degrades,
+    // rather than silently serving potentially stale asset permissions.
+    throw err;
   }
 }

@@ -6,6 +6,8 @@ import { apiRouter } from './server/routes/api';
 import { ensureInitialPhysicalDocs, ensureAssetReferences } from './server/services/seedData';
 import { documentService } from './server/services/documentService';
 import { assetService } from './server/services/assetService';
+import { fileStorage } from './server/services/fileStorageService';
+import { maintenanceState } from './server/services/maintenanceState';
 import { getDatabase } from './server/db/sqlite';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -65,8 +67,16 @@ async function startServer() {
   // here aborts startServer() before listen() (see the top-level catch).
   getDatabase();
 
-  // Non-fatal storage maintenance. Save/delete operations still run their own
-  // recovery guard if a document could not be reconciled here.
+  // Startup recovery is split into two classes:
+  //
+  //  CRITICAL — unfinished V1.1 document save/delete recovery. If this cannot be
+  //  completed, the DB and Markdown may disagree; the server must NOT accept
+  //  writes. We still listen so operators can read /api/health and inspect data.
+  //
+  //  NON-CRITICAL — attachment tombstone retry and derived-index maintenance.
+  //  These are safe to degrade: they are retried later, and tombstoned assets
+  //  cannot be resurrected by reconciliation.
+  let criticalRecoveryError: unknown = null;
   try {
     // Finish committed deletions whose folder removal failed before any disk
     // rebuild/seed, so deleted documents cannot be re-imported.
@@ -82,36 +92,104 @@ async function startServer() {
       console.log(`[InkFlow Save Recovery] Recovered ${recovered} interrupted document save(s).`);
     }
 
-    // Finish attachment deletions whose DB rows committed but whose file unlink
-    // failed. This must run before reconciliation/seed/asset-reference rebuild so
-    // a tombstoned file can never be re-registered.
-    const assetDeletions = await assetService.recoverPendingAssetDeletions();
-    if (assetDeletions.recovered > 0) {
-      console.log(
-        `[InkFlow Asset Recovery] Completed ${assetDeletions.recovered} pending attachment deletion(s).`
+    // The recovery helpers log per-document failures instead of throwing. Scan
+    // strictly for leftovers so a partial recovery is still treated as critical.
+    const [pendingDeletions, pendingSaves] = await Promise.all([
+      fileStorage.listPendingDeletionDocumentIds(),
+      fileStorage.listPendingSaveDocumentIdsStrict(),
+    ]);
+    if (pendingDeletions.length > 0 || pendingSaves.length > 0) {
+      throw new Error(
+        `仍有未完成的文档恢复任务：待删除目录 [${pendingDeletions.join(', ')}]，` +
+          `待恢复保存 [${pendingSaves.join(', ')}]`
       );
     }
-
-    await ensureInitialPhysicalDocs();
-
-    // Reconcile the asset ↔ document association table with the Markdown SSOT
-    // BEFORE accepting requests. This is a multi-document DB write guarded by the
-    // exclusive consistency lease; running it after listen() let online saves race
-    // with the rebuild and made a backup snapshot non-deterministic.
-    await ensureAssetReferences();
   } catch (err) {
-    console.error('[Storage Init Error]:', err);
+    criticalRecoveryError = err;
   }
+
+  if (criticalRecoveryError) {
+    maintenanceState.enterMaintenance('startup_recovery_failed');
+    console.error(
+      '[InkFlow Startup] 关键恢复失败，服务将以只读维护模式启动；所有写入请求将返回 503。' +
+        '请在修复文件系统/数据后重启，期间不要执行写入操作。',
+      criticalRecoveryError
+    );
+  } else {
+    // Non-critical maintenance: failures degrade the service but do not block
+    // writes, because the core data-recovery invariants still hold.
+    try {
+      // Finish attachment deletions whose DB rows committed but whose file unlink
+      // failed. Must run before reconciliation/seed/asset-reference rebuild so a
+      // tombstoned file can never be re-registered.
+      const assetDeletions = await assetService.recoverPendingAssetDeletions();
+      if (assetDeletions.recovered > 0) {
+        console.log(
+          `[InkFlow Asset Recovery] Completed ${assetDeletions.recovered} pending attachment deletion(s).`
+        );
+      }
+      if (assetDeletions.failed > 0) {
+        maintenanceState.addDegradedWarning(
+          `附件删除恢复仍有 ${assetDeletions.failed} 项待重试（服务继续可用）`
+        );
+      }
+    } catch (err) {
+      console.error('[InkFlow Asset Recovery] 非关键恢复失败，服务继续运行（降级）:', err);
+      maintenanceState.addDegradedWarning('附件删除恢复失败，tombstone 已保留等待重试');
+    }
+
+    try {
+      await ensureInitialPhysicalDocs();
+    } catch (err) {
+      console.error('[InkFlow Storage] 初始化/重建索引失败，服务继续运行（降级）:', err);
+      maintenanceState.addDegradedWarning('物理文档初始化/索引重建失败');
+    }
+
+    try {
+      // Reconcile the asset ↔ document association table with the Markdown SSOT
+      // BEFORE accepting requests. This is a multi-document DB write guarded by the
+      // exclusive consistency lease; running it after listen() let online saves race
+      // with the rebuild and made a backup snapshot non-deterministic.
+      await ensureAssetReferences();
+    } catch (err) {
+      console.error('[InkFlow Storage] 附件引用重建失败，服务继续运行（降级）:', err);
+      maintenanceState.addDegradedWarning('文档↔附件引用重建失败');
+    }
+  }
+
+  // Server-side maintenance barrier. It does not rely on the UI: every non-read
+  // HTTP request is rejected while critical recovery is unresolved.
+  app.use('/api', (req, res, next) => {
+    if (
+      !maintenanceState.isWriteAllowed() &&
+      req.method !== 'GET' &&
+      req.method !== 'HEAD' &&
+      req.method !== 'OPTIONS'
+    ) {
+      const state = maintenanceState.snapshot();
+      res.status(503).json({
+        error: {
+          code: 'MAINTENANCE_MODE',
+          message: '服务处于只读维护模式：启动恢复尚未完成，写入操作已被拒绝',
+          details: { reason: state.reason, since: state.since },
+        },
+      });
+      return;
+    }
+    next();
+  });
 
   // Mount API Router under /api/v1
   app.use('/api/v1', apiRouter);
 
-  // Health check endpoint
-  app.get('/api/health', (req, res) => {
-    res.json({
-      status: 'ok',
+  // Health check endpoint: HTTP status and body both distinguish the three states.
+  app.get('/api/health', (_req, res) => {
+    const state = maintenanceState.snapshot();
+    res.status(state.status === 'maintenance' ? 503 : 200).json({
+      status: state.status,
       service: 'InkFlow Knowledge Hub Full-Stack API',
       timestamp: new Date().toISOString(),
+      maintenance: state,
     });
   });
 
@@ -159,6 +237,11 @@ async function startServer() {
     console.log(`🗄️ Native SQLite WAL Database: storage/database/knowledge_hub.sqlite`);
     console.log(`🔌 API Base Endpoint: http://0.0.0.0:${PORT}/api/v1`);
     console.log(`🔒 Document write mode: single instance (no cluster workers)`);
+    if (maintenanceState.isMaintenance()) {
+      console.log(`🛑 MAINTENANCE MODE (read-only): startup recovery failed — writes return 503.`);
+    } else if (maintenanceState.snapshot().status === 'degraded') {
+      console.log(`⚠️  DEGRADED: non-critical maintenance pending — see /api/health.`);
+    }
     if (!process.env.INKFLOW_INIT_KEY) {
       console.log(`⚠️  INKFLOW_INIT_KEY is not set — first-run owner initialization is DISABLED.`);
     }

@@ -6,6 +6,7 @@ import { getDatabase, generateId, runInTransaction } from '../db/sqlite';
 import { fileStorage } from './fileStorageService';
 import { extractAssetReferences } from './documentService';
 import { assetMutationLock, consistencyGate } from './consistencyGate';
+import { maintenanceState } from './maintenanceState';
 import { normalizeStorageRelativePath } from '../utils/storagePaths';
 
 // Resolved lazily so INKFLOW_DATA_DIR is always honoured (tests / multi-instance deployments)
@@ -51,6 +52,21 @@ export interface AssetRecord {
   checksum: string;
   url: string;
   createdAt: string;
+}
+
+/**
+ * Thrown when a live asset row cannot be deleted safely because its stored
+ * `storage_path` cannot produce an exact, validated tombstone. The DB row and
+ * file are left untouched; callers must surface this as an explicit error.
+ */
+export class AssetPathInvalidError extends Error {
+  public readonly code = 'ASSET_PATH_INVALID';
+  constructor(
+    public readonly assetId: string,
+    message: string
+  ) {
+    super(message);
+  }
 }
 
 type AssetDeletionReason = 'manual-delete' | 'cleanup-unreferenced' | 'cleanup-orphan';
@@ -144,6 +160,16 @@ export class AssetService {
     `);
 
     for (const intent of intents) {
+      // Defense in depth: never persist a tombstone that could later resolve to
+      // an unrelated file. Callers must already have validated the path, but a
+      // future caller must not be able to bypass that by constructing an intent.
+      const normalized = normalizeManagedAssetPath(intent.storagePath);
+      const impliedId = normalized ? assetIdFromFileName(path.posix.basename(normalized)) : null;
+      if (!normalized || normalized !== intent.storagePath || !impliedId || impliedId !== intent.assetId) {
+        throw new Error(
+          `拒绝写入非法的附件删除标记：asset_id=${intent.assetId}, storage_path=${JSON.stringify(intent.storagePath)}`
+        );
+      }
       statement.run(intent.assetId, intent.storagePath, intent.filename, intent.reason, now);
     }
   }
@@ -378,7 +404,11 @@ export class AssetService {
     const releaseGate = await consistencyGate.acquireShared();
     const releaseMutex = await assetMutationLock.acquire();
     try {
-      this.reconcilePhysicalAssetsLocked();
+      // In read-only maintenance mode, listing assets must not perform the
+      // reconciliation write (GET /assets is otherwise a disguised write).
+      if (maintenanceState.isWriteAllowed()) {
+        this.reconcilePhysicalAssetsLocked();
+      }
       const db = getDatabase();
       const rows = db.prepare('SELECT * FROM assets ORDER BY created_at DESC').all() as any[];
 
@@ -489,18 +519,31 @@ export class AssetService {
 
       const intents: AssetDeletionIntent[] = [];
       const seenPaths = new Set<string>();
-      const addIntent = (rawStoragePath: unknown, filename: string | null): void => {
+      const addIntent = (rawStoragePath: unknown, filename: string | null): boolean => {
         const storagePath = normalizeManagedAssetPath(rawStoragePath);
-        if (!storagePath) return;
+        if (!storagePath) return false;
         const impliedId = assetIdFromFileName(path.posix.basename(storagePath));
-        if (!impliedId || impliedId !== id) return;
-        if (seenPaths.has(storagePath)) return;
+        if (!impliedId || impliedId !== id) return false;
+        if (seenPaths.has(storagePath)) return false;
         seenPaths.add(storagePath);
         intents.push({ assetId: id, storagePath, filename, reason: 'manual-delete' });
+        return true;
       };
 
       if (record) {
-        addIntent(record.storage_path, record.filename ? String(record.filename) : null);
+        const recordPathValid = addIntent(
+          record.storage_path,
+          record.filename ? String(record.filename) : null
+        );
+        if (!recordPathValid) {
+          // A live row whose storage_path cannot produce an exact tombstone must
+          // not be deleted: doing so would leave an unprotected file that the
+          // reconciler could later re-register (or could never be cleaned up).
+          throw new AssetPathInvalidError(
+            id,
+            `附件 ${id} 的 storage_path 无法生成合法删除标记，已拒绝删除并保留数据库记录与物理文件`
+          );
+        }
       }
 
       // Also remove any physical file whose exact basename matches the asset ID
@@ -560,6 +603,7 @@ export class AssetService {
     cleanedCount: number;
     freedBytes: number;
     deletedIds: string[];
+    skippedInvalidPaths: string[];
   }> {
     return consistencyGate.withExclusive(() =>
       assetMutationLock.withLock(() => this.cleanupUnreferencedAssetsUnderLease())
@@ -571,6 +615,7 @@ export class AssetService {
     cleanedCount: number;
     freedBytes: number;
     deletedIds: string[];
+    skippedInvalidPaths: string[];
   }> {
     const db = getDatabase();
 
@@ -593,35 +638,46 @@ export class AssetService {
     await this.retryPendingDeletionsLocked();
 
     const allAssets = db.prepare('SELECT * FROM assets').all() as any[];
-    const candidates: Array<{ id: string; storagePath: string | null }> = [];
+    const candidates: Array<{ id: string; storagePath: string }> = [];
     const intentByPath = new Map<string, AssetDeletionIntent>();
     const sizeByPath = new Map<string, number>();
+    const skippedInvalidPaths: string[] = [];
 
     for (const asset of allAssets) {
       const id = String(asset.id);
       if (referencedIds.has(id)) continue;
 
       const storagePath = normalizeManagedAssetPath(asset.storage_path);
+      const impliedId = storagePath ? assetIdFromFileName(path.posix.basename(storagePath)) : null;
+      if (!storagePath || !impliedId || impliedId !== id) {
+        // Never delete the index row when the physical target cannot be named
+        // exactly. Keep the row + file and leave a diagnostic for the operator.
+        const label = `${id}:${JSON.stringify(asset.storage_path ?? null)}`;
+        skippedInvalidPaths.push(label);
+        console.error(
+          `[InkFlow Assets] Skipping unreferenced asset ${label}: storage_path 无法解析为合法附件路径`
+        );
+        continue;
+      }
+
       candidates.push({ id, storagePath });
 
-      if (storagePath) {
-        try {
-          const absolutePath = resolveAssetPath(storagePath);
-          if (absolutePath) {
-            const stat = await fs.lstat(absolutePath);
-            sizeByPath.set(storagePath, stat.isFile() ? stat.size : 0);
-          }
-        } catch {
-          // missing file: the DB row is still removable
+      try {
+        const absolutePath = resolveAssetPath(storagePath);
+        if (absolutePath) {
+          const stat = await fs.lstat(absolutePath);
+          sizeByPath.set(storagePath, stat.isFile() ? stat.size : 0);
         }
-
-        intentByPath.set(storagePath, {
-          assetId: id,
-          storagePath,
-          filename: asset.filename ? String(asset.filename) : path.posix.basename(storagePath),
-          reason: 'cleanup-unreferenced',
-        });
+      } catch {
+        // missing file: the DB row is still removable
       }
+
+      intentByPath.set(storagePath, {
+        assetId: id,
+        storagePath,
+        filename: asset.filename ? String(asset.filename) : path.posix.basename(storagePath),
+        reason: 'cleanup-unreferenced',
+      });
     }
 
     // Unindexed orphan files (no assets row) that are also not referenced by any
@@ -637,7 +693,17 @@ export class AssetService {
 
         const storagePath = normalizeManagedAssetPath(`assets/${entry.name}`);
         const assetId = assetIdFromFileName(entry.name);
-        if (!storagePath || !assetId) continue;
+        if (!storagePath || !assetId) {
+          // Dotfiles (.gitkeep) are not attachments and are skipped silently.
+          if (!entry.name.startsWith('.')) {
+            const label = `assets/${entry.name}`;
+            skippedInvalidPaths.push(label);
+            console.error(
+              `[InkFlow Assets] Skipping orphan file ${label}: 名称不是受管理的附件文件名`
+            );
+          }
+          continue;
+        }
         if (indexedFilenames.has(entry.name)) continue;
         if (referencedIds.has(assetId)) continue;
         if (intentByPath.has(storagePath)) continue;
@@ -698,7 +764,12 @@ export class AssetService {
     }
 
     const deletedIds = candidates.map(candidate => candidate.id);
-    return { cleanedCount: candidates.length + cleanedOrphanFiles, freedBytes, deletedIds };
+    return {
+      cleanedCount: candidates.length + cleanedOrphanFiles,
+      freedBytes,
+      deletedIds,
+      skippedInvalidPaths,
+    };
   }
 
   private getExtensionFromMime(mime: string): string {

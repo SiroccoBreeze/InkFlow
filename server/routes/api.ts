@@ -10,7 +10,7 @@ import {
 } from '../services/documentService';
 import { searchService } from '../services/searchService';
 import { shareService } from '../services/shareService';
-import { assetService } from '../services/assetService';
+import { assetService, AssetPathInvalidError } from '../services/assetService';
 import { fileStorage } from '../services/fileStorageService';
 import { ensureInitialPhysicalDocs } from '../services/seedData';
 import { getDatabase, generateId } from '../db/sqlite';
@@ -619,8 +619,23 @@ apiRouter.get('/assets/file/:id', authenticateOptional, async (req, res) => {
 
 
 apiRouter.delete('/assets/:id', requireOwner, async (req, res) => {
-  const ok = await assetService.deleteAsset(req.params.id);
-  res.json({ data: { success: ok } });
+  try {
+    const ok = await assetService.deleteAsset(req.params.id);
+    res.json({ data: { success: ok } });
+  } catch (err: any) {
+    if (err instanceof AssetPathInvalidError) {
+      res.status(409).json({
+        error: {
+          code: err.code,
+          message: err.message,
+          details: { assetId: err.assetId },
+        },
+      });
+      return;
+    }
+    console.error('[InkFlow Assets] Delete failed:', err);
+    res.status(500).json({ error: { code: 'ASSET_DELETE_FAILED', message: '删除附件失败' } });
+  }
 });
 
 apiRouter.post('/assets/cleanup-orphans', requireOwner, async (req, res) => {
@@ -631,7 +646,12 @@ apiRouter.post('/assets/cleanup-orphans', requireOwner, async (req, res) => {
         success: true,
         cleanedCount: result.cleanedCount,
         freedBytes: result.freedBytes,
-        message: `成功清理 ${result.cleanedCount} 个未引用的孤立附件，释放 ${(result.freedBytes / 1024).toFixed(1)} KB 空间`,
+        skippedInvalidPathCount: result.skippedInvalidPaths.length,
+        message:
+          `成功清理 ${result.cleanedCount} 个未引用的孤立附件，释放 ${(result.freedBytes / 1024).toFixed(1)} KB 空间` +
+          (result.skippedInvalidPaths.length > 0
+            ? `；${result.skippedInvalidPaths.length} 条记录的 storage_path 非法，已跳过并保留以供诊断`
+            : ''),
       },
     });
   } catch (err: any) {

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { getDatabase, hashPassword, verifyPassword, hashRecoveryCode, generateId, seedDefaultCategoriesIfEmpty } from '../db/sqlite';
+import { maintenanceState } from './maintenanceState';
 
 const MIN_INIT_KEY_LENGTH = 24;
 const OWNER_INITIALIZED_MARKER = 'owner_initialized';
@@ -262,9 +263,11 @@ export class AuthService {
       return { isValid: false };
     }
 
-    // Refresh last_seen_at only if more than 2 minutes elapsed (throttle DB writes)
+    // Refresh last_seen_at only if more than 2 minutes elapsed (throttle DB writes).
+    // In read-only maintenance mode even this incidental write is skipped so GET
+    // requests never mutate storage while critical recovery is unresolved.
     const lastSeenTime = row.last_seen_at ? new Date(row.last_seen_at).getTime() : 0;
-    if (Date.now() - lastSeenTime > 2 * 60 * 1000) {
+    if (maintenanceState.isWriteAllowed() && Date.now() - lastSeenTime > 2 * 60 * 1000) {
       db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').run(now, row.session_id);
     }
 

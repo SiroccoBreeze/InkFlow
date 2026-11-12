@@ -274,6 +274,39 @@ export class FileStorageService {
     return ids;
   }
 
+  /**
+   * Strict variant used by startup recovery: directory read failures are
+   * propagated instead of being interpreted as "no pending saves". That lets the
+   * server enter read-only maintenance mode instead of accepting writes while a
+   * document may still need recovery.
+   */
+  public async listPendingSaveDocumentIdsStrict(): Promise<string[]> {
+    const ids: string[] = [];
+    const entries = await fs.readdir(this.documentsDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const folder = path.join(this.documentsDir, entry.name);
+
+      let names: string[];
+      try {
+        names = await fs.readdir(folder);
+      } catch (err: any) {
+        if (err?.code === 'ENOENT') continue; // folder vanished between scans
+        throw err;
+      }
+
+      // Pending deletion wins: a folder awaiting deletion must not be recovered
+      // as a live document.
+      if (names.includes('.delete.pending')) continue;
+      if (names.includes('.save.pending') || names.includes('index.md.bak')) {
+        ids.push(entry.name);
+      }
+    }
+
+    return ids;
+  }
+
   public async readDocumentSaveBackup(documentId: string): Promise<string | null> {
     const artifacts = this.getSaveArtifacts(documentId);
     if (!artifacts) return null;
