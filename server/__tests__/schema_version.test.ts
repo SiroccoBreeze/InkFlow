@@ -92,9 +92,17 @@ describe('Database schema versioning', () => {
 
     expect(getUserVersion(db)).toBe(CURRENT_SCHEMA_VERSION);
     const migrations = db.prepare('SELECT version, name FROM schema_migrations ORDER BY version').all() as any[];
-    expect(migrations.map(row => row.version)).toEqual([BASELINE_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION]);
+    expect(migrations.map(row => row.version)).toEqual([
+      BASELINE_SCHEMA_VERSION,
+      2,
+      CURRENT_SCHEMA_VERSION,
+    ]);
     expect(migrations.map(row => row.name)).toContain('baseline');
     expect(migrations.map(row => row.name)).toContain('normalize-storage-paths');
+    expect(migrations.map(row => row.name)).toContain('create-asset-deletions');
+
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map(row => row.name);
+    expect(tables).toContain('asset_deletions');
 
     // Re-running startup must be a no-op.
     initDatabaseSchema(db);

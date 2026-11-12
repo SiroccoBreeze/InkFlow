@@ -6,6 +6,7 @@ import { getDatabase, generateId, runInTransaction } from '../db/sqlite';
 import { fileStorage } from './fileStorageService';
 import { extractAssetReferences } from './documentService';
 import { assetMutationLock, consistencyGate } from './consistencyGate';
+import { normalizeStorageRelativePath } from '../utils/storagePaths';
 
 // Resolved lazily so INKFLOW_DATA_DIR is always honoured (tests / multi-instance deployments)
 function getStorageRoot(): string {
@@ -52,6 +53,59 @@ export interface AssetRecord {
   createdAt: string;
 }
 
+type AssetDeletionReason = 'manual-delete' | 'cleanup-unreferenced' | 'cleanup-orphan';
+
+interface AssetDeletionIntent {
+  assetId: string;
+  storagePath: string;
+  filename: string | null;
+  reason: AssetDeletionReason;
+}
+
+interface AssetDeletionRow {
+  asset_id: string;
+  storage_path: string;
+  filename: string | null;
+  reason: string;
+  requested_at: string;
+  attempts: number;
+  last_attempt_at: string | null;
+  last_error: string | null;
+}
+
+/** Only flat files directly inside storage/assets/ with a conservative name. */
+const ASSET_FILE_NAME_RE = /^[A-Za-z0-9._-]{1,200}$/;
+
+/**
+ * Normalizes a managed asset path (`assets/<file>`). Rejects traversal,
+ * subdirectories, dotfiles and names that could not have been produced by the
+ * upload path. Used for reconciliation, tombstones and retry validation.
+ */
+function normalizeManagedAssetPath(value: unknown): string | null {
+  // normalizeStorageRelativePath() trims; reject a value that would map to a
+  // different file name than the one actually on disk.
+  if (typeof value !== 'string' || value !== value.trim()) return null;
+
+  const normalized = normalizeStorageRelativePath(value);
+  if (!normalized) return null;
+
+  const segments = normalized.split('/');
+  if (segments.length !== 2 || segments[0] !== 'assets') return null;
+
+  const fileName = segments[1];
+  if (fileName.startsWith('.') || !ASSET_FILE_NAME_RE.test(fileName)) return null;
+  if (path.posix.parse(fileName).name.startsWith('.')) return null;
+
+  return normalized;
+}
+
+/** The asset ID implied by a managed file name (same rule used by reconcile). */
+function assetIdFromFileName(fileName: string): string | null {
+  if (fileName.startsWith('.') || !ASSET_FILE_NAME_RE.test(fileName)) return null;
+  const id = path.posix.parse(fileName).name;
+  return ASSET_FILE_NAME_RE.test(id) && !id.startsWith('.') ? id : null;
+}
+
 export class AssetService {
   private ensureAssetsDir(): string {
     const assetsDir = getAssetsDir();
@@ -59,6 +113,174 @@ export class AssetService {
       fsSync.mkdirSync(assetsDir, { recursive: true });
     }
     return assetsDir;
+  }
+
+  // -------------------------------------------------------------------------
+  // Asset deletion tombstones
+  //
+  // Deleting an asset is a two-sided operation: the DB rows and the physical
+  // file cannot be removed atomically. The tombstone is inserted in the SAME
+  // transaction that removes the rows, so the intent survives a crash. The file
+  // is unlinked afterwards, and only a confirmed deletion (or ENOENT) removes
+  // the tombstone. Reconcile skips every tombstoned ID/path, so a failed unlink
+  // can never resurrect the asset as a fresh DB row.
+  // -------------------------------------------------------------------------
+
+  /** Persist deletion intent. Caller must already be inside a transaction. */
+  private recordDeletionIntentsLocked(intents: AssetDeletionIntent[]): void {
+    if (intents.length === 0) return;
+    const db = getDatabase();
+    const now = new Date().toISOString();
+    const statement = db.prepare(`
+      INSERT INTO asset_deletions (asset_id, storage_path, filename, reason, requested_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(asset_id, storage_path) DO UPDATE SET
+        filename = excluded.filename,
+        reason = excluded.reason,
+        requested_at = excluded.requested_at,
+        attempts = 0,
+        last_attempt_at = NULL,
+        last_error = NULL
+    `);
+
+    for (const intent of intents) {
+      statement.run(intent.assetId, intent.storagePath, intent.filename, intent.reason, now);
+    }
+  }
+
+  /** Removes exactly the tombstone that was just satisfied (no broader match). */
+  private clearTombstoneLocked(assetId: string, storagePath: string): void {
+    getDatabase()
+      .prepare('DELETE FROM asset_deletions WHERE asset_id = ? AND storage_path = ?')
+      .run(assetId, storagePath);
+  }
+
+  private markTombstoneFailureLocked(row: AssetDeletionRow, error: unknown): void {
+    const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    getDatabase()
+      .prepare(`
+        UPDATE asset_deletions
+        SET attempts = attempts + 1, last_attempt_at = ?, last_error = ?
+        WHERE asset_id = ? AND storage_path = ?
+      `)
+      .run(new Date().toISOString(), message, row.asset_id, row.storage_path);
+  }
+
+  /**
+   * Validates a tombstone before touching the filesystem:
+   *  - path must be a flat `assets/<file>` with a conservative name;
+   *  - the file name must imply the same asset ID stored in the tombstone.
+   * A forged/corrupt tombstone is refused (kept for diagnosis), never used to
+   * delete an unrelated file or a document.
+   */
+  private resolveTombstoneTarget(row: AssetDeletionRow): { absolutePath: string; storagePath: string } | null {
+    const storagePath = normalizeManagedAssetPath(row.storage_path);
+    if (!storagePath) return null;
+
+    const fileName = path.posix.basename(storagePath);
+    const impliedId = assetIdFromFileName(fileName);
+    if (!impliedId || impliedId !== row.asset_id) return null;
+
+    const absolutePath = resolveAssetPath(storagePath);
+    if (!absolutePath) return null;
+
+    return { absolutePath, storagePath };
+  }
+
+  private async attemptTombstoneDeletionLocked(
+    row: AssetDeletionRow
+  ): Promise<{ status: 'deleted' | 'missing' | 'cancelled' | 'failed'; freedBytes: number }> {
+    const db = getDatabase();
+
+    // If the assets row still exists, the delete transaction that created this
+    // tombstone never committed (or the id was reused). Never delete a live
+    // asset's file: cancel the intent instead.
+    const live = db.prepare('SELECT id FROM assets WHERE id = ?').get(row.asset_id) as any;
+    if (live) {
+      this.clearTombstoneLocked(row.asset_id, row.storage_path);
+      return { status: 'cancelled', freedBytes: 0 };
+    }
+
+    const target = this.resolveTombstoneTarget(row);
+    if (!target) {
+      this.markTombstoneFailureLocked(row, '删除标记路径无效或与 asset_id 不匹配');
+      return { status: 'failed', freedBytes: 0 };
+    }
+
+    try {
+      // lstat: never follow a symlink. Directories are refused (no recursive rm).
+      const stat = await fs.lstat(target.absolutePath);
+      if (stat.isDirectory()) {
+        this.markTombstoneFailureLocked(row, '目标是目录，拒绝递归删除');
+        return { status: 'failed', freedBytes: 0 };
+      }
+      if (!stat.isFile() && !stat.isSymbolicLink()) {
+        this.markTombstoneFailureLocked(row, '目标不是普通文件或符号链接');
+        return { status: 'failed', freedBytes: 0 };
+      }
+
+      await fs.unlink(target.absolutePath);
+      this.clearTombstoneLocked(row.asset_id, row.storage_path);
+      return { status: 'deleted', freedBytes: stat.isFile() ? stat.size : 0 };
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') {
+        // The file is already gone: the deletion goal is satisfied.
+        this.clearTombstoneLocked(row.asset_id, row.storage_path);
+        return { status: 'missing', freedBytes: 0 };
+      }
+      this.markTombstoneFailureLocked(row, err);
+      return { status: 'failed', freedBytes: 0 };
+    }
+  }
+
+  /**
+   * Retries every pending tombstone. Idempotent; safe to call repeatedly.
+   * Caller must hold either the exclusive consistency lease (startup/cleanup)
+   * or the asset mutex plus a shared lease (delete/list paths).
+   */
+  private async retryPendingDeletionsLocked(): Promise<{
+    recovered: number;
+    failed: number;
+    freedBytes: number;
+  }> {
+    const db = getDatabase();
+    const rows = db
+      .prepare('SELECT * FROM asset_deletions ORDER BY requested_at ASC, asset_id ASC, storage_path ASC')
+      .all() as unknown as AssetDeletionRow[];
+
+    let recovered = 0;
+    let failed = 0;
+    let freedBytes = 0;
+
+    for (const row of rows) {
+      const result = await this.attemptTombstoneDeletionLocked(row);
+      if (result.status === 'failed') failed++;
+      else recovered++;
+      freedBytes += result.freedBytes;
+    }
+
+    if (failed > 0) {
+      console.error(
+        `[InkFlow Assets] ${failed} asset deletion(s) still pending; tombstones were retained for retry.`
+      );
+    }
+
+    return { recovered, failed, freedBytes };
+  }
+
+  /**
+   * Startup recovery for attachments whose physical deletion failed after the
+   * DB rows were removed. Runs under the exclusive lease before the server
+   * accepts requests, so it cannot race an upload/reconcile/save.
+   */
+  public async recoverPendingAssetDeletions(): Promise<{
+    recovered: number;
+    failed: number;
+    freedBytes: number;
+  }> {
+    return consistencyGate.withExclusive(() =>
+      assetMutationLock.withLock(() => this.retryPendingDeletionsLocked())
+    );
   }
 
   // Upload and persist asset to physical storage/assets/ & SQLite
@@ -180,110 +402,149 @@ export class AssetService {
   /**
    * Adds DB rows for physical files that are missing from `assets`. Caller must
    * hold the asset mutex (and a shared lease). It never deletes anything.
+   *
+   * Tombstoned IDs/paths are skipped: a failed physical deletion must never be
+   * turned back into a live asset row by reconciliation. Only regular files with
+   * a conservative, flat name inside storage/assets/ are considered; dotfiles,
+   * directories and symlinks are ignored.
    */
   private reconcilePhysicalAssetsLocked(): void {
     const db = getDatabase();
     const assetsDir = getAssetsDir();
 
     try {
-      if (fsSync.existsSync(assetsDir)) {
-        const diskFiles = fsSync.readdirSync(assetsDir);
-        const existingRows = db.prepare('SELECT id, storage_path FROM assets').all() as any[];
-        const existingFilenames = new Set(existingRows.map(r => path.basename(String(r.storage_path).replace(/\\/g, '/'))));
+      if (!fsSync.existsSync(assetsDir)) return;
 
-        // Only reconcile against a real owner so FOREIGN KEY constraints stay satisfiable
-        const ownerRow = db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('owner') as any;
-        const reconcileOwnerId = ownerRow?.id;
+      const tombstones = db.prepare('SELECT asset_id, storage_path FROM asset_deletions').all() as any[];
+      const tombstoneIds = new Set(tombstones.map(row => String(row.asset_id)));
+      const tombstonePaths = new Set(
+        tombstones
+          .map(row => normalizeManagedAssetPath(row.storage_path) ?? String(row.storage_path))
+          .filter(Boolean)
+      );
 
-        if (reconcileOwnerId) {
-          for (const file of diskFiles) {
-            if (!existingFilenames.has(file)) {
-              const filePath = path.join(assetsDir, file);
-              const stat = fsSync.statSync(filePath);
-              if (!stat.isFile()) continue;
-              const ext = path.extname(file).toLowerCase();
-              const id = path.parse(file).name;
-              const mimeType = this.getMimeFromExtension(ext);
-              const relativeStoragePath = fileStorage.toStorageRelativePath(filePath);
-              const now = new Date(stat.mtimeMs).toISOString();
+      const existingRows = db.prepare('SELECT id, storage_path FROM assets').all() as any[];
+      const existingIds = new Set(existingRows.map(row => String(row.id)));
+      const existingFilenames = new Set(
+        existingRows.map(row => path.basename(String(row.storage_path).replace(/\\/g, '/')))
+      );
 
-              db.prepare(`
-                INSERT OR REPLACE INTO assets (id, owner_id, filename, storage_path, mime_type, size, checksum, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-              `).run(
-                id,
-                reconcileOwnerId,
-                file,
-                relativeStoragePath,
-                mimeType,
-                stat.size,
-                '',
-                now
-              );
-            }
-          }
+      // Only reconcile against a real owner so FOREIGN KEY constraints stay satisfiable
+      const ownerRow = db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('owner') as any;
+      const reconcileOwnerId = ownerRow?.id;
+      if (!reconcileOwnerId) return;
+
+      for (const entry of fsSync.readdirSync(assetsDir, { withFileTypes: true })) {
+        if (!entry.isFile() || entry.isSymbolicLink()) continue;
+
+        const storagePath = normalizeManagedAssetPath(`assets/${entry.name}`);
+        const assetId = assetIdFromFileName(entry.name);
+        if (!storagePath || !assetId) continue;
+
+        if (tombstoneIds.has(assetId) || tombstonePaths.has(storagePath)) continue;
+        if (existingIds.has(assetId) || existingFilenames.has(entry.name)) continue;
+
+        const filePath = path.join(assetsDir, entry.name);
+        let stat: fsSync.Stats;
+        try {
+          // lstat: a symlink is not an attachment, even if it points at a file.
+          stat = fsSync.lstatSync(filePath);
+        } catch {
+          continue;
         }
+        if (!stat.isFile()) continue;
+
+        const ext = path.extname(entry.name).toLowerCase();
+        const mimeType = this.getMimeFromExtension(ext);
+        const now = new Date(stat.mtimeMs).toISOString();
+
+        db.prepare(`
+          INSERT OR IGNORE INTO assets (id, owner_id, filename, storage_path, mime_type, size, checksum, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          assetId,
+          reconcileOwnerId,
+          entry.name,
+          storagePath,
+          mimeType,
+          stat.size,
+          '',
+          now
+        );
       }
     } catch (e) {
       console.error('Error reconciling physical assets:', e);
     }
   }
 
-  // Delete asset: remove the SQLite rows first, then the physical file. A crash
-  // between the two leaves an orphan file (harmless, cleaned up later), never a
-  // DB row pointing at a missing file.
+  // Delete asset: persist the deletion intent and remove the SQLite rows in one
+  // transaction, then unlink the file. A failed unlink keeps the tombstone, so
+  // reconcile cannot resurrect the attachment and startup can retry.
   public async deleteAsset(id: string): Promise<boolean> {
     const releaseGate = await consistencyGate.acquireShared();
     const releaseMutex = await assetMutationLock.acquire();
     try {
       const db = getDatabase();
-      let deleted = false;
-
-      // 1. Check SQLite record and remove its metadata atomically.
       const record = db.prepare('SELECT * FROM assets WHERE id = ?').get(id) as any;
-      if (record) {
-        runInTransaction(db, () => {
-          db.prepare('DELETE FROM document_assets WHERE asset_id = ?').run(id);
-          db.prepare('DELETE FROM assets WHERE id = ?').run(id);
-        });
-        deleted = true;
 
-        const fullPath = resolveAssetPath(record.storage_path);
-        if (fullPath) {
-          try {
-            await fs.unlink(fullPath);
-          } catch (err: any) {
-            if (err?.code !== 'ENOENT') {
-              console.error(`[InkFlow Assets] Metadata removed but file deletion failed for ${id}:`, err);
-            }
-          }
-        }
+      const intents: AssetDeletionIntent[] = [];
+      const seenPaths = new Set<string>();
+      const addIntent = (rawStoragePath: unknown, filename: string | null): void => {
+        const storagePath = normalizeManagedAssetPath(rawStoragePath);
+        if (!storagePath) return;
+        const impliedId = assetIdFromFileName(path.posix.basename(storagePath));
+        if (!impliedId || impliedId !== id) return;
+        if (seenPaths.has(storagePath)) return;
+        seenPaths.add(storagePath);
+        intents.push({ assetId: id, storagePath, filename, reason: 'manual-delete' });
+      };
+
+      if (record) {
+        addIntent(record.storage_path, record.filename ? String(record.filename) : null);
       }
 
-      // 2. Also remove any physical file whose exact basename matches the asset ID
-      //    (never substring matching, which could delete unrelated assets).
+      // Also remove any physical file whose exact basename matches the asset ID
+      // (never substring matching). Only regular files are considered; directories
+      // and symlinks are never treated as attachments.
       try {
-        const assetsDir = getAssetsDir();
-        if (fsSync.existsSync(assetsDir)) {
-          const files = await fs.readdir(assetsDir);
-          for (const file of files) {
-            if (path.parse(file).name === id) {
-              try {
-                await fs.unlink(path.join(assetsDir, file));
-                deleted = true;
-              } catch (err: any) {
-                if (err?.code !== 'ENOENT') {
-                  console.error(`[InkFlow Assets] Failed deleting ${file}:`, err);
-                }
-              }
-            }
-          }
+        const assetsDir = this.ensureAssetsDir();
+        for (const entry of fsSync.readdirSync(assetsDir, { withFileTypes: true })) {
+          if (!entry.isFile() || entry.isSymbolicLink()) continue;
+          if (path.parse(entry.name).name !== id) continue;
+          addIntent(`assets/${entry.name}`, entry.name);
         }
       } catch (err) {
         console.error('[InkFlow Assets] Failed scanning assets directory:', err);
       }
 
-      return deleted;
+      let dbRowDeleted = false;
+      if (record) {
+        runInTransaction(db, () => {
+          // Intent and row removal commit together, or not at all.
+          this.recordDeletionIntentsLocked(intents);
+          db.prepare('DELETE FROM document_assets WHERE asset_id = ?').run(id);
+          db.prepare('DELETE FROM assets WHERE id = ?').run(id);
+        });
+        dbRowDeleted = true;
+      } else if (intents.length > 0) {
+        runInTransaction(db, () => this.recordDeletionIntentsLocked(intents));
+      }
+
+      // Retry this deletion and any previously failed attachments. A failure
+      // leaves the tombstone in place for the next startup/cleanup attempt.
+      await this.retryPendingDeletionsLocked();
+
+      if (dbRowDeleted) return true;
+      if (intents.length === 0) return false;
+
+      // No DB row: report success only if at least one exact target was removed
+      // (or was already missing).
+      const remaining = new Set(
+        (db.prepare('SELECT storage_path FROM asset_deletions WHERE asset_id = ?').all(id) as any[]).map(
+          row => String(row.storage_path)
+        )
+      );
+      return intents.some(intent => !remaining.has(intent.storagePath));
     } finally {
       releaseMutex();
       releaseGate();
@@ -300,10 +561,12 @@ export class AssetService {
     freedBytes: number;
     deletedIds: string[];
   }> {
-    return consistencyGate.withExclusive(() => this.cleanupUnreferencedAssetsUnderLease());
+    return consistencyGate.withExclusive(() =>
+      assetMutationLock.withLock(() => this.cleanupUnreferencedAssetsUnderLease())
+    );
   }
 
-  /** Body of cleanup; caller must hold the exclusive consistency lease. */
+  /** Body of cleanup; caller must hold the exclusive lease AND the asset mutex. */
   public async cleanupUnreferencedAssetsUnderLease(): Promise<{
     cleanedCount: number;
     freedBytes: number;
@@ -326,29 +589,88 @@ export class AssetService {
       for (const r of rows) if (r.asset_id) referencedIds.add(r.asset_id);
     } catch {}
 
+    // 0. Retry deletions that failed in a previous run before choosing new work.
+    await this.retryPendingDeletionsLocked();
+
     const allAssets = db.prepare('SELECT * FROM assets').all() as any[];
-    const candidates: Array<{ id: string; fullPath: string | null; size: number }> = [];
+    const candidates: Array<{ id: string; storagePath: string | null }> = [];
+    const intentByPath = new Map<string, AssetDeletionIntent>();
+    const sizeByPath = new Map<string, number>();
 
     for (const asset of allAssets) {
-      if (referencedIds.has(asset.id)) continue;
-      const fullPath = resolveAssetPath(asset.storage_path);
-      let size = 0;
-      if (fullPath) {
+      const id = String(asset.id);
+      if (referencedIds.has(id)) continue;
+
+      const storagePath = normalizeManagedAssetPath(asset.storage_path);
+      candidates.push({ id, storagePath });
+
+      if (storagePath) {
         try {
-          const stat = await fs.stat(fullPath);
-          if (stat.isFile()) size = stat.size;
+          const absolutePath = resolveAssetPath(storagePath);
+          if (absolutePath) {
+            const stat = await fs.lstat(absolutePath);
+            sizeByPath.set(storagePath, stat.isFile() ? stat.size : 0);
+          }
         } catch {
           // missing file: the DB row is still removable
         }
+
+        intentByPath.set(storagePath, {
+          assetId: id,
+          storagePath,
+          filename: asset.filename ? String(asset.filename) : path.posix.basename(storagePath),
+          reason: 'cleanup-unreferenced',
+        });
       }
-      candidates.push({ id: String(asset.id), fullPath, size });
     }
 
-    // 1. Remove DB rows atomically BEFORE touching any file. A crash after this
-    //    point leaves orphan files only; no document can reference a missing row
-    //    or a row can point at a file that was already deleted.
-    if (candidates.length > 0) {
+    // Unindexed orphan files (no assets row) that are also not referenced by any
+    // Markdown. Only regular, conservatively named flat files are considered.
+    const indexedFilenames = new Set(
+      allAssets.map(asset => path.basename(String(asset.storage_path).replace(/\\/g, '/')))
+    );
+    const orphanIntents: AssetDeletionIntent[] = [];
+    try {
+      const assetsDir = this.ensureAssetsDir();
+      for (const entry of fsSync.readdirSync(assetsDir, { withFileTypes: true })) {
+        if (!entry.isFile() || entry.isSymbolicLink()) continue;
+
+        const storagePath = normalizeManagedAssetPath(`assets/${entry.name}`);
+        const assetId = assetIdFromFileName(entry.name);
+        if (!storagePath || !assetId) continue;
+        if (indexedFilenames.has(entry.name)) continue;
+        if (referencedIds.has(assetId)) continue;
+        if (intentByPath.has(storagePath)) continue;
+
+        const filePath = path.join(assetsDir, entry.name);
+        try {
+          const stat = fsSync.lstatSync(filePath);
+          if (!stat.isFile()) continue;
+          sizeByPath.set(storagePath, stat.size);
+        } catch {
+          continue;
+        }
+
+        orphanIntents.push({
+          assetId,
+          storagePath,
+          filename: entry.name,
+          reason: 'cleanup-orphan',
+        });
+        intentByPath.set(storagePath, orphanIntents[orphanIntents.length - 1]);
+      }
+    } catch (err) {
+      console.error('[InkFlow Assets] Failed scanning assets directory:', err);
+    }
+
+    const intents = Array.from(intentByPath.values());
+
+    // 1. Persist every deletion intent and remove the candidate DB rows in one
+    //    transaction. Reconcile will skip these tombstones even if the unlink
+    //    below fails, so the asset cannot come back.
+    if (candidates.length > 0 || intents.length > 0) {
       runInTransaction(db, () => {
+        this.recordDeletionIntentsLocked(intents);
         const deleteAssociation = db.prepare('DELETE FROM document_assets WHERE asset_id = ?');
         const deleteAsset = db.prepare('DELETE FROM assets WHERE id = ?');
         for (const candidate of candidates) {
@@ -358,53 +680,24 @@ export class AssetService {
       });
     }
 
-    // 2. Delete the physical files. Failures are logged and become orphans.
+    // 2. Attempt every pending deletion (including ones from earlier runs).
+    await this.retryPendingDeletionsLocked();
+
+    // 3. Report only this operation's outcome.
+    const remainingPaths = new Set(
+      (db.prepare('SELECT storage_path FROM asset_deletions').all() as any[]).map(row =>
+        String(row.storage_path)
+      )
+    );
     let freedBytes = 0;
-    for (const candidate of candidates) {
-      if (!candidate.fullPath) continue;
-      try {
-        await fs.unlink(candidate.fullPath);
-        freedBytes += candidate.size;
-      } catch (err: any) {
-        if (err?.code !== 'ENOENT') {
-          console.error(`[InkFlow Assets] Failed deleting ${candidate.fullPath}:`, err);
-        }
-      }
+    let cleanedOrphanFiles = 0;
+    for (const intent of intents) {
+      if (remainingPaths.has(intent.storagePath)) continue;
+      freedBytes += sizeByPath.get(intent.storagePath) ?? 0;
+      if (intent.reason === 'cleanup-orphan') cleanedOrphanFiles++;
     }
 
     const deletedIds = candidates.map(candidate => candidate.id);
-
-    // 3. Also clean unindexed orphan files inside storage/assets/.
-    let cleanedOrphanFiles = 0;
-    try {
-      const assetsDir = getAssetsDir();
-      const files = await fs.readdir(assetsDir);
-      const remainingAssets = db.prepare('SELECT storage_path FROM assets').all() as any[];
-      const indexedPaths = new Set(
-        remainingAssets.map(a => path.basename(String(a.storage_path).replace(/\\/g, '/')))
-      );
-      for (const file of files) {
-        if (!indexedPaths.has(file)) {
-          const filePath = path.join(assetsDir, file);
-          try {
-            const stat = await fs.stat(filePath);
-            if (!stat.isFile()) continue;
-            // Preserve files that are still explicitly referenced by Markdown
-            if (referencedIds.has(path.parse(file).name)) continue;
-            await fs.unlink(filePath);
-            freedBytes += stat.size;
-            cleanedOrphanFiles++;
-          } catch (err: any) {
-            if (err?.code !== 'ENOENT') {
-              console.error(`[InkFlow Assets] Failed deleting orphan ${filePath}:`, err);
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.error('[InkFlow Assets] Failed scanning assets directory:', err);
-    }
-
     return { cleanedCount: candidates.length + cleanedOrphanFiles, freedBytes, deletedIds };
   }
 

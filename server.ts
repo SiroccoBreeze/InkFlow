@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { apiRouter } from './server/routes/api';
 import { ensureInitialPhysicalDocs, ensureAssetReferences } from './server/services/seedData';
 import { documentService } from './server/services/documentService';
+import { assetService } from './server/services/assetService';
 import { getDatabase } from './server/db/sqlite';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -80,6 +81,17 @@ async function startServer() {
     if (recovered > 0) {
       console.log(`[InkFlow Save Recovery] Recovered ${recovered} interrupted document save(s).`);
     }
+
+    // Finish attachment deletions whose DB rows committed but whose file unlink
+    // failed. This must run before reconciliation/seed/asset-reference rebuild so
+    // a tombstoned file can never be re-registered.
+    const assetDeletions = await assetService.recoverPendingAssetDeletions();
+    if (assetDeletions.recovered > 0) {
+      console.log(
+        `[InkFlow Asset Recovery] Completed ${assetDeletions.recovered} pending attachment deletion(s).`
+      );
+    }
+
     await ensureInitialPhysicalDocs();
 
     // Reconcile the asset ↔ document association table with the Markdown SSOT

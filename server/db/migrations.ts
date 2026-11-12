@@ -22,8 +22,9 @@ export const BASELINE_SCHEMA_VERSION = 1;
 /**
  * v1: baseline schema (includes documents.document_hash, handled by schema.ts).
  * v2: canonical POSIX storage paths (Windows backslashes → '/').
+ * v3: asset deletion tombstones (crash-safe attachment deletion + reconcile guard).
  */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 export interface SchemaMigration {
   version: number;
@@ -104,11 +105,38 @@ function migrateToPosixStoragePaths(db: DatabaseSync): void {
   normalizeColumn(db, 'assets', 'storage_path');
 }
 
+function createAssetDeletionsTable(db: DatabaseSync): void {
+  // A tombstone records the intent to delete one physical asset file. It is
+  // inserted in the SAME transaction that removes the assets/document_assets
+  // rows, so a crash can never leave "DB row gone, file present, nothing
+  // remembering why". Reconcile must skip every tombstoned ID/path; the file is
+  // unlinked afterwards and only then is the tombstone removed.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS asset_deletions (
+      asset_id TEXT NOT NULL,
+      storage_path TEXT NOT NULL,
+      filename TEXT,
+      reason TEXT NOT NULL,
+      requested_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT,
+      last_error TEXT,
+      PRIMARY KEY (asset_id, storage_path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_asset_deletions_path ON asset_deletions (storage_path);
+  `);
+}
+
 const MIGRATIONS: SchemaMigration[] = [
   {
     version: 2,
     name: 'normalize-storage-paths',
     up: migrateToPosixStoragePaths,
+  },
+  {
+    version: 3,
+    name: 'create-asset-deletions',
+    up: createAssetDeletionsTable,
   },
 ];
 
