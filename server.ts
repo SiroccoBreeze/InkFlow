@@ -81,6 +81,12 @@ async function startServer() {
       console.log(`[InkFlow Save Recovery] Recovered ${recovered} interrupted document save(s).`);
     }
     await ensureInitialPhysicalDocs();
+
+    // Reconcile the asset ↔ document association table with the Markdown SSOT
+    // BEFORE accepting requests. This is a multi-document DB write guarded by the
+    // exclusive consistency lease; running it after listen() let online saves race
+    // with the rebuild and made a backup snapshot non-deterministic.
+    await ensureAssetReferences();
   } catch (err) {
     console.error('[Storage Init Error]:', err);
   }
@@ -131,8 +137,8 @@ async function startServer() {
     });
   }
 
-  // Reconcile the asset ↔ document association table with the Markdown SSOT (non-blocking).
-  ensureAssetReferences().catch(err => console.error('[Asset Ref Sync Error]:', err));
+  // Reconcile the asset ↔ document association table with the Markdown SSOT.
+  // (Done before listen() above; nothing to do here.)
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n==================================================`);

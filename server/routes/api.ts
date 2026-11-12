@@ -564,8 +564,8 @@ apiRouter.post('/assets/upload', requireOwner, async (req, res) => {
   }
 });
 
-apiRouter.get('/assets', requireOwner, (req, res) => {
-  const assets = assetService.listAssets();
+apiRouter.get('/assets', requireOwner, async (req, res) => {
+  const assets = await assetService.listAssets();
   res.json({ data: assets });
 });
 

@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import crypto from 'node:crypto';
+import { resolveInsideRoot, toStorageRelativePath as toRelativeStoragePath } from '../utils/storagePaths';
 
 export function getStorageRootDir(): string {
   return process.env.INKFLOW_DATA_DIR
@@ -58,15 +59,12 @@ export class FileStorageService {
   /**
    * Resolves a stored relative path inside the storage root and guarantees the
    * result cannot escape it (defense against traversal / absolute path injection).
+   *
+   * Accepts both canonical POSIX paths and legacy Windows backslash paths, which
+   * is required when a backup created on one OS is restored on another.
    */
   public resolveWithinStorage(relativePath: string): string | null {
-    if (!relativePath || typeof relativePath !== 'string') return null;
-    const root = this.rootDir;
-    const resolved = path.resolve(root, relativePath);
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      return null;
-    }
-    return resolved;
+    return resolveInsideRoot(this.rootDir, relativePath);
   }
 
   /**
@@ -129,9 +127,13 @@ export class FileStorageService {
     return folder ? path.join(folder, 'index.md') : null;
   }
 
-  /** Path relative to the storage root, as persisted in the documents table. */
+  /** Path relative to the storage root, in canonical POSIX form for cross-platform backups. */
   public toStorageRelativePath(absolutePath: string): string {
-    return path.relative(this.rootDir, absolutePath);
+    const normalized = toRelativeStoragePath(this.rootDir, absolutePath);
+    if (!normalized) {
+      throw new Error('存储路径越界，拒绝写入数据库');
+    }
+    return normalized;
   }
 
   /** True when a previous save for this document left a marker or backup behind. */
@@ -677,86 +679,63 @@ export class FileStorageService {
     }
   }
 
-  // Prune revisions for a specific document (keep newest keepLatest)
-  public async pruneDocumentRevisions(
+  /**
+   * Deletes specific revision files after their SQLite rows have already been
+   * removed. Failure to delete a file leaves only an orphan file (harmless and
+   * retryable); it can never leave a DB row pointing at a missing snapshot.
+   */
+  public async deleteRevisionFiles(
     documentId: string,
-    keepLatest: number = 1
-  ): Promise<{ deletedCount: number; freedBytes: number; deletedRevisionIds: string[] }> {
+    revisionIds: string[]
+  ): Promise<{ deletedCount: number; freedBytes: number; failedIds: string[] }> {
     let safeDocId: string;
     try {
       safeDocId = this.assertSafeId(documentId);
     } catch {
-      return { deletedCount: 0, freedBytes: 0, deletedRevisionIds: [] };
+      return { deletedCount: 0, freedBytes: 0, failedIds: [...revisionIds] };
     }
-    const docRevDir = path.join(this.revisionsDir, safeDocId);
+
     let deletedCount = 0;
     let freedBytes = 0;
-    const deletedRevisionIds: string[] = [];
+    const failedIds: string[] = [];
 
-    try {
-      const fileEntries = await fs.readdir(docRevDir, { withFileTypes: true });
-      const filesWithStats = await Promise.all(
-        fileEntries
-          .filter(fe => fe.isFile() && fe.name.endsWith('.md'))
-          .map(async fe => {
-            const filePath = path.join(docRevDir, fe.name);
-            const stat = await fs.stat(filePath);
-            return {
-              revisionId: fe.name.replace(/\.md$/, ''),
-              filePath,
-              size: stat.size,
-              mtime: stat.mtime.getTime(),
-            };
-          })
-      );
+    for (const revisionId of revisionIds) {
+      let safeRevId: string;
+      try {
+        safeRevId = this.assertSafeId(revisionId);
+      } catch {
+        failedIds.push(revisionId);
+        continue;
+      }
 
-      // Sort newest first
-      filesWithStats.sort((a, b) => b.mtime - a.mtime);
-
-      // Files beyond keepLatest should be pruned
-      const toDelete = filesWithStats.slice(Math.max(0, keepLatest));
-      for (const item of toDelete) {
-        await fs.rm(item.filePath, { force: true });
+      const filePath = path.join(this.revisionsDir, safeDocId, `${safeRevId}.md`);
+      try {
+        const stat = await fs.stat(filePath);
+        await fs.rm(filePath, { force: true });
         deletedCount++;
-        freedBytes += item.size;
-        deletedRevisionIds.push(item.revisionId);
+        freedBytes += stat.size;
+      } catch (err: any) {
+        if (err?.code === 'ENOENT') {
+          // The row is already gone and the file was already absent: nothing to do.
+          continue;
+        }
+        console.error(`[InkFlow Revisions] Failed deleting ${filePath}:`, err);
+        failedIds.push(revisionId);
       }
-
-      // If keepLatest === 0 and folder is empty, remove the folder
-      if (keepLatest === 0) {
-        await fs.rm(docRevDir, { recursive: true, force: true }).catch(() => {});
-      }
-    } catch (err) {
-      console.error(`Failed pruning revisions for ${documentId}:`, err);
     }
 
-    return { deletedCount, freedBytes, deletedRevisionIds };
-  }
-
-  // Prune revisions across all documents (keep newest keepLatest for each doc)
-  public async pruneAllRevisions(
-    keepLatest: number = 1
-  ): Promise<{ deletedCount: number; freedBytes: number; deletedRevisionIds: string[] }> {
-    let totalDeleted = 0;
-    let totalFreed = 0;
-    const allDeletedIds: string[] = [];
-
+    // Remove the now-empty per-document folder without treating a missing folder
+    // as an error.
     try {
-      const docEntries = await fs.readdir(this.revisionsDir, { withFileTypes: true });
-      for (const entry of docEntries) {
-        if (!entry.isDirectory()) continue;
-        const res = await this.pruneDocumentRevisions(entry.name, keepLatest);
-        totalDeleted += res.deletedCount;
-        totalFreed += res.freedBytes;
-        allDeletedIds.push(...res.deletedRevisionIds);
+      const remaining = await fs.readdir(path.join(this.revisionsDir, safeDocId));
+      if (remaining.length === 0) {
+        await fs.rm(path.join(this.revisionsDir, safeDocId), { recursive: true, force: true });
       }
-      // Also clean up any orphan folders for documents that no longer exist
-      await this.cleanupOrphanRevisions();
-    } catch (err) {
-      console.error('Failed pruning all revisions:', err);
+    } catch {
+      // folder missing or unreadable: leave it for orphan cleanup
     }
 
-    return { deletedCount: totalDeleted, freedBytes: totalFreed, deletedRevisionIds: allDeletedIds };
+    return { deletedCount, freedBytes, failedIds };
   }
 }
 

@@ -72,6 +72,35 @@ export function setDatabase(db: DatabaseSync | null): void {
   dbInstance = db;
 }
 
+/**
+ * Runs a SYNCHRONOUS callback inside a single IMMEDIATE transaction.
+ *
+ * Why synchronous: `node:sqlite` exposes one connection per process. If a
+ * transaction spans an `await`, other request handlers can run their SQL on the
+ * same connection while the transaction is open — their writes become part of
+ * this transaction (and are rolled back with it), or their own BEGIN fails and
+ * rolls back this one. Callers must perform all file I/O before/after the
+ * transaction and only run synchronous SQL here.
+ */
+export function runInTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    if (result && typeof (result as any).then === 'function') {
+      throw new Error('事务回调必须是同步函数：检测到返回 Promise，已回滚以避免跨 await 事务');
+    }
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // SQLite may already have rolled the transaction back.
+    }
+    throw err;
+  }
+}
+
 export function closeDatabase(): void {
   if (dbInstance) {
     try {

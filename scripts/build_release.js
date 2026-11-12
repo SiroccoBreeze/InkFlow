@@ -60,7 +60,7 @@ console.log(`📁 Output directory (validated): ${RELEASE_DIR}`);
 // 0. Allow-list of files that may be shipped
 // ---------------------------------------------------------------------------
 const ALLOWED_ROOT_FILES = ['server.ts', 'tsconfig.json', '.env.example'];
-const ALLOWED_SERVER_DIRS = ['db', 'routes', 'services'];
+const ALLOWED_SERVER_DIRS = ['db', 'routes', 'services', 'utils'];
 
 function copyFileSafe(src, destDir) {
   const relative = path.relative(RELEASE_DIR, path.join(destDir, path.basename(src)));

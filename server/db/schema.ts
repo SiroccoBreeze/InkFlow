@@ -1,4 +1,10 @@
 import type { DatabaseSync } from 'node:sqlite';
+import {
+  assertSchemaVersionSupported,
+  getUserVersion,
+  markBaselineIfNeeded,
+  runSchemaMigrations,
+} from './migrations';
 
 export const SCHEMA_SQL = `
 -- 1. Users Table (Multi-tenant ready, single-owner for V1)
@@ -172,11 +178,27 @@ CREATE TABLE IF NOT EXISTS system_settings (
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- 14. Schema Migration Audit Trail
+-- The authoritative version lives in PRAGMA user_version so it travels with the
+-- database file (and every backup). This table records what was applied and when.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+);
 `;
 
 export function initDatabaseSchema(db: DatabaseSync): void {
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA journal_mode = WAL;');
+
+  // Refuse to open a database written by a newer build before running any DDL.
+  // "Opening" with an older schema is harmless, but running old migrations on a
+  // newer file is not; fail closed and let the operator upgrade InkFlow.
+  assertSchemaVersionSupported(db);
+  const hadExplicitVersion = getUserVersion(db) > 0;
+
   db.exec(SCHEMA_SQL);
 
   // Incremental migration for installations created before document_hash existed.
@@ -200,4 +222,10 @@ export function initDatabaseSchema(db: DatabaseSync): void {
       { cause: err }
     );
   }
+
+  // Pre-versioning installations are treated as baseline v1 and then migrated
+  // forward. Every migration is transactional; a failure aborts startup without
+  // deleting or recreating the database.
+  markBaselineIfNeeded(db, hadExplicitVersion);
+  runSchemaMigrations(db, getUserVersion(db));
 }

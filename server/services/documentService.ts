@@ -1,9 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { marked } from 'marked';
-import { getDatabase, generateId } from '../db/sqlite';
+import { getDatabase, generateId, runInTransaction } from '../db/sqlite';
 import { fileStorage } from './fileStorageService';
 import { assetService } from './assetService';
+import { consistencyGate } from './consistencyGate';
 
 export interface DocumentInput {
   id?: string;
@@ -205,59 +206,17 @@ export function calculateDocumentHash(markdown: string): string {
 }
 
 /**
- * Minimal async read/write lock (no third-party dependency).
- * Document saves/deletes hold a shared lease; global maintenance operations
- * (tag dictionary cleanup, global revision pruning) hold an exclusive lease.
- * Writer-preferring so a maintenance request cannot starve behind new saves.
+ * Global lease used by every storage-backed write.
+ *
+ * The gate itself lives in `consistencyGate.ts` so that backup/restore, asset
+ * writes and startup rebuilds all share the same process-wide barrier. Document
+ * writes hold a SHARED lease; whole-library maintenance (tag cleanup, global
+ * revision pruning, rebuilds) holds an EXCLUSIVE lease. Per-document locking is
+ * still layered on top for the Markdown + SQLite save sequence.
+ *
+ * The gate is process-local by design: InkFlow supports a single writer process
+ * per storage directory (see the cluster guard in server.ts).
  */
-class AsyncReadWriteLock {
-  private readers = 0;
-  private writing = false;
-  private queue: Array<{ mode: 'read' | 'write'; grant: (release: () => void) => void }> = [];
-
-  private makeRelease(mode: 'read' | 'write'): () => void {
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      if (mode === 'read') this.readers--;
-      else this.writing = false;
-      this.drain();
-    };
-  }
-
-  private drain(): void {
-    if (this.writing) return;
-
-    if (this.queue[0]?.mode === 'write') {
-      if (this.readers > 0) return;
-      const next = this.queue.shift()!;
-      this.writing = true;
-      next.grant(this.makeRelease('write'));
-      return;
-    }
-
-    while (this.queue[0]?.mode === 'read') {
-      const next = this.queue.shift()!;
-      this.readers++;
-      next.grant(this.makeRelease('read'));
-    }
-  }
-
-  public acquireRead(): Promise<() => void> {
-    return new Promise(resolve => {
-      this.queue.push({ mode: 'read', grant: resolve });
-      this.drain();
-    });
-  }
-
-  public acquireWrite(): Promise<() => void> {
-    return new Promise(resolve => {
-      this.queue.push({ mode: 'write', grant: resolve });
-      this.drain();
-    });
-  }
-}
 
 /**
  * Normalizes one link/image target and returns the asset ID it refers to.
@@ -511,18 +470,10 @@ export class DocumentService {
   // is ever required, replace this with a cross-process lock before enabling it.
   private saveLocks = new Map<string, Promise<void>>();
 
-  // Shared by all document writes; exclusive for tag dictionary cleanup and global
-  // revision pruning, so their multi-document scan/delete cannot interleave with a
-  // save that adds a tag association.
-  private maintenanceLock = new AsyncReadWriteLock();
-
-  private async withSaveGate<T>(fn: () => Promise<T>): Promise<T> {
-    const release = await this.maintenanceLock.acquireRead();
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+  // Shared by all document writes; exclusive for tag dictionary cleanup, global
+  // revision pruning, whole-library rebuilds and (later) backup/restore.
+  private withSaveGate<T>(fn: () => Promise<T>): Promise<T> {
+    return consistencyGate.withShared(fn);
   }
 
   /**
@@ -530,12 +481,12 @@ export class DocumentService {
    * in flight (and blocks new ones until the operation completes).
    */
   public async runExclusiveMaintenance<T>(fn: () => Promise<T>): Promise<T> {
-    const release = await this.maintenanceLock.acquireWrite();
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    return consistencyGate.withExclusive(fn);
+  }
+
+  /** Diagnostics for tests and operational health checks. */
+  public getConsistencySnapshot() {
+    return consistencyGate.snapshot();
   }
 
   private async withDocumentLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
@@ -808,9 +759,24 @@ export class DocumentService {
   // (rollback, index rebuild) may omit it and are serialised by the same lock.
   public async saveDocument(input: DocumentInput, ownerId: string, note?: string) {
     assertValidDocumentInput(input);
-
     const docId = input.id || generateId('doc');
-    return this.withSaveGate(() => this.withDocumentLock(docId, async () => {
+    return this.withSaveGate(() => this.saveDocumentUnderLease(input, ownerId, note, docId));
+  }
+
+  /**
+   * Save path for callers that ALREADY hold a shared or exclusive consistency
+   * lease (whole-library rebuilds, seed data). Acquiring a nested lease would
+   * deadlock the gate, so this method deliberately does not acquire one.
+   */
+  public async saveDocumentUnderLease(
+    input: DocumentInput,
+    ownerId: string,
+    note: string | undefined,
+    docId: string
+  ) {
+    assertValidDocumentInput(input);
+
+    return this.withDocumentLock(docId, async () => {
       // A pending deletion must finish first; resurrecting the folder would
       // conflict with startup recovery and the delete's committed DB state.
       const deletion = await this.recoverPendingDeletion(docId).catch(err => {
@@ -832,7 +798,7 @@ export class DocumentService {
         throw new DocumentRecoveryRequiredError(docId);
       }
       return this.saveDocumentLocked(input, docId, ownerId, note);
-    }));
+    });
   }
 
   private async saveDocumentLocked(input: DocumentInput, docId: string, ownerId: string, note?: string) {
@@ -911,11 +877,17 @@ export class DocumentService {
       // 2. Commit the file change (atomic rename on the same filesystem).
       await fileStorage.commitStagedDocumentSave(artifacts.stagedPath, artifacts.finalPath);
 
-      // 3. All SQLite writes happen in one transaction. If anything fails (revision
-      //    snapshot I/O, FTS, tag, asset association), the DB rolls back and the
-      //    Markdown file is restored from the backup below.
-      db.exec('BEGIN IMMEDIATE');
-      try {
+      // 3. Write the revision snapshot BEFORE opening the SQLite transaction.
+      //    The transaction below must be fully synchronous: `node:sqlite` has one
+      //    connection per process, so any `await` inside a transaction lets other
+      //    request handlers run SQL in the same transaction (or roll it back).
+      revisionId = generateId('rev');
+      const snapshotPath = await fileStorage.saveRevisionSnapshot(docId, revisionId, fullMarkdown);
+
+      // 4. All SQLite writes happen in one synchronous transaction. If anything
+      //    fails (FTS, tag, asset association), the DB rolls back and the Markdown
+      //    file is restored from the backup below.
+      runInTransaction(db, () => {
         const existingCat = db.prepare('SELECT id FROM categories WHERE name = ?').get(category) as any;
         let categoryId = existingCat?.id;
         if (!categoryId) {
@@ -991,8 +963,6 @@ export class DocumentService {
           );
         }
 
-        revisionId = generateId('rev');
-        const snapshotPath = await fileStorage.saveRevisionSnapshot(docId, revisionId, fullMarkdown);
         db.prepare(`
           INSERT INTO document_revisions (id, document_id, title, content_hash, snapshot_path, version_number, note, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1031,19 +1001,10 @@ export class DocumentService {
         `).run(docId, title, cleanBody, category, tags.join(' '));
 
         this.syncDocumentAssets(docId, cleanBody);
+      });
+      dbCommitted = true;
 
-        db.exec('COMMIT');
-        dbCommitted = true;
-      } catch (err) {
-        try {
-          db.exec('ROLLBACK');
-        } catch {
-          // transaction may already be rolled back by SQLite
-        }
-        throw err;
-      }
-
-      // 4. Success: drop the backup marker files.
+      // 5. Success: drop the backup marker files.
       await fileStorage.finalizeDocumentSave(artifacts);
 
       return {
@@ -1104,8 +1065,14 @@ export class DocumentService {
   /**
    * Rebuilds every document ↔ asset reference from the physical Markdown SSOT.
    * Used at startup so legacy documents get a reliable association table.
+   * Exclusive: the scan must not interleave with a save that rewrites the same
+   * association rows.
    */
   public async rebuildAssetReferences(): Promise<number> {
+    return consistencyGate.withExclusive(() => this.rebuildAssetReferencesUnderLease());
+  }
+
+  public async rebuildAssetReferencesUnderLease(): Promise<number> {
     const db = this.getDb();
     const docIds = await fileStorage.listAllDiskDocumentIds();
     let synced = 0;
@@ -1149,7 +1116,7 @@ export class DocumentService {
     // Same gate + per-document lock as saveDocument: a save and a delete for the
     // same document can never interleave, and global tag/revision maintenance
     // cannot observe a half-deleted document.
-    return this.withSaveGate(() =>
+    const outcome = await this.withSaveGate(() =>
       this.withDocumentLock(id, async () => {
         // 0. Finish a previous failed disk cleanup for this id (idempotent).
         const deletion = await this.recoverPendingDeletion(id).catch(err => {
@@ -1185,25 +1152,20 @@ export class DocumentService {
           throw new Error(`无法写入删除标记，已取消删除：${err?.message || err}`);
         }
 
-        // 3. Remove SQLite records first, in one transaction. If this fails the
-        //    Markdown folder is untouched (consistent).
+        // 3. Remove SQLite records first, in one synchronous transaction. If this
+        //    fails the Markdown folder is untouched (consistent).
         try {
-          db.exec('BEGIN IMMEDIATE');
-          db.prepare('DELETE FROM documents_fts WHERE document_id = ?').run(id);
-          db.prepare('DELETE FROM document_tags WHERE document_id = ?').run(id);
-          db.prepare('DELETE FROM document_revisions WHERE document_id = ?').run(id);
-          try {
-            db.prepare('DELETE FROM comments WHERE document_id = ?').run(id);
-          } catch {}
-          // Cascades remove document_assets.
-          db.prepare('DELETE FROM documents WHERE id = ?').run(id);
-          db.exec('COMMIT');
+          runInTransaction(db, () => {
+            db.prepare('DELETE FROM documents_fts WHERE document_id = ?').run(id);
+            db.prepare('DELETE FROM document_tags WHERE document_id = ?').run(id);
+            db.prepare('DELETE FROM document_revisions WHERE document_id = ?').run(id);
+            try {
+              db.prepare('DELETE FROM comments WHERE document_id = ?').run(id);
+            } catch {}
+            // Cascades remove document_assets.
+            db.prepare('DELETE FROM documents WHERE id = ?').run(id);
+          });
         } catch (err) {
-          try {
-            db.exec('ROLLBACK');
-          } catch {
-            // may already be rolled back
-          }
           if (markerCreated) {
             // Strict: if the marker cannot be removed, leave it in place. Recovery
             // will find the still-existing DB row and cancel/retry; this delete is
@@ -1239,24 +1201,37 @@ export class DocumentService {
           await fileStorage.clearDocumentDeletePending(id).catch(() => {});
         }
 
-        // 5. Clean up assets that were only in this document. If the folder could
-        //    not be removed its Markdown is still present, so assets are retained.
-        if (rawMarkdown) {
-          try {
-            await assetService.cleanupUnreferencedAssets();
-          } catch {}
-        }
-
-        // 6. Clean up any orphaned revisions
+        // 5. Clean up any orphaned revisions
         await fileStorage.cleanupOrphanRevisions();
 
-        return { diskCleanupPending };
+        return { diskCleanupPending, hadMarkdown: rawMarkdown !== null };
       })
     );
+
+    // 6. Clean up assets that were only in this document. This scan reads every
+    //    Markdown file, so it must run under an EXCLUSIVE lease — and therefore
+    //    after the shared document lease above has been released. Calling it
+    //    inside the shared lease would either deadlock the gate or race a save.
+    if (outcome.hadMarkdown) {
+      try {
+        await assetService.cleanupUnreferencedAssets();
+      } catch (err) {
+        console.error(`[InkFlow Delete] Asset cleanup failed for ${id}:`, err);
+      }
+    }
+
+    return { diskCleanupPending: outcome.diskCleanupPending };
   }
 
   // Disaster Recovery: Rebuild Index from Physical Disk Markdown Files
+  // Runs under an exclusive lease so a concurrent save cannot observe or create a
+  // half-rebuilt index. Callers that already hold the exclusive lease (seedData)
+  // use the `UnderLease` variant directly.
   public async rebuildIndexFromDisk(ownerId: string): Promise<{ restoredCount: number }> {
+    return consistencyGate.withExclusive(() => this.rebuildIndexFromDiskUnderLease(ownerId));
+  }
+
+  public async rebuildIndexFromDiskUnderLease(ownerId: string): Promise<{ restoredCount: number }> {
     const db = this.getDb();
     const diskDocIds = await fileStorage.listAllDiskDocumentIds();
     let restoredCount = 0;
@@ -1275,7 +1250,7 @@ export class DocumentService {
       const status = frontmatter.status || 'published';
       const pinned = frontmatter.pinned ? true : false;
 
-      await this.saveDocument(
+      await this.saveDocumentUnderLease(
         {
           id: docId,
           title,
@@ -1289,7 +1264,8 @@ export class DocumentService {
           author: frontmatter.author || 'Owner',
         },
         ownerId,
-        '从磁盘文件自动重建索引'
+        '从磁盘文件自动重建索引',
+        docId
       );
       restoredCount++;
     }
@@ -1439,47 +1415,85 @@ export class DocumentService {
     remainingCount: number;
     totalDiskBytes: number;
   }> {
-    const keepLatest = options.all ? 0 : options.keepLatest !== undefined ? options.keepLatest : 1;
+    const keepLatest = Math.max(
+      0,
+      options.all ? 0 : options.keepLatest !== undefined ? options.keepLatest : 1
+    );
 
     const runCleanup = async (documentId?: string) => {
       const db = this.getDb();
-      let deletedCount = 0;
-      let freedBytes = 0;
-      let deletedIds: string[] = [];
 
+      // Select by DB (the index of record), newest first per document. The old
+      // implementation selected files by mtime and deleted them BEFORE removing
+      // the rows, so a crash left DB rows pointing at missing snapshots.
+      const rows = (documentId
+        ? db
+            .prepare(
+              'SELECT id, document_id FROM document_revisions WHERE document_id = ? ORDER BY version_number DESC'
+            )
+            .all(documentId)
+        : db
+            .prepare(
+              'SELECT id, document_id FROM document_revisions ORDER BY document_id ASC, version_number DESC'
+            )
+            .all()) as Array<{ id: string; document_id: string }>;
+
+      const toDelete: Array<{ documentId: string; revisionId: string }> = [];
       if (documentId) {
-        const res = await fileStorage.pruneDocumentRevisions(documentId, keepLatest);
-        deletedCount = res.deletedCount;
-        freedBytes = res.freedBytes;
-        deletedIds = res.deletedRevisionIds;
-
-        if (deletedIds.length > 0) {
-          const placeholders = deletedIds.map(() => '?').join(',');
-          db.prepare(`DELETE FROM document_revisions WHERE document_id = ? AND id IN (${placeholders})`).run(
-            documentId,
-            ...deletedIds
-          );
+        for (const row of rows.slice(keepLatest)) {
+          toDelete.push({ documentId, revisionId: row.id });
         }
       } else {
-        const res = await fileStorage.pruneAllRevisions(keepLatest);
-        deletedCount = res.deletedCount;
-        freedBytes = res.freedBytes;
-        deletedIds = res.deletedRevisionIds;
-
-        if (deletedIds.length > 0) {
-          const batchSize = 100;
-          for (let i = 0; i < deletedIds.length; i += batchSize) {
-            const chunk = deletedIds.slice(i, i + batchSize);
-            const placeholders = chunk.map(() => '?').join(',');
-            db.prepare(`DELETE FROM document_revisions WHERE id IN (${placeholders})`).run(...chunk);
+        const seenPerDocument = new Map<string, number>();
+        for (const row of rows) {
+          const docId = String(row.document_id);
+          const seen = seenPerDocument.get(docId) ?? 0;
+          if (seen >= keepLatest) {
+            toDelete.push({ documentId: docId, revisionId: row.id });
           }
+          seenPerDocument.set(docId, seen + 1);
         }
       }
+
+      // 1. Remove the DB rows first, atomically. If this fails, no file has been
+      //    touched, so the index stays consistent.
+      if (toDelete.length > 0) {
+        runInTransaction(db, () => {
+          const deleteRow = db.prepare('DELETE FROM document_revisions WHERE document_id = ? AND id = ?');
+          for (const item of toDelete) {
+            deleteRow.run(item.documentId, item.revisionId);
+          }
+        });
+      }
+
+      // 2. Delete the files after the rows committed. A crash here leaves only
+      //    orphan files (harmless, retryable), never dangling DB rows.
+      const byDocument = new Map<string, string[]>();
+      for (const item of toDelete) {
+        const ids = byDocument.get(item.documentId) ?? [];
+        ids.push(item.revisionId);
+        byDocument.set(item.documentId, ids);
+      }
+
+      let freedBytes = 0;
+      for (const [docId, revisionIds] of byDocument) {
+        const result = await fileStorage.deleteRevisionFiles(docId, revisionIds);
+        freedBytes += result.freedBytes;
+        if (result.failedIds.length > 0) {
+          console.error(
+            `[InkFlow Revisions] ${result.failedIds.length} snapshot file(s) for ${docId} could not be deleted; ` +
+              'rows are already removed and the files will be treated as orphans.'
+          );
+        }
+      }
+
+      // 3. Sweep revision folders whose document no longer exists.
+      await fileStorage.cleanupOrphanRevisions();
 
       const updatedStats = await fileStorage.getRevisionsDiskStats();
 
       return {
-        cleanedCount: deletedCount,
+        cleanedCount: toDelete.length,
         freedBytes,
         remainingCount: updatedStats.totalRevisionsCount,
         totalDiskBytes: updatedStats.totalDiskBytes,
@@ -1499,14 +1513,25 @@ export class DocumentService {
     return this.runExclusiveMaintenance(() => runCleanup());
   }
 
-  // Delete a single revision file and DB record
+  // Delete a single revision: DB row first, then the snapshot file. A failed
+  // unlink leaves an orphan file, never a row pointing at a missing snapshot.
   public async deleteSingleRevision(documentId: string, revisionId: string): Promise<boolean> {
     return this.withSaveGate(() =>
       this.withDocumentLock(documentId, async () => {
         const db = this.getDb();
-        const diskRemoved = await fileStorage.deleteSingleRevisionFile(documentId, revisionId);
-        db.prepare('DELETE FROM document_revisions WHERE document_id = ? AND id = ?').run(documentId, revisionId);
-        return diskRemoved;
+        const result = db
+          .prepare('DELETE FROM document_revisions WHERE document_id = ? AND id = ?')
+          .run(documentId, revisionId);
+        const dbDeleted = Number((result as any)?.changes) > 0;
+
+        const fileResult = await fileStorage.deleteRevisionFiles(documentId, [revisionId]);
+        if (fileResult.failedIds.length > 0) {
+          console.error(
+            `[InkFlow Revisions] Snapshot ${revisionId} row removed but file deletion failed; will be treated as orphan.`
+          );
+        }
+
+        return dbDeleted || fileResult.deletedCount > 0;
       })
     );
   }
