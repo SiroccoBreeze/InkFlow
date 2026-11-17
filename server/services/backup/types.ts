@@ -1,0 +1,98 @@
+import type { DatabaseSync } from 'node:sqlite';
+
+/**
+ * Backup snapshot package format (V1.2 Batch 2A).
+ *
+ * The manifest is the only contract a future restore implementation needs. Its
+ * format is versioned independently from the application version and from the
+ * SQLite schema version.
+ */
+export const BACKUP_FORMAT = 'inkflow-backup';
+export const BACKUP_FORMAT_VERSION = 1;
+
+export const BACKUP_DATABASE_RELATIVE_PATH = 'database/knowledge_hub.sqlite';
+export const BACKUP_MANIFEST_FILE_NAME = 'manifest.json';
+
+export type SnapshotMode = 'hardlink' | 'copy' | 'mixed';
+
+export interface BackupFileEntry {
+  /** POSIX path relative to the backup root, e.g. documents/doc_1/index.md */
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface BackupDatabaseEntry {
+  /** POSIX path relative to the backup root. */
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface BackupManifest {
+  format: typeof BACKUP_FORMAT;
+  formatVersion: number;
+  applicationVersion: string;
+  createdAt: string;
+  schemaVersion: number;
+  database: BackupDatabaseEntry;
+  files: BackupFileEntry[];
+  /** Number of entries in `files` (the database is counted separately). */
+  fileCount: number;
+  /** Sum of `files[].size` (the database size is reported separately). */
+  totalSize: number;
+  snapshotMode: SnapshotMode;
+  /** Always true for format v1: sessions are removed from the database copy. */
+  sessionsExcluded: boolean;
+}
+
+export type BackupErrorCode =
+  | 'BACKUP_MAINTENANCE_MODE'
+  | 'BACKUP_RECOVERY_FAILED'
+  | 'BACKUP_INCONSISTENT_STATE'
+  | 'BACKUP_DATABASE_SNAPSHOT_FAILED'
+  | 'BACKUP_DATABASE_VALIDATION_FAILED'
+  | 'BACKUP_FILE_SNAPSHOT_FAILED'
+  | 'BACKUP_MANIFEST_INVALID'
+  | 'BACKUP_STAGING_FAILED'
+  | 'BACKUP_UNSUPPORTED';
+
+export class BackupError extends Error {
+  public readonly code: BackupErrorCode;
+  public readonly details: Record<string, unknown> | undefined;
+
+  constructor(
+    code: BackupErrorCode,
+    message: string,
+    details?: Record<string, unknown>,
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+    this.name = 'BackupError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
+/** Injectable filesystem/database operations (defaults are production safe). */
+export interface CreateBackupOptions {
+  /**
+   * Force copy snapshots. Hardlinks are never attempted. Useful for filesystems
+   * where the caller already knows hardlinks are unavailable.
+   */
+  forceCopy?: boolean;
+  /** Test/diagnostic injection; defaults to fs.link. */
+  linkFile?: (source: string, destination: string) => Promise<void>;
+  /** Test/diagnostic injection; defaults to fs.copyFile with COPYFILE_EXCL. */
+  copyFile?: (source: string, destination: string) => Promise<void>;
+  /** Test/diagnostic injection; defaults to node:sqlite backup(). */
+  backupDatabase?: (source: DatabaseSync, destination: string) => Promise<number>;
+}
+
+export interface BackupSnapshotResult {
+  id: string;
+  /** Absolute path of the completed snapshot directory. */
+  directory: string;
+  manifestPath: string;
+  manifest: BackupManifest;
+}

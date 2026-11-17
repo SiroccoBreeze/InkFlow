@@ -304,9 +304,20 @@ export class AssetService {
     failed: number;
     freedBytes: number;
   }> {
-    return consistencyGate.withExclusive(() =>
-      assetMutationLock.withLock(() => this.retryPendingDeletionsLocked())
-    );
+    return consistencyGate.withExclusive(() => this.recoverPendingAssetDeletionsUnderLease());
+  }
+
+  /**
+   * Tombstone retry for callers that ALREADY hold the exclusive consistency
+   * lease (e.g. backup snapshots). Acquiring the exclusive lease again here would
+   * deadlock the gate.
+   */
+  public async recoverPendingAssetDeletionsUnderLease(): Promise<{
+    recovered: number;
+    failed: number;
+    freedBytes: number;
+  }> {
+    return assetMutationLock.withLock(() => this.retryPendingDeletionsLocked());
   }
 
   // Upload and persist asset to physical storage/assets/ & SQLite

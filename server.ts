@@ -8,6 +8,7 @@ import { documentService } from './server/services/documentService';
 import { assetService } from './server/services/assetService';
 import { fileStorage } from './server/services/fileStorageService';
 import { maintenanceState } from './server/services/maintenanceState';
+import { backupService } from './server/services/backup/backupService';
 import { getDatabase } from './server/db/sqlite';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -163,6 +164,18 @@ async function startServer() {
       maintenanceState.markAssetReferencesUnavailable(
         err instanceof Error ? err.message : String(err)
       );
+    }
+
+    try {
+      // A crashed backup may have left a partial snapshot in backups/.staging/.
+      // It is never part of a successful snapshot and is safe to remove.
+      const cleaned = await backupService.cleanupStaleStaging();
+      if (cleaned > 0) {
+        console.log(`[InkFlow Backup] Removed ${cleaned} stale staging entr${cleaned === 1 ? 'y' : 'ies'}.`);
+      }
+    } catch (err) {
+      console.error('[InkFlow Backup] 清理遗留 staging 失败，服务继续运行（降级）:', err);
+      maintenanceState.addDegradedWarning('备份 staging 清理失败');
     }
   }
 
