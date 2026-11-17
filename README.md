@@ -178,6 +178,13 @@ curl http://localhost:3000/api/v1/auth/status
 `document_assets` 关联表在每次保存文档、以及服务启动时从 Markdown 重新同步，
 取消发布或删除引用后匿名访问立即失效。
 
+**关联表可信状态（V1.2 Batch 1）**：服务启动时的 Markdown → `document_assets`
+重建如果失败，关联表可能残留已从文章中移除的旧引用。此时匿名访问一律返回
+`503 ASSET_REFERENCES_UNAVAILABLE`（服务端路由强制执行，不回退为 403/404 掩盖原因），
+直到重启并成功完成校准。已认证 owner 的附件访问，以及文档读取、登录等无关功能不受影响。
+`GET /api/health` 的 `maintenance.assetReferenceIntegrity` 会显示
+`ready` / `unavailable` 及失败原因；仅 tombstone 重试失败等其他降级原因不会关闭匿名访问。
+
 ## 🗄️ 数据目录与 Git（SEC-008）
 
 运行时数据**不进 Git**：

@@ -13,6 +13,7 @@ import { shareService } from '../services/shareService';
 import { assetService, AssetPathInvalidError } from '../services/assetService';
 import { fileStorage } from '../services/fileStorageService';
 import { ensureInitialPhysicalDocs } from '../services/seedData';
+import { maintenanceState } from '../services/maintenanceState';
 import { getDatabase, generateId } from '../db/sqlite';
 
 export const apiRouter = Router();
@@ -582,6 +583,26 @@ apiRouter.get('/assets/file/:id', authenticateOptional, async (req, res) => {
   // Anonymous/non-owner access requires a REAL document_assets association with a
   // document that is both public and published. Filename/ID substring matching is never used.
   if (!isOwner) {
+    // Fail closed when startup could not calibrate the association table against
+    // the Markdown SSOT: stale rows might otherwise keep granting access to
+    // attachments that were already removed from their document. Do not report
+    // this as 404 (the asset exists) or as a plain 403 (that would hide the
+    // maintenance cause from clients and operators). Owner access is unchanged.
+    if (!maintenanceState.isAssetReferenceIntegrityTrusted()) {
+      const state = maintenanceState.snapshot();
+      res.status(503).json({
+        error: {
+          code: 'ASSET_REFERENCES_UNAVAILABLE',
+          message: '附件引用索引尚未完成校准，暂时拒绝匿名访问；请稍后重试或由主理人登录访问',
+          details: {
+            integrity: state.assetReferenceIntegrity,
+            since: state.since,
+          },
+        },
+      });
+      return;
+    }
+
     const isPubliclyReadable = documentService.isAssetPubliclyReadable(asset.record.id);
     if (!isPubliclyReadable) {
       res.status(403).json({ error: { code: 'FORBIDDEN', message: '私有附件或尚未公开的媒体资源，禁止匿名访问' } });

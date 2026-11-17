@@ -110,6 +110,9 @@ async function startServer() {
 
   if (criticalRecoveryError) {
     maintenanceState.enterMaintenance('startup_recovery_failed');
+    // The asset-reference rebuild below is skipped entirely in this branch, so
+    // the document_assets table cannot be trusted for anonymous authorization.
+    maintenanceState.markAssetReferencesUnavailable('startup_recovery_failed');
     console.error(
       '[InkFlow Startup] 关键恢复失败，服务将以只读维护模式启动；所有写入请求将返回 503。' +
         '请在修复文件系统/数据后重启，期间不要执行写入操作。',
@@ -151,9 +154,15 @@ async function startServer() {
       // exclusive consistency lease; running it after listen() let online saves race
       // with the rebuild and made a backup snapshot non-deterministic.
       await ensureAssetReferences();
+      // Calibration succeeded: anonymous readers may rely on document_assets again.
+      maintenanceState.markAssetReferencesReady();
     } catch (err) {
       console.error('[InkFlow Storage] 附件引用重建失败，服务继续运行（降级）:', err);
-      maintenanceState.addDegradedWarning('文档↔附件引用重建失败');
+      // Fail closed for anonymous asset access: stale rows may still grant access
+      // to attachments that were already removed from their Markdown document.
+      maintenanceState.markAssetReferencesUnavailable(
+        err instanceof Error ? err.message : String(err)
+      );
     }
   }
 
