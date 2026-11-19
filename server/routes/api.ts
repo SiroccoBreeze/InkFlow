@@ -14,6 +14,7 @@ import { assetService, AssetPathInvalidError } from '../services/assetService';
 import { fileStorage } from '../services/fileStorageService';
 import { ensureInitialPhysicalDocs } from '../services/seedData';
 import { maintenanceState } from '../services/maintenanceState';
+import { consistencyGate } from '../services/consistencyGate';
 import { getDatabase, generateId } from '../db/sqlite';
 
 export const apiRouter = Router();
@@ -705,17 +706,29 @@ apiRouter.post('/categories', requireOwner, (req, res) => {
   res.status(201).json({ data: { id, name: name.trim() } });
 });
 
-apiRouter.delete('/categories/:id', requireOwner, (req, res) => {
-  const db = getDatabase();
-  const idOrName = req.params.id;
-  const cat = db.prepare('SELECT id, name FROM categories WHERE id = ? OR name = ?').get(idOrName, idOrName) as any;
-  if (cat) {
-    db.prepare('DELETE FROM categories WHERE id = ?').run(cat.id);
-    db.prepare("UPDATE documents SET category_name = '未分类' WHERE category_name = ?").run(cat.name);
-  } else {
-    db.prepare('DELETE FROM categories WHERE id = ?').run(idOrName);
+apiRouter.delete('/categories/:id', requireOwner, async (req, res) => {
+  try {
+    // This route mutates `documents.category_name`, which the documents table
+    // describes as part of the Markdown-backed document state. Take the shared
+    // consistency lease so a backup snapshot cannot observe the DB halfway
+    // through the category update. (Categories themselves are DB-only.)
+    const data = await consistencyGate.withShared(async () => {
+      const db = getDatabase();
+      const idOrName = req.params.id;
+      const cat = db.prepare('SELECT id, name FROM categories WHERE id = ? OR name = ?').get(idOrName, idOrName) as any;
+      if (cat) {
+        db.prepare('DELETE FROM categories WHERE id = ?').run(cat.id);
+        db.prepare("UPDATE documents SET category_name = '未分类' WHERE category_name = ?").run(cat.name);
+      } else {
+        db.prepare('DELETE FROM categories WHERE id = ?').run(idOrName);
+      }
+      return { success: true };
+    });
+    res.json({ data });
+  } catch (err: any) {
+    console.error('[InkFlow Categories] Failed deleting category:', err);
+    res.status(500).json({ error: { code: 'CATEGORY_DELETE_FAILED', message: err?.message || '删除分类失败' } });
   }
-  res.json({ data: { success: true } });
 });
 
 apiRouter.get('/tags', (req, res) => {

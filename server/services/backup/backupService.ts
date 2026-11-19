@@ -12,6 +12,7 @@ import { getDatabase, getDbPath } from '../../db/sqlite';
 import {
   assertAssetAssociationsMatchMarkdown,
   assertDatabaseMatchesInventory,
+  assertRevisionSnapshotsMatchDatabase,
   assertSnapshotHashesMatchDatabase,
   loadDatabaseBackupState,
   stripSessionsFromDatabaseCopy,
@@ -32,6 +33,7 @@ import {
 import {
   BACKUP_DATABASE_RELATIVE_PATH,
   BackupError,
+  isBackupSnapshotId,
   type BackupSnapshotResult,
   type CreateBackupOptions,
 } from './types';
@@ -67,13 +69,53 @@ export class BackupService {
   }
 
   /**
+   * Creates (if needed) and validates a directory used by the snapshot lifecycle.
+   * A symlink/reparse point here could redirect staging cleanup or a published
+   * snapshot outside the storage tree, so it is refused explicitly.
+   */
+  private async ensureSafeDirectory(target: string, label: string): Promise<void> {
+    try {
+      await fs.mkdir(target, { recursive: true });
+    } catch (err) {
+      throw new BackupError(
+        'BACKUP_STAGING_FAILED',
+        `无法创建${label}：${(err as any)?.message || err}`,
+        { path: target },
+        { cause: err }
+      );
+    }
+    let stat: fsSync.Stats;
+    try {
+      stat = await fs.lstat(target);
+    } catch (err) {
+      throw new BackupError(
+        'BACKUP_STAGING_FAILED',
+        `无法检查${label}：${(err as any)?.message || err}`,
+        { path: target },
+        { cause: err }
+      );
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new BackupError(
+        'BACKUP_STAGING_FAILED',
+        `${label}不是普通目录（拒绝跟随符号链接/junction）：${target}`,
+        { path: target }
+      );
+    }
+  }
+
+  /**
    * Removes abandoned staging directories from a previous crashed run. Only
-   * `.staging` children are touched; completed snapshots are never deleted.
+   * entries matching this service's own snapshot ID shape are touched; unrelated
+   * files/directories under `.staging/` are preserved. Completed snapshots are
+   * never deleted.
    */
   public async cleanupStaleStaging(): Promise<number> {
     return consistencyGate.withExclusive(async () => {
-      const stagingRoot = path.join(this.getBackupsRoot(), STAGING_DIR_NAME);
-      await fs.mkdir(stagingRoot, { recursive: true });
+      const backupsRoot = this.getBackupsRoot();
+      await this.ensureSafeDirectory(backupsRoot, '备份根目录');
+      const stagingRoot = path.join(backupsRoot, STAGING_DIR_NAME);
+      await this.ensureSafeDirectory(stagingRoot, '备份 staging 目录');
       return this.cleanupStaleStagingLocked(stagingRoot);
     });
   }
@@ -94,12 +136,27 @@ export class BackupService {
 
     let removed = 0;
     for (const entry of entries) {
+      if (!isBackupSnapshotId(entry.name)) {
+        console.warn(
+          `[InkFlow Backup] Ignoring unexpected entry in staging directory (not a backup snapshot ID): ${entry.name}`
+        );
+        continue;
+      }
       const target = path.join(stagingRoot, entry.name);
-      // rm on a symlink removes the link itself, never the target.
-      await fs.rm(target, { recursive: true, force: true }).catch(err => {
+      try {
+        // lstat first: a symlink must be unlinked itself, never traversed.
+        const stat = await fs.lstat(target);
+        if (stat.isSymbolicLink()) {
+          await fs.rm(target, { force: true });
+        } else if (stat.isDirectory()) {
+          await fs.rm(target, { recursive: true, force: true });
+        } else {
+          await fs.rm(target, { force: true });
+        }
+        removed++;
+      } catch (err) {
         console.error(`[InkFlow Backup] Failed cleaning stale staging entry ${target}:`, err);
-      });
-      removed++;
+      }
     }
     return removed;
   }
@@ -288,23 +345,18 @@ export class BackupService {
       }
 
       const backupsRoot = this.getBackupsRoot();
+      await this.ensureSafeDirectory(backupsRoot, '备份根目录');
       const stagingRoot = path.join(backupsRoot, STAGING_DIR_NAME);
-      try {
-        await fs.mkdir(stagingRoot, { recursive: true });
-      } catch (err) {
-        throw new BackupError(
-          'BACKUP_STAGING_FAILED',
-          `无法创建 staging 目录：${(err as any)?.message || err}`,
-          { stagingRoot },
-          { cause: err }
-        );
-      }
+      await this.ensureSafeDirectory(stagingRoot, '备份 staging 目录');
 
       // A previous crash may have left staging data behind. Nothing else can be
       // using it: this method holds the exclusive lease.
       await this.cleanupStaleStagingLocked(stagingRoot);
 
       const id = nowId();
+      if (!isBackupSnapshotId(id)) {
+        throw new BackupError('BACKUP_STAGING_FAILED', `生成的备份 ID 不合法：${id}`, { id });
+      }
       const stagingDir = path.join(stagingRoot, id);
       try {
         await fs.mkdir(stagingDir, { recursive: false });
@@ -334,6 +386,7 @@ export class BackupService {
 
         const { entries, mode } = await createFileSnapshot({
           stagingDir,
+          storageRoot,
           files: inventory,
           forceCopy: options.forceCopy,
           linkFile: options.linkFile,
@@ -341,6 +394,12 @@ export class BackupService {
         });
         // The snapshot bytes must match the DB's commit markers, not just exist.
         assertSnapshotHashesMatchDatabase(state, entries);
+        // Revision files have no full-file hash in SQLite; re-derive their body
+        // hash from the packaged copy so a mismatched/corrupted snapshot cannot
+        // be published as a successful backup.
+        await assertRevisionSnapshotsMatchDatabase(state, relativePath =>
+          fs.readFile(path.join(stagingDir, ...relativePath.split('/')), 'utf-8')
+        );
 
         const manifest = buildBackupManifest({
           applicationVersion: getApplicationVersion(),

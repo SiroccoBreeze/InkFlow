@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import express from 'express';
+import request from 'supertest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -13,9 +15,10 @@ import { getDatabase, closeDatabase } from '../db/sqlite';
 import { CURRENT_SCHEMA_VERSION, getUserVersion } from '../db/migrations';
 import { consistencyGate } from '../services/consistencyGate';
 import { normalizeStorageRelativePath } from '../utils/storagePaths';
+import { apiRouter } from '../routes/api';
 import { backupService } from '../services/backup/backupService';
+import { createFileSnapshot, sha256File } from '../services/backup/backupSnapshot';
 import { readBackupManifest, validateBackupManifest } from '../services/backup/backupManifest';
-import { sha256File } from '../services/backup/backupSnapshot';
 import { BackupError, type BackupManifest } from '../services/backup/types';
 
 const testDbPath = path.join(
@@ -30,6 +33,10 @@ const INIT_KEY = 'backup-infra-init-key-0123456789abcdef';
 process.env.INKFLOW_DB_PATH = testDbPath;
 process.env.INKFLOW_DATA_DIR = testDataDir;
 process.env.INKFLOW_INIT_KEY = INIT_KEY;
+
+const app = express();
+app.use(express.json({ limit: '10mb' }));
+app.use('/api/v1', apiRouter);
 
 const SQL_TABLES = [
   'users',
@@ -637,6 +644,223 @@ describe('V1.2 Batch 2A backup snapshot infrastructure', () => {
     }
   });
 
+  it('refuses to create a backup while an asset tombstone cannot be resolved', async () => {
+    const assetId = `ast_backup_gate_${Date.now()}`;
+    const storagePath = `assets/${assetId}.png`;
+    const targetPath = path.join(testDataDir, 'assets', `${assetId}.png`);
+    // A directory at the tombstoned path makes physical deletion fail; the
+    // tombstone must be retained and the backup must abort.
+    fs.mkdirSync(targetPath, { recursive: true });
+    db.prepare(
+      `INSERT OR REPLACE INTO asset_deletions
+       (asset_id, storage_path, filename, reason, requested_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(assetId, storagePath, `${assetId}.png`, 'manual-delete', new Date().toISOString());
+
+    const before = finalBackupNames().length;
+    try {
+      const error = await expectRejectedBackup(
+        backupService.createBackupSnapshot(),
+        'BACKUP_RECOVERY_FAILED'
+      );
+      expect(error.details?.failed).toBeGreaterThan(0);
+      expect(finalBackupNames().length).toBe(before);
+      expect(stagingNames()).toEqual([]);
+      expect(fs.existsSync(targetPath)).toBe(true);
+      expect(
+        (db.prepare('SELECT COUNT(*) AS c FROM asset_deletions WHERE asset_id = ?').get(assetId) as any).c
+      ).toBe(1);
+    } finally {
+      db.prepare('DELETE FROM asset_deletions WHERE asset_id = ?').run(assetId);
+      fs.rmSync(targetPath, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts when a revision file no longer matches its database content hash', async () => {
+    const revision = db
+      .prepare(
+        `SELECT id, snapshot_path FROM document_revisions
+         WHERE document_id = ? ORDER BY version_number ASC LIMIT 1`
+      )
+      .get('doc_backup_base') as any;
+    expect(revision).toBeTruthy();
+    const revisionPath = path.join(testDataDir, ...String(revision.snapshot_path).split('/'));
+    const original = fs.readFileSync(revisionPath, 'utf-8');
+    const before = finalBackupNames().length;
+
+    fs.writeFileSync(revisionPath, '# 被篡改的历史版本\n\nREVISION-HASH-MISMATCH', 'utf-8');
+    try {
+      const error = await expectRejectedBackup(
+        backupService.createBackupSnapshot(),
+        'BACKUP_INCONSISTENT_STATE'
+      );
+      expect(error.message).toContain('历史版本');
+      expect(finalBackupNames().length).toBe(before);
+      expect(stagingNames()).toEqual([]);
+    } finally {
+      fs.writeFileSync(revisionPath, original, 'utf-8');
+    }
+  });
+
+  it('aborts when documents.content_hash disagrees with the Markdown body', async () => {
+    const row = db
+      .prepare('SELECT content_hash FROM documents WHERE id = ?')
+      .get('doc_backup_base') as any;
+    const originalContentHash = String(row.content_hash);
+    const before = finalBackupNames().length;
+
+    db.prepare('UPDATE documents SET content_hash = ? WHERE id = ?').run(
+      '0'.repeat(16),
+      'doc_backup_base'
+    );
+    try {
+      const error = await expectRejectedBackup(
+        backupService.createBackupSnapshot(),
+        'BACKUP_INCONSISTENT_STATE'
+      );
+      expect(error.message).toContain('content_hash');
+      expect(finalBackupNames().length).toBe(before);
+      expect(stagingNames()).toEqual([]);
+    } finally {
+      db.prepare('UPDATE documents SET content_hash = ? WHERE id = ?').run(
+        originalContentHash,
+        'doc_backup_base'
+      );
+    }
+  });
+
+  it('aborts when assets.size disagrees with the physical attachment', async () => {
+    const row = db.prepare('SELECT size FROM assets WHERE id = ?').get(baseAssetId) as any;
+    const originalSize = Number(row.size);
+    const before = finalBackupNames().length;
+
+    db.prepare('UPDATE assets SET size = ? WHERE id = ?').run(originalSize + 1, baseAssetId);
+    try {
+      const error = await expectRejectedBackup(
+        backupService.createBackupSnapshot(),
+        'BACKUP_INCONSISTENT_STATE'
+      );
+      expect(error.message).toContain('数据库大小与物理文件不一致');
+      expect(finalBackupNames().length).toBe(before);
+      expect(stagingNames()).toEqual([]);
+    } finally {
+      db.prepare('UPDATE assets SET size = ? WHERE id = ?').run(originalSize, baseAssetId);
+    }
+  });
+
+  it('publishes a single-file database snapshot without WAL/journal sidecars', async () => {
+    const result = await backupService.createBackupSnapshot();
+    const databaseDir = path.join(result.directory, 'database');
+    expect(fs.readdirSync(databaseDir).sort()).toEqual(['knowledge_hub.sqlite']);
+  });
+
+  it('only cleans snapshot-shaped staging entries and preserves unrelated data', async () => {
+    const stagingRoot = path.join(backupsRoot(), '.staging');
+    const staleId = 'backup-20000101T000000000Z-deadbeef';
+    const staleDir = path.join(stagingRoot, staleId);
+    const sentinelDir = path.join(stagingRoot, 'unrelated-sentinel');
+    fs.mkdirSync(staleDir, { recursive: true });
+    fs.writeFileSync(path.join(staleDir, 'partial.txt'), 'STALE-PARTIAL', 'utf-8');
+    fs.mkdirSync(sentinelDir, { recursive: true });
+    fs.writeFileSync(path.join(sentinelDir, 'keep.txt'), 'KEEP-ME', 'utf-8');
+
+    try {
+      const removed = await backupService.cleanupStaleStaging();
+      expect(removed).toBe(1);
+      expect(fs.existsSync(staleDir)).toBe(false);
+      expect(fs.readFileSync(path.join(sentinelDir, 'keep.txt'), 'utf-8')).toBe('KEEP-ME');
+    } finally {
+      fs.rmSync(sentinelDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to materialise a source that resolves outside the storage root', async () => {
+    const storageRoot = path.join(
+      os.tmpdir(),
+      `inkflow_snapshot_root_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+    );
+    const stagingDir = path.join(
+      os.tmpdir(),
+      `inkflow_snapshot_stage_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+    );
+    const outsideDir = path.join(
+      os.tmpdir(),
+      `inkflow_snapshot_outside_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+    );
+    fs.mkdirSync(path.join(storageRoot, 'documents', 'doc_link'), { recursive: true });
+    fs.mkdirSync(stagingDir, { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+    const outsideFile = path.join(outsideDir, 'secret.md');
+    fs.writeFileSync(outsideFile, 'OUTSIDE-STORAGE', 'utf-8');
+    const linkPath = path.join(storageRoot, 'documents', 'doc_link', 'index.md');
+
+    let linked = false;
+    try {
+      fs.symlinkSync(outsideFile, linkPath);
+      linked = true;
+    } catch (err) {
+      console.warn('[InkFlow Backup test] file symlink unavailable, skipping assertion:', err);
+    }
+
+    try {
+      if (!linked) return;
+      const outsideStat = fs.lstatSync(outsideFile);
+      await expect(
+        createFileSnapshot({
+          stagingDir,
+          storageRoot,
+          files: [
+            {
+              relativePath: 'documents/doc_link/index.md',
+              absolutePath: linkPath,
+              size: outsideStat.size,
+            },
+          ],
+          forceCopy: true,
+        })
+      ).rejects.toMatchObject({ code: 'BACKUP_INCONSISTENT_STATE' });
+      expect(fs.existsSync(path.join(stagingDir, 'documents', 'doc_link', 'index.md'))).toBe(false);
+    } finally {
+      fs.rmSync(storageRoot, { recursive: true, force: true });
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks category deletion (a documents-row write) while the exclusive lease is held', async () => {
+    const created = await request(app)
+      .post('/api/v1/categories')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ name: `GatedCategory_${Date.now()}`, slug: `gated-${Date.now()}` });
+    expect(created.status).toBe(201);
+    const categoryId = created.body.data.id as string;
+
+    const release = await consistencyGate.acquireExclusive();
+    let resolved = false;
+    let pending: Promise<any> | null = null;
+    try {
+      pending = request(app)
+        .delete(`/api/v1/categories/${categoryId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .then(response => {
+          resolved = true;
+          return response;
+        });
+
+      for (let i = 0; i < 100 && consistencyGate.snapshot().queued === 0; i++) {
+        await new Promise(resolveTimer => setTimeout(resolveTimer, 10));
+      }
+      expect(consistencyGate.snapshot().queued).toBeGreaterThan(0);
+      expect(resolved).toBe(false);
+    } finally {
+      release();
+    }
+
+    const response = await pending!;
+    expect(response.status).toBe(200);
+    expect(response.body.data?.success).toBe(true);
+  });
+
   it('strictly rejects unknown manifest versions, unsafe paths, duplicates and bad totals', async () => {
     const result = await backupService.createBackupSnapshot();
     const valid = result.manifest;
@@ -673,5 +897,21 @@ describe('V1.2 Batch 2A backup snapshot infrastructure', () => {
     const badDate = JSON.parse(JSON.stringify(valid));
     badDate.createdAt = 'not-a-date';
     expectBackupError(() => validateBackupManifest(badDate), 'BACKUP_MANIFEST_INVALID');
+
+    const unknownTopLevel = JSON.parse(JSON.stringify(valid));
+    unknownTopLevel.futureField = true;
+    expectBackupError(() => validateBackupManifest(unknownTopLevel), 'BACKUP_MANIFEST_INVALID');
+
+    const unknownDatabaseField = JSON.parse(JSON.stringify(valid));
+    unknownDatabaseField.database.futureField = true;
+    expectBackupError(() => validateBackupManifest(unknownDatabaseField), 'BACKUP_MANIFEST_INVALID');
+
+    const unknownFileField = JSON.parse(JSON.stringify(valid));
+    unknownFileField.files[0].futureField = true;
+    expectBackupError(() => validateBackupManifest(unknownFileField), 'BACKUP_MANIFEST_INVALID');
+
+    const hiddenSegment = JSON.parse(JSON.stringify(valid));
+    hiddenSegment.files[0].path = 'documents/doc_backup_base/.hidden.md';
+    expectBackupError(() => validateBackupManifest(hiddenSegment), 'BACKUP_MANIFEST_INVALID');
   });
 });

@@ -34,12 +34,14 @@ async function walkManagedDirectory(
   try {
     entries = await fs.readdir(absoluteDir, { withFileTypes: true });
   } catch (err: any) {
-    // A managed directory that does not exist is semantically empty. If the DB
-    // references any file inside it, the later DB↔file preflight aborts.
-    if (err?.code === 'ENOENT') return;
+    // The managed roots are checked before walking. A nested directory that
+    // disappears mid-scan means the source changed while we were snapshotting;
+    // silently returning would turn an incomplete snapshot into a "successful"
+    // one, so fail closed. Callers that need "absent directory == empty" handle
+    // the managed root themselves in collectManagedFiles().
     throw new BackupError(
       'BACKUP_INCONSISTENT_STATE',
-      `无法读取快照目录 ${directoryRelativePath}：${err?.message || err}`,
+      `快照目录在扫描过程中不可访问 ${directoryRelativePath}：${err?.message || err}`,
       { path: directoryRelativePath },
       { cause: err }
     );
@@ -169,6 +171,70 @@ function resolveSnapshotDestination(stagingDir: string, relativePath: string): s
   return resolved;
 }
 
+function isStrictlyInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+/**
+ * Re-checks a source entry immediately before it is linked/copied.
+ *
+ * collectManagedFiles() already skips symlinks, but the filesystem can change
+ * while the snapshot is being materialised. Following a newly introduced symlink
+ * here would pull an out-of-tree file into the backup package (or violate the DB
+ * commit markers), so every source must still be a regular file, stay under the
+ * real storage root, and keep the size captured by the inventory.
+ */
+async function assertSnapshotSourceUnchanged(
+  file: SnapshotInventoryEntry,
+  storageRootReal: string
+): Promise<void> {
+  let stat: fsSync.Stats;
+  try {
+    stat = await fs.lstat(file.absolutePath);
+  } catch (err: any) {
+    throw new BackupError(
+      'BACKUP_INCONSISTENT_STATE',
+      `快照源文件在扫描后不可访问：${file.relativePath}：${err?.message || err}`,
+      { path: file.relativePath },
+      { cause: err }
+    );
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new BackupError(
+      'BACKUP_INCONSISTENT_STATE',
+      `快照源文件在扫描后不再是普通文件（拒绝跟随符号链接）：${file.relativePath}`,
+      { path: file.relativePath }
+    );
+  }
+  if (stat.size !== file.size) {
+    throw new BackupError(
+      'BACKUP_INCONSISTENT_STATE',
+      `快照源文件在扫描后发生变化：${file.relativePath}（期望 ${file.size} 字节，实际 ${stat.size}）`,
+      { path: file.relativePath, expectedSize: file.size, actualSize: stat.size }
+    );
+  }
+
+  let realPath: string;
+  try {
+    realPath = await fs.realpath(file.absolutePath);
+  } catch (err: any) {
+    throw new BackupError(
+      'BACKUP_INCONSISTENT_STATE',
+      `无法解析快照源文件真实路径：${file.relativePath}：${err?.message || err}`,
+      { path: file.relativePath },
+      { cause: err }
+    );
+  }
+  if (!isStrictlyInside(storageRootReal, realPath)) {
+    throw new BackupError(
+      'BACKUP_INCONSISTENT_STATE',
+      `快照源文件解析到存储目录之外（符号链接逃逸）：${file.relativePath}`,
+      { path: file.relativePath }
+    );
+  }
+}
+
 /**
  * Materialises the file inventory inside `stagingDir`.
  *
@@ -186,9 +252,16 @@ function resolveSnapshotDestination(stagingDir: string, relativePath: string): s
  *
  * Link failures (EXDEV, EPERM, unsupported filesystems, Windows restrictions) fall
  * back to a real copy file-by-file. The manifest records hardlink/copy/mixed.
+ *
+ * Defence in depth: every inventory entry is lstat'ed and realpath-checked again
+ * immediately before materialisation (regular file, still inside the real storage
+ * root, unchanged size). This closes the scan→link/copy window against a file that
+ * is swapped for a symlink after collectManagedFiles() ran.
  */
 export async function createFileSnapshot(params: {
   stagingDir: string;
+  /** Real storage root used to verify that no source escaped through a symlink. */
+  storageRoot: string;
   files: SnapshotInventoryEntry[];
   forceCopy?: boolean;
   linkFile?: (source: string, destination: string) => Promise<void>;
@@ -196,11 +269,23 @@ export async function createFileSnapshot(params: {
 }): Promise<{ entries: BackupFileEntry[]; mode: SnapshotMode }> {
   const linkFile = params.linkFile ?? fs.link;
   const copyFile = params.copyFile ?? defaultCopyFile;
+  let storageRootReal: string;
+  try {
+    storageRootReal = await fs.realpath(params.storageRoot);
+  } catch (err: any) {
+    throw new BackupError(
+      'BACKUP_FILE_SNAPSHOT_FAILED',
+      `无法解析存储根目录真实路径：${params.storageRoot}：${err?.message || err}`,
+      { storageRoot: params.storageRoot },
+      { cause: err }
+    );
+  }
   let hardlinkCount = 0;
   let copyCount = 0;
   const entries: BackupFileEntry[] = [];
 
   for (const file of params.files) {
+    await assertSnapshotSourceUnchanged(file, storageRootReal);
     const destination = resolveSnapshotDestination(params.stagingDir, file.relativePath);
     await fs.mkdir(path.dirname(destination), { recursive: true });
 

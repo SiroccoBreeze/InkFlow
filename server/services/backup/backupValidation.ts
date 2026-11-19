@@ -2,12 +2,13 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { normalizeStorageRelativePath } from '../../utils/storagePaths';
-import { extractAssetReferences, parseFrontmatter } from '../documentService';
+import { extractAssetReferences, parseFrontmatter, calculateContentHash, calculateDocumentHash } from '../documentService';
 import { getUserVersion } from '../../db/migrations';
 import { BackupError, type BackupFileEntry } from './types';
 import type { SnapshotInventoryEntry } from './backupSnapshot';
 
 const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+const CONTENT_HASH_RE = /^[a-f0-9]{16}$/;
 const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,200}$/;
 const ASSET_FILE_NAME_RE = /^[A-Za-z0-9._-]{1,200}$/;
 
@@ -41,9 +42,22 @@ const REQUIRED_TABLES = [
 
 export interface DatabaseBackupState {
   schemaVersion: number;
-  documents: Array<{ id: string; canonicalPath: string; documentHash: string | null }>;
-  revisions: Array<{ id: string; documentId: string; canonicalPath: string }>;
-  assets: Array<{ id: string; canonicalPath: string; checksum: string }>;
+  documents: Array<{
+    id: string;
+    canonicalPath: string;
+    /** Full-file SHA-256 commit marker. Required after pending-save recovery. */
+    documentHash: string;
+    /** Body-only content hash stored in the documents row and frontmatter. */
+    contentHash: string;
+  }>;
+  revisions: Array<{
+    id: string;
+    documentId: string;
+    canonicalPath: string;
+    /** Body-only content hash stored in the revision row. */
+    contentHash: string;
+  }>;
+  assets: Array<{ id: string; canonicalPath: string; size: number; checksum: string }>;
   documentAssetIds: Map<string, Set<string>>;
   criticalCounts: Record<CriticalTable, number>;
 }
@@ -98,38 +112,55 @@ function canonicalAssetPath(raw: unknown, assetId: string): string {
 
 /** Reads and validates the production DB index used to cross-check the file snapshot. */
 export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
-  const documentRows = db.prepare('SELECT id, file_path, document_hash FROM documents').all() as any[];
-  const revisionRows = db
-    .prepare('SELECT id, document_id, snapshot_path FROM document_revisions')
+  const documentRows = db
+    .prepare('SELECT id, file_path, document_hash, content_hash FROM documents')
     .all() as any[];
-  const assetRows = db.prepare('SELECT id, storage_path, checksum FROM assets').all() as any[];
+  const revisionRows = db
+    .prepare('SELECT id, document_id, snapshot_path, content_hash FROM document_revisions')
+    .all() as any[];
+  const assetRows = db.prepare('SELECT id, storage_path, size, checksum FROM assets').all() as any[];
   const associationRows = db
     .prepare('SELECT document_id, asset_id FROM document_assets')
     .all() as any[];
 
   const documents = documentRows.map(row => {
     const id = assertSafeId(row.id, 'documents.id');
-    const documentHash =
-      row.document_hash === null || row.document_hash === undefined ? null : String(row.document_hash);
-    if (documentHash !== null && !SHA256_HEX_RE.test(documentHash)) {
+    const documentHash = String(row.document_hash ?? '');
+    if (!SHA256_HEX_RE.test(documentHash)) {
       throw new BackupError(
         'BACKUP_INCONSISTENT_STATE',
-        `文档 ${id} 的 document_hash 不是合法 SHA-256：${JSON.stringify(row.document_hash)}`
+        `文档 ${id} 缺少有效的 document_hash（保存恢复未完成），拒绝创建备份`
+      );
+    }
+    const contentHash = String(row.content_hash ?? '');
+    if (!CONTENT_HASH_RE.test(contentHash)) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `文档 ${id} 的 content_hash 不是合法正文哈希：${JSON.stringify(row.content_hash)}`
       );
     }
     return {
       id,
       canonicalPath: canonicalExpectedPath(row.file_path, `documents/${id}/index.md`, `文档 ${id} 的 file_path`),
       documentHash,
+      contentHash,
     };
   });
 
   const revisions = revisionRows.map(row => {
     const id = assertSafeId(row.id, 'document_revisions.id');
     const documentId = assertSafeId(row.document_id, 'document_revisions.document_id');
+    const contentHash = String(row.content_hash ?? '');
+    if (!CONTENT_HASH_RE.test(contentHash)) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `历史版本 ${id} 的 content_hash 不是合法正文哈希：${JSON.stringify(row.content_hash)}`
+      );
+    }
     return {
       id,
       documentId,
+      contentHash,
       canonicalPath: canonicalExpectedPath(
         row.snapshot_path,
         `revisions/${documentId}/${id}.md`,
@@ -140,6 +171,13 @@ export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
 
   const assets = assetRows.map(row => {
     const id = assertSafeId(row.id, 'assets.id');
+    const size = Number(row.size);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `附件 ${id} 的 size 不是非负安全整数：${JSON.stringify(row.size)}`
+      );
+    }
     const checksum = row.checksum === null || row.checksum === undefined ? '' : String(row.checksum);
     if (checksum && !SHA256_HEX_RE.test(checksum)) {
       throw new BackupError(
@@ -147,7 +185,7 @@ export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
         `附件 ${id} 的 checksum 不是合法 SHA-256：${JSON.stringify(row.checksum)}`
       );
     }
-    return { id, canonicalPath: canonicalAssetPath(row.storage_path, id), checksum };
+    return { id, canonicalPath: canonicalAssetPath(row.storage_path, id), size, checksum };
   });
 
   // The same physical file must never be claimed by two DB rows. Such a conflict
@@ -168,6 +206,14 @@ export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
 
   const documentIds = new Set(documents.map(document => document.id));
   const assetIds = new Set(assets.map(asset => asset.id));
+  for (const revision of revisions) {
+    if (!documentIds.has(revision.documentId)) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `document_revisions 引用了不存在的文档：${revision.documentId}（历史版本 ${revision.id}）`
+      );
+    }
+  }
   const documentAssetIds = new Map<string, Set<string>>();
   for (const row of associationRows) {
     const documentId = String(row.document_id);
@@ -291,19 +337,28 @@ export function assertDatabaseMatchesInventory(
     }
   }
   for (const asset of state.assets) {
-    if (!inventoryByPath.has(asset.canonicalPath)) {
+    const entry = inventoryByPath.get(asset.canonicalPath);
+    if (!entry) {
       throw new BackupError(
         'BACKUP_INCONSISTENT_STATE',
         `附件 ${asset.id} 在数据库中，但物理文件不在快照清单中：${asset.canonicalPath}`
+      );
+    }
+    if (entry.size !== asset.size) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `附件 ${asset.id} 的数据库大小与物理文件不一致：${asset.canonicalPath}（DB ${asset.size}，磁盘 ${entry.size}）`,
+        { assetId: asset.id, path: asset.canonicalPath, expected: asset.size, actual: entry.size }
       );
     }
   }
 }
 
 /**
- * Re-derives `document_assets` from the Markdown SSOT (read-only) and compares it
- * with the DB rows. This prevents a backup from freezing a stale association that
- * could grant access to an attachment already removed from the article.
+ * Re-derives each document's body hash and `document_assets` rows from the
+ * Markdown SSOT (read-only) and compares them with the DB state. This prevents a
+ * backup from freezing stale metadata or an attachment association that could
+ * grant access to an attachment already removed from the article.
  */
 export async function assertAssetAssociationsMatchMarkdown(
   state: DatabaseBackupState,
@@ -329,7 +384,27 @@ export async function assertAssetAssociationsMatchMarkdown(
         `无法读取文档 Markdown，拒绝创建备份：${document.id}`
       );
     }
+
+    // The DB commit marker must describe exactly the bytes that will be packaged.
+    const actualDocumentHash = calculateDocumentHash(raw);
+    if (actualDocumentHash !== document.documentHash) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `文档 ${document.id} 的 document_hash 与 Markdown 不一致；请先完成保存恢复再备份。`,
+        { documentId: document.id, expected: document.documentHash, actual: actualDocumentHash }
+      );
+    }
+
     const { body } = parseFrontmatter(raw);
+    const actualContentHash = calculateContentHash(body);
+    if (actualContentHash !== document.contentHash) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `文档 ${document.id} 的 content_hash 与 Markdown 正文不一致；请先运行索引对账再备份。`,
+        { documentId: document.id, expected: document.contentHash, actual: actualContentHash }
+      );
+    }
+
     const expected = new Set(
       extractAssetReferences(body).filter(assetId => assetIds.has(assetId))
     );
@@ -341,6 +416,45 @@ export async function assertAssetAssociationsMatchMarkdown(
         'BACKUP_INCONSISTENT_STATE',
         `文档 ${document.id} 的附件关联与 Markdown 不一致；请重启服务完成关联重建后再备份。`,
         { documentId: document.id, missing, extra }
+      );
+    }
+  }
+}
+
+/**
+ * Re-reads every packaged revision and verifies its body against
+ * `document_revisions.content_hash`. Path existence alone is not enough: a
+ * corrupted or replaced snapshot would restore a revision whose DB row claims
+ * different content.
+ */
+export async function assertRevisionSnapshotsMatchDatabase(
+  state: DatabaseBackupState,
+  readSnapshot: (relativePath: string) => Promise<string>
+): Promise<void> {
+  for (const revision of state.revisions) {
+    let raw: string;
+    try {
+      raw = await readSnapshot(revision.canonicalPath);
+    } catch (err) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `无法读取历史版本快照：${revision.canonicalPath}：${(err as any)?.message || err}`,
+        { revisionId: revision.id, path: revision.canonicalPath },
+        { cause: err }
+      );
+    }
+    const { body } = parseFrontmatter(raw);
+    const actual = calculateContentHash(body);
+    if (actual !== revision.contentHash) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `历史版本 ${revision.id} 的 content_hash 与快照内容不一致；备份已中止。`,
+        {
+          revisionId: revision.id,
+          path: revision.canonicalPath,
+          expected: revision.contentHash,
+          actual,
+        }
       );
     }
   }
@@ -359,7 +473,6 @@ export function assertSnapshotHashesMatchDatabase(
   const hashes = new Map(snapshotFiles.map(file => [file.path, file.sha256]));
 
   for (const document of state.documents) {
-    if (!document.documentHash) continue;
     const actual = hashes.get(document.canonicalPath);
     if (actual !== document.documentHash) {
       throw new BackupError(
@@ -441,7 +554,7 @@ export async function stripSessionsFromDatabaseCopy(databasePath: string): Promi
     db?.close();
   }
 
-  for (const suffix of ['-wal', '-shm']) {
+  for (const suffix of ['-wal', '-shm', '-journal']) {
     await fs.rm(`${databasePath}${suffix}`, { force: true }).catch(() => {});
   }
 }

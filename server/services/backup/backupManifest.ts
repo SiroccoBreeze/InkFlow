@@ -19,6 +19,35 @@ const SNAPSHOT_MODES: readonly SnapshotMode[] = ['hardlink', 'copy', 'mixed'];
 const FILE_PREFIXES = ['documents/', 'revisions/', 'assets/'];
 const DATABASE_PREFIX = 'database/';
 
+const MANIFEST_KEYS = [
+  'format',
+  'formatVersion',
+  'applicationVersion',
+  'createdAt',
+  'schemaVersion',
+  'database',
+  'files',
+  'fileCount',
+  'totalSize',
+  'snapshotMode',
+  'sessionsExcluded',
+] as const;
+const DATABASE_KEYS = ['path', 'size', 'sha256'] as const;
+const FILE_KEYS = ['path', 'size', 'sha256'] as const;
+
+/** Rejects fields outside the format-v1 contract instead of silently ignoring them. */
+function assertExactKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      throw new BackupError('BACKUP_MANIFEST_INVALID', `${label} 包含未知字段：${key}`);
+    }
+  }
+}
+
 /** `package.json` version of the running application, without loading it as a module. */
 export function getApplicationVersion(): string {
   try {
@@ -47,8 +76,8 @@ function assertSnapshotRelativePath(value: unknown, label: string, prefixes: str
   if (!prefixes.some(prefix => normalized.startsWith(prefix))) {
     throw new BackupError('BACKUP_MANIFEST_INVALID', `${label} 不在允许的快照目录中：${normalized}`);
   }
-  if (path.posix.basename(normalized).startsWith('.')) {
-    throw new BackupError('BACKUP_MANIFEST_INVALID', `${label} 指向隐藏文件：${normalized}`);
+  if (normalized.split('/').some(segment => segment.startsWith('.'))) {
+    throw new BackupError('BACKUP_MANIFEST_INVALID', `${label} 指向隐藏文件或目录：${normalized}`);
   }
   return normalized;
 }
@@ -63,6 +92,7 @@ export function validateBackupManifest(input: unknown): BackupManifest {
     throw new BackupError('BACKUP_MANIFEST_INVALID', 'manifest 必须是 JSON 对象');
   }
   const raw = input as Record<string, unknown>;
+  assertExactKeys(raw, MANIFEST_KEYS, 'manifest');
 
   if (raw.format !== BACKUP_FORMAT) {
     throw new BackupError(
@@ -104,6 +134,7 @@ export function validateBackupManifest(input: unknown): BackupManifest {
     throw new BackupError('BACKUP_MANIFEST_INVALID', 'database 必须是对象');
   }
   const databaseRaw = raw.database as Record<string, unknown>;
+  assertExactKeys(databaseRaw, DATABASE_KEYS, 'database');
   const databasePath = assertSnapshotRelativePath(
     databaseRaw.path,
     'database.path',
@@ -135,6 +166,7 @@ export function validateBackupManifest(input: unknown): BackupManifest {
       throw new BackupError('BACKUP_MANIFEST_INVALID', `files[${index}] 必须是对象`);
     }
     const fileRaw = entry as Record<string, unknown>;
+    assertExactKeys(fileRaw, FILE_KEYS, `files[${index}]`);
     const filePath = assertSnapshotRelativePath(fileRaw.path, `files[${index}].path`, FILE_PREFIXES);
     if (!isSafeInteger(fileRaw.size)) {
       throw new BackupError('BACKUP_MANIFEST_INVALID', `files[${index}].size 必须是非负整数`);
