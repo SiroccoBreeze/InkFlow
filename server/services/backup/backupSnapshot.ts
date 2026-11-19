@@ -27,7 +27,9 @@ async function walkManagedDirectory(
   rootDir: string,
   directoryRelativePath: string,
   output: SnapshotInventoryEntry[],
-  seen: Map<string, string>
+  seen: Map<string, string>,
+  preservedPaths: ReadonlySet<string>,
+  preservedDirectories: ReadonlySet<string>
 ): Promise<void> {
   const absoluteDir = path.join(rootDir, ...directoryRelativePath.split('/'));
   let entries: fsSync.Dirent[];
@@ -48,9 +50,14 @@ async function walkManagedDirectory(
   }
 
   for (const entry of entries) {
-    if (isExcludedFileName(entry.name)) continue;
-
     const childRelativePath = `${directoryRelativePath}/${entry.name}`;
+    // A DB-referenced attachment may legitimately end in `.tmp`/`.bak`; those
+    // exact paths are content, not recovery artifacts. Directories containing a
+    // preserved path must also be traversed. Unreferenced files with those
+    // suffixes remain excluded.
+    const preserved =
+      preservedPaths.has(childRelativePath) || preservedDirectories.has(childRelativePath);
+    if (isExcludedFileName(entry.name) && !preserved) continue;
 
     // Never follow symlinks/junctions: an attacker could otherwise pull files
     // from outside the storage root into the backup.
@@ -67,7 +74,14 @@ async function walkManagedDirectory(
         console.warn(`[InkFlow Backup] Skipping symbolic link in snapshot tree: ${childRelativePath}`);
         continue;
       }
-      await walkManagedDirectory(rootDir, childRelativePath, output, seen);
+      await walkManagedDirectory(
+        rootDir,
+        childRelativePath,
+        output,
+        seen,
+        preservedPaths,
+        preservedDirectories
+      );
       continue;
     }
     if (!entry.isFile()) continue;
@@ -110,12 +124,24 @@ async function walkManagedDirectory(
  * Builds the authoritative file inventory for documents/, revisions/ and assets/.
  *
  * Only regular files are considered. Dotfiles, `.bak`, `.tmp`, `.save.pending`,
- * `.delete.pending`, `.env` and symlinks are excluded. Directory read failures
- * abort the backup rather than producing a silently incomplete snapshot.
+ * `.delete.pending`, `.env` and symlinks are excluded, unless the exact path is
+ * listed in `preservedPaths` (DB-referenced attachments are content even when
+ * their extension happens to be `.tmp`/`.bak`). Directory read failures abort
+ * the backup rather than producing a silently incomplete snapshot.
  */
-export async function collectManagedFiles(rootDir: string): Promise<SnapshotInventoryEntry[]> {
+export async function collectManagedFiles(
+  rootDir: string,
+  preservedPaths: ReadonlySet<string> = new Set()
+): Promise<SnapshotInventoryEntry[]> {
   const output: SnapshotInventoryEntry[] = [];
   const seen = new Map<string, string>();
+  const preservedDirectories = new Set<string>();
+  for (const preservedPath of preservedPaths) {
+    const segments = preservedPath.split('/');
+    for (let index = 1; index < segments.length; index++) {
+      preservedDirectories.add(segments.slice(0, index).join('/'));
+    }
+  }
 
   for (const directory of MANAGED_DIRECTORIES) {
     const absoluteRoot = path.join(rootDir, directory);
@@ -140,7 +166,14 @@ export async function collectManagedFiles(rootDir: string): Promise<SnapshotInve
         { path: directory }
       );
     }
-    await walkManagedDirectory(rootDir, directory, output, seen);
+    await walkManagedDirectory(
+      rootDir,
+      directory,
+      output,
+      seen,
+      preservedPaths,
+      preservedDirectories
+    );
   }
 
   output.sort((a, b) => (a.relativePath < b.relativePath ? -1 : a.relativePath > b.relativePath ? 1 : 0));

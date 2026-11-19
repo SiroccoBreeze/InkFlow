@@ -324,6 +324,19 @@ describe('V1.2 Batch 2A backup snapshot infrastructure', () => {
     );
   });
 
+  it('includes a database-referenced attachment whose extension looks like an artifact', async () => {
+    const asset = await uploadAsset('legacy-upload.tmp', 'LEGIT-TMP-ATTACHMENT');
+    const diskName = asset.storagePath.split('/')[1];
+    expect(diskName.endsWith('.tmp')).toBe(true);
+
+    const result = await backupService.createBackupSnapshot();
+    const entry = result.manifest.files.find(file => file.path === `assets/${diskName}`);
+    expect(entry).toBeTruthy();
+    expect(
+      fs.readFileSync(path.join(result.directory, 'assets', diskName), 'utf-8')
+    ).toBe('LEGIT-TMP-ATTACHMENT');
+  });
+
   it('uses only safe POSIX relative paths in the manifest', async () => {
     const result = await backupService.createBackupSnapshot();
     const allPaths = [result.manifest.database.path, ...result.manifest.files.map(file => file.path)];

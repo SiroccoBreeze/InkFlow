@@ -376,7 +376,13 @@ export class BackupService {
         const db = getDatabase();
         const state = loadDatabaseBackupState(db);
         const storageRoot = fileStorage.getStorageRoot();
-        const inventory = await collectManagedFiles(storageRoot);
+        // Attachments are content exactly as named by the DB, even if their
+        // extension looks like a temp/backup artifact (e.g. an upload named
+        // `figure.tmp`). Unreferenced `.bak`/`.tmp` files are still excluded.
+        const inventory = await collectManagedFiles(
+          storageRoot,
+          new Set(state.assets.map(asset => asset.canonicalPath))
+        );
         assertDatabaseMatchesInventory(state, inventory);
         await assertAssetAssociationsMatchMarkdown(state, docId =>
           fileStorage.readDocumentMarkdownStrict(docId)
