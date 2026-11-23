@@ -143,6 +143,12 @@ const MIGRATIONS: SchemaMigration[] = [
 /**
  * Applies every migration newer than `fromVersion`, in ascending order.
  * Returns the list of applied versions.
+ *
+ * Invariant for every initialized database (also checked by the backup
+ * verifier): `PRAGMA user_version` equals the maximum recorded
+ * `schema_migrations.version`, and every version 1..user_version has an audit
+ * row. Baseline (v1) is recorded for pre-versioning databases; each later
+ * migration records its own row in the same transaction that sets user_version.
  */
 export function runSchemaMigrations(db: DatabaseSync, fromVersion: number): number[] {
   const pending = MIGRATIONS.filter(migration => migration.version > fromVersion).sort(

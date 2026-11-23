@@ -212,7 +212,7 @@ describe('V1.2 Batch 2B-1 independent backup verifier', () => {
     expect(report.counts.assets).toBeGreaterThan(0);
     expect(report.counts.files).toBe(result.manifest.fileCount);
     expect(report.snapshotMode).toBe('copy');
-    expect(report.warnings).toEqual([]);
+    expect(report.warnings.filter(warning => warning.code !== 'PLATFORM_NO_NOFOLLOW')).toEqual([]);
     expect(report.checks.every(check => check.ok)).toBe(true);
   });
 
@@ -477,6 +477,29 @@ describe('V1.2 Batch 2B-1 independent backup verifier', () => {
     const documentReport = await verifyBackupSnapshot(documentResult.id);
     expect(documentReport.ok).toBe(false);
     expect(codes(documentReport)).toContain('DOCUMENT_FRONTMATTER_ID_MISMATCH');
+
+    const titleResult = await createBackup();
+    const titlePath = path.join(
+      titleResult.directory,
+      'documents',
+      'doc_verify_base',
+      'index.md'
+    );
+    const titleRaw = fs.readFileSync(titlePath, 'utf-8');
+    fs.writeFileSync(
+      titlePath,
+      titleRaw.replace(/^title: ".*"$/m, 'title: "TAMPERED DOCUMENT TITLE"'),
+      'utf-8'
+    );
+    await refreshManifestFile(
+      titleResult.directory,
+      readManifest(titleResult.directory),
+      'documents/doc_verify_base/index.md'
+    );
+
+    const titleReport = await verifyBackupSnapshot(titleResult.id);
+    expect(titleReport.ok).toBe(false);
+    expect(codes(titleReport)).toContain('DOCUMENT_FRONTMATTER_TITLE_MISMATCH');
   });
 
   it('blocks verification of an uncalibrated attachment instead of skipping its hash', async () => {
@@ -727,5 +750,232 @@ describe('V1.2 Batch 2B-1 independent backup verifier', () => {
       db.prepare('DELETE FROM asset_deletions WHERE asset_id = ?').run(assetId);
       fs.rmSync(absolutePath, { force: true });
     }
+  });
+
+  it('aborts when a source is swapped to a symlink after the pre-check', async () => {
+    const documentPath = path.join(testDataDir, 'documents', 'doc_verify_base', 'index.md');
+    const original = fs.readFileSync(documentPath, 'utf-8');
+    const outsidePath = path.join(
+      os.tmpdir(),
+      `inkflow_verify_outside_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.md`
+    );
+    fs.writeFileSync(outsidePath, original, 'utf-8');
+
+    const probePath = path.join(testDataDir, 'symlink-probe');
+    try {
+      fs.symlinkSync(outsidePath, probePath);
+      fs.rmSync(probePath, { force: true });
+    } catch {
+      // Windows without symlink privileges: this race cannot be simulated here.
+      fs.rmSync(outsidePath, { force: true });
+      return;
+    }
+
+    const before = publishedNames().length;
+    let swapped = false;
+    try {
+      await expect(
+        createBackup({
+          beforeSourceOpen: async (relativePath, absolutePath) => {
+            if (relativePath !== 'documents/doc_verify_base/index.md' || swapped) return;
+            swapped = true;
+            fs.rmSync(absolutePath, { force: true });
+            fs.symlinkSync(outsidePath, absolutePath);
+          },
+        })
+      ).rejects.toMatchObject({
+        code: expect.stringMatching(/^BACKUP_(INCONSISTENT_STATE|FILE_SNAPSHOT_FAILED)$/),
+      });
+
+      expect(swapped).toBe(true);
+      expect(publishedNames().length).toBe(before);
+      expect(stagingNames()).toEqual([]);
+    } finally {
+      fs.rmSync(documentPath, { force: true });
+      fs.writeFileSync(documentPath, original, 'utf-8');
+      fs.rmSync(outsidePath, { force: true });
+    }
+  });
+
+  it('aborts when a source changes while it is being copied', async () => {
+    const documentPath = path.join(testDataDir, 'documents', 'doc_verify_base', 'index.md');
+    const original = fs.readFileSync(documentPath, 'utf-8');
+    const tampered = original.replace('第二版', '篡改版');
+    expect(tampered.length).toBe(original.length);
+
+    let mutated = false;
+    const before = publishedNames().length;
+    try {
+      await expect(
+        createBackup({
+          afterSourceCopyChunk: async (relativePath, bytesReadTotal) => {
+            if (
+              relativePath !== 'documents/doc_verify_base/index.md' ||
+              mutated ||
+              bytesReadTotal <= 0
+            ) {
+              return;
+            }
+            mutated = true;
+            fs.writeFileSync(documentPath, tampered, 'utf-8');
+          },
+        })
+      ).rejects.toMatchObject({ code: 'BACKUP_INCONSISTENT_STATE' });
+
+      expect(mutated).toBe(true);
+      expect(publishedNames().length).toBe(before);
+      expect(stagingNames()).toEqual([]);
+    } finally {
+      fs.writeFileSync(documentPath, original, 'utf-8');
+    }
+  });
+
+  it('computes the hash and parses frontmatter from the same document bytes', async () => {
+    const result = await createBackup();
+    const backupDocumentPath = path.join(
+      result.directory,
+      'documents',
+      'doc_verify_base',
+      'index.md'
+    );
+    const original = fs.readFileSync(backupDocumentPath, 'utf-8');
+    const tampered = original.replace('第二版', '篡改版');
+    let replaced = false;
+
+    try {
+      const report = await verifyBackupSnapshot(result.id, {
+        testHooks: {
+          afterFileRead: async relativePath => {
+            if (relativePath !== 'documents/doc_verify_base/index.md' || replaced) return;
+            replaced = true;
+            // Replace the on-disk file AFTER its bytes were read+hashed. The
+            // verifier must parse the buffer it already hashed, so this must not
+            // turn into a semantic mismatch for different bytes.
+            fs.writeFileSync(backupDocumentPath, tampered, 'utf-8');
+          },
+        },
+      });
+
+      expect(replaced).toBe(true);
+      expect(report.ok).toBe(true);
+      expect(report.issues).toEqual([]);
+    } finally {
+      fs.writeFileSync(backupDocumentPath, original, 'utf-8');
+    }
+  });
+
+  it('fails when a document or revision frontmatter title is missing', async () => {
+    const documentResult = await createBackup();
+    const documentPath = path.join(
+      documentResult.directory,
+      'documents',
+      'doc_verify_base',
+      'index.md'
+    );
+    const documentRaw = fs.readFileSync(documentPath, 'utf-8');
+    fs.writeFileSync(documentPath, documentRaw.replace(/^title: .*\n/m, ''), 'utf-8');
+    await refreshManifestFile(
+      documentResult.directory,
+      readManifest(documentResult.directory),
+      'documents/doc_verify_base/index.md'
+    );
+
+    const documentReport = await verifyBackupSnapshot(documentResult.id);
+    expect(documentReport.ok).toBe(false);
+    expect(codes(documentReport)).toContain('DOCUMENT_FRONTMATTER_TITLE_MISSING');
+
+    const revisionResult = await createBackup();
+    const revisionEntry = revisionResult.manifest.files.find(file =>
+      file.path.startsWith('revisions/doc_verify_base/')
+    );
+    expect(revisionEntry).toBeTruthy();
+    const revisionPath = path.join(revisionResult.directory, ...revisionEntry!.path.split('/'));
+    const revisionRaw = fs.readFileSync(revisionPath, 'utf-8');
+    fs.writeFileSync(revisionPath, revisionRaw.replace(/^title: .*\n/m, ''), 'utf-8');
+    await refreshManifestFile(
+      revisionResult.directory,
+      readManifest(revisionResult.directory),
+      revisionEntry!.path
+    );
+
+    const revisionReport = await verifyBackupSnapshot(revisionResult.id);
+    expect(revisionReport.ok).toBe(false);
+    expect(codes(revisionReport)).toContain('REVISION_FRONTMATTER_TITLE_MISSING');
+  });
+
+  it('rejects a VIEW masquerading as a core data table', async () => {
+    const result = await createBackup();
+    const database = new DatabaseSync(snapshotDatabasePath(result.directory));
+    try {
+      database.exec('PRAGMA foreign_keys = OFF;');
+      database.exec('DROP TABLE sessions;');
+      database.exec(`
+        CREATE VIEW sessions AS
+        SELECT '' AS id, '' AS user_id, '' AS token_hash, '' AS expires_at,
+               '' AS created_at, '' AS last_seen_at
+        WHERE 0;
+      `);
+    } finally {
+      database.close();
+    }
+    await refreshManifestDatabase(result.directory, readManifest(result.directory));
+
+    const report = await verifyBackupSnapshot(result.id);
+    expect(report.ok).toBe(false);
+    expect(codes(report)).toContain('REQUIRED_TABLE_NOT_REAL');
+    expect(report.checks.find(check => check.name === 'databaseState')?.ok).toBe(false);
+  });
+
+  it('rejects an ordinary table masquerading as documents_fts', async () => {
+    const result = await createBackup();
+    const database = new DatabaseSync(snapshotDatabasePath(result.directory));
+    try {
+      database.exec('DROP TABLE documents_fts;');
+      database.exec('CREATE TABLE documents_fts (document_id TEXT, body TEXT);');
+    } finally {
+      database.close();
+    }
+    await refreshManifestDatabase(result.directory, readManifest(result.directory));
+
+    const report = await verifyBackupSnapshot(result.id);
+    expect(report.ok).toBe(false);
+    expect(codes(report)).toContain('FTS_TABLE_INVALID');
+  });
+
+  it('reports incomplete migration audit rows as a warning', async () => {
+    const result = await createBackup();
+    const database = new DatabaseSync(snapshotDatabasePath(result.directory));
+    try {
+      database.prepare('DELETE FROM schema_migrations WHERE version = ?').run(3);
+    } finally {
+      database.close();
+    }
+    await refreshManifestDatabase(result.directory, readManifest(result.directory));
+
+    const report = await verifyBackupSnapshot(result.id);
+    const warningCodes = report.warnings.map(warning => warning.code);
+    expect(
+      warningCodes.some(code =>
+        ['SCHEMA_MIGRATION_AUDIT_INCOMPLETE', 'SCHEMA_MIGRATION_AUDIT_GAPS'].includes(code)
+      )
+    ).toBe(true);
+    expect(report.checks.find(check => check.name === 'migrationAudit')?.ok).toBe(false);
+  });
+
+  it('rejects a migration audit row newer than user_version', async () => {
+    const result = await createBackup();
+    const database = new DatabaseSync(snapshotDatabasePath(result.directory));
+    try {
+      database
+        .prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+        .run(99, 'tampered-future-migration', new Date().toISOString());
+    } finally {
+      database.close();
+    }
+    await refreshManifestDatabase(result.directory, readManifest(result.directory));
+
+    const report = await verifyBackupSnapshot(result.id);
+    expect(report.ok).toBe(false);
+    expect(codes(report)).toContain('SCHEMA_MIGRATION_AUDIT_AHEAD');
   });
 });

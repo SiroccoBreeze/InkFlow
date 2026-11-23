@@ -392,7 +392,7 @@ export class BackupService {
 
         const database = await this.createDatabaseSnapshot(stagingDir, state, options);
 
-        const { entries, mode } = await createFileSnapshot({
+        const { entries, mode, warnings: materializationWarnings } = await createFileSnapshot({
           stagingDir,
           storageRoot,
           files: inventory,
@@ -400,6 +400,8 @@ export class BackupService {
           forceCopy: options.forceCopy,
           linkFile: options.linkFile,
           copyFile: options.copyFile,
+          beforeSourceOpen: options.beforeSourceOpen,
+          afterSourceCopyChunk: options.afterSourceCopyChunk,
         });
         // The snapshot bytes must match the DB's commit markers, not just exist.
         assertSnapshotHashesMatchDatabase(state, entries);
@@ -432,6 +434,12 @@ export class BackupService {
             '重新读取的 manifest 与写入前内容不一致，拒绝发布',
             { stagingDir }
           );
+        }
+        for (const message of materializationWarnings) {
+          verification.warnings.push({
+            code: 'SNAPSHOT_SOURCE_RACE_WINDOW',
+            message,
+          });
         }
         for (const warning of verification.warnings) {
           console.warn(`[InkFlow Backup] ${warning.message}`);

@@ -118,6 +118,10 @@ export interface CreateBackupOptions {
    * callers never set it.
    */
   beforePublishVerification?: (stagingDir: string, manifest: BackupManifest) => Promise<void>;
+  /** Test/diagnostic hook: runs after source pre-checks and before open/link. */
+  beforeSourceOpen?: (relativePath: string, absolutePath: string) => Promise<void>;
+  /** Test/diagnostic hook: runs after each copied 64 KiB chunk. */
+  afterSourceCopyChunk?: (relativePath: string, bytesReadTotal: number) => Promise<void>;
 }
 
 export interface BackupSnapshotResult {

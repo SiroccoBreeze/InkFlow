@@ -80,7 +80,11 @@ export interface BackupVerificationOptions {
    * Test/diagnostic hook used to prove that verification does not hold the
    * consistency gate while it hashes files. Production callers never set it.
    */
-  testHooks?: { beforeHashing?: () => Promise<void> };
+  testHooks?: {
+    beforeHashing?: () => Promise<void>;
+    /** Runs after a document/revision read+hash and before semantic parsing. */
+    afterFileRead?: (relativePath: string) => Promise<void>;
+  };
 }
 
 interface LayoutInspection {
@@ -167,6 +171,187 @@ function decodeFrontmatterString(value: unknown): string | null {
   // buildFrontmatterBlock escapes double quotes in titles. parseFrontmatter
   // strips the surrounding quotes but does not unescape, so normalize here.
   return value.replace(/\\"/g, '"');
+}
+
+function verifyDocumentContent(params: {
+  document: DatabaseBackupState['documents'][number];
+  raw: string;
+  actualSha256: string;
+  issues: BackupVerificationIssue[];
+  bodyByDocumentId: Map<string, string>;
+}): boolean {
+  const { document, raw, actualSha256, issues, bodyByDocumentId } = params;
+  let ok = true;
+
+  if (actualSha256 !== document.documentHash) {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_HASH_MISMATCH',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的 document_hash 与快照内容不一致`,
+      expected: document.documentHash,
+      actual: actualSha256,
+    });
+  }
+
+  const { frontmatter, body } = parseFrontmatter(raw);
+  bodyByDocumentId.set(document.id, body);
+
+  const bodyHash = calculateContentHash(body);
+  if (bodyHash !== document.contentHash) {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_CONTENT_HASH_MISMATCH',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的正文哈希与数据库 content_hash 不一致`,
+      expected: document.contentHash,
+      actual: bodyHash,
+    });
+  }
+
+  const frontmatterId = decodeFrontmatterString(frontmatter.id);
+  if (frontmatterId === null) {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_FRONTMATTER_ID_MISSING',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的 frontmatter 缺少 id`,
+    });
+  } else if (frontmatterId !== document.id) {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_FRONTMATTER_ID_MISMATCH',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的 frontmatter id 不一致`,
+      expected: document.id,
+      actual: frontmatterId,
+    });
+  }
+
+  const frontmatterContentHash = decodeFrontmatterString(frontmatter.content_hash);
+  if (frontmatterContentHash === null) {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_FRONTMATTER_CONTENT_HASH_MISSING',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的 frontmatter 缺少 content_hash`,
+    });
+  } else if (frontmatterContentHash !== document.contentHash) {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_FRONTMATTER_CONTENT_HASH_MISMATCH',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的 frontmatter content_hash 与数据库不一致`,
+      expected: document.contentHash,
+      actual: frontmatterContentHash,
+    });
+  }
+
+  // Every real document written by InkFlow has a title in frontmatter. A
+  // missing/empty title is a hard failure, not a reason to skip the check.
+  const frontmatterTitle = decodeFrontmatterString(frontmatter.title);
+  if (frontmatterTitle === null || frontmatterTitle.trim() === '') {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_FRONTMATTER_TITLE_MISSING',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的 frontmatter 缺少 title`,
+    });
+  } else if (frontmatterTitle !== document.title) {
+    ok = false;
+    issues.push({
+      code: 'DOCUMENT_FRONTMATTER_TITLE_MISMATCH',
+      path: document.canonicalPath,
+      message: `文档 ${document.id} 的 frontmatter title 与数据库不一致`,
+      expected: document.title,
+      actual: frontmatterTitle,
+    });
+  }
+
+  return ok;
+}
+
+function verifyRevisionContent(params: {
+  revision: DatabaseBackupState['revisions'][number];
+  raw: string;
+  issues: BackupVerificationIssue[];
+}): boolean {
+  const { revision, raw, issues } = params;
+  let ok = true;
+
+  const { frontmatter, body } = parseFrontmatter(raw);
+  const bodyHash = calculateContentHash(body);
+  if (bodyHash !== revision.contentHash) {
+    ok = false;
+    issues.push({
+      code: 'REVISION_CONTENT_HASH_MISMATCH',
+      path: revision.canonicalPath,
+      message: `历史版本 ${revision.id} 的正文哈希与数据库 content_hash 不一致`,
+      expected: revision.contentHash,
+      actual: bodyHash,
+    });
+  }
+
+  const frontmatterId = decodeFrontmatterString(frontmatter.id);
+  if (frontmatterId === null) {
+    ok = false;
+    issues.push({
+      code: 'REVISION_FRONTMATTER_ID_MISSING',
+      path: revision.canonicalPath,
+      message: `历史版本 ${revision.id} 的 frontmatter 缺少 id`,
+    });
+  } else if (frontmatterId !== revision.documentId) {
+    ok = false;
+    issues.push({
+      code: 'REVISION_FRONTMATTER_ID_MISMATCH',
+      path: revision.canonicalPath,
+      message: `历史版本 ${revision.id} 的 frontmatter id 与所属文档不一致`,
+      expected: revision.documentId,
+      actual: frontmatterId,
+    });
+  }
+
+  const frontmatterContentHash = decodeFrontmatterString(frontmatter.content_hash);
+  if (frontmatterContentHash === null) {
+    ok = false;
+    issues.push({
+      code: 'REVISION_FRONTMATTER_CONTENT_HASH_MISSING',
+      path: revision.canonicalPath,
+      message: `历史版本 ${revision.id} 的 frontmatter 缺少 content_hash`,
+    });
+  } else if (frontmatterContentHash !== revision.contentHash) {
+    ok = false;
+    issues.push({
+      code: 'REVISION_FRONTMATTER_CONTENT_HASH_MISMATCH',
+      path: revision.canonicalPath,
+      message: `历史版本 ${revision.id} 的 frontmatter content_hash 与数据库不一致`,
+      expected: revision.contentHash,
+      actual: frontmatterContentHash,
+    });
+  }
+
+  // Real revision snapshots (checked against existing storage files) contain a
+  // title. Missing/empty titles fail; there is no legacy exception in this format.
+  const frontmatterTitle = decodeFrontmatterString(frontmatter.title);
+  if (frontmatterTitle === null || frontmatterTitle.trim() === '') {
+    ok = false;
+    issues.push({
+      code: 'REVISION_FRONTMATTER_TITLE_MISSING',
+      path: revision.canonicalPath,
+      message: `历史版本 ${revision.id} 的 frontmatter 缺少 title`,
+    });
+  } else if (frontmatterTitle !== revision.title) {
+    ok = false;
+    issues.push({
+      code: 'REVISION_FRONTMATTER_TITLE_MISMATCH',
+      path: revision.canonicalPath,
+      message: `历史版本 ${revision.id} 的 frontmatter title 与数据库不一致`,
+      expected: revision.title,
+      actual: frontmatterTitle,
+    });
+  }
+
+  return ok;
 }
 
 async function lstatRegularFile(filePath: string, label: string): Promise<fsSync.Stats> {
@@ -490,10 +675,43 @@ async function inspectLayout(
   return { files, directories, issues, entryCount };
 }
 
+interface FileReadResult {
+  buffer: Buffer;
+  sha256: string;
+  size: number;
+}
+
+function openFlagsNoFollow(): number {
+  const noFollow =
+    process.platform === 'win32' || fsSync.constants.O_NOFOLLOW === undefined
+      ? 0
+      : fsSync.constants.O_NOFOLLOW;
+  return fsSync.constants.O_RDONLY | noFollow;
+}
+
+function statChanged(before: fsSync.Stats, after: fsSync.Stats): boolean {
+  return (
+    before.size !== after.size ||
+    before.mtimeMs !== after.mtimeMs ||
+    before.ctimeMs !== after.ctimeMs ||
+    before.ino !== after.ino
+  );
+}
+
+function sameFileIdentity(expected: fsSync.Stats, actual: fsSync.Stats): boolean {
+  return (
+    expected.size === actual.size &&
+    expected.ino === actual.ino &&
+    expected.dev === actual.dev &&
+    expected.mtimeMs === actual.mtimeMs
+  );
+}
+
 /**
  * Hashes a file without following a final symlink. The verifier never trusts a
  * previously observed Dirent/lstat state, so O_NOFOLLOW closes the race where an
- * entry is swapped between layout inspection and hashing.
+ * entry is swapped between layout inspection and hashing. On Windows O_NOFOLLOW
+ * is unavailable; the final lstat→open window is a documented residual risk.
  */
 async function hashFileNoFollow(filePath: string): Promise<HashedFile> {
   // Re-check immediately before opening: on Windows O_NOFOLLOW is unavailable,
@@ -503,37 +721,102 @@ async function hashFileNoFollow(filePath: string): Promise<HashedFile> {
     throw new Error('不是普通文件');
   }
 
-  const noFollow =
-    process.platform === 'win32' || fsSync.constants.O_NOFOLLOW === undefined
-      ? 0
-      : fsSync.constants.O_NOFOLLOW;
-  const handle = await fs.open(filePath, fsSync.constants.O_RDONLY | noFollow);
+  const handle = await fs.open(filePath, openFlagsNoFollow());
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) {
-      throw new Error('不是普通文件');
+    const before = await handle.stat();
+    if (!before.isFile() || !sameFileIdentity(pre, before)) {
+      throw new Error('文件在检查与打开之间被替换或修改');
     }
     const hash = crypto.createHash('sha256');
-    const stream = handle.createReadStream({ autoClose: false });
-    for await (const chunk of stream) {
-      hash.update(chunk as Buffer);
+    const chunk = Buffer.alloc(64 * 1024);
+    let position = 0;
+    let bytes = 0;
+    while (position < before.size) {
+      const { bytesRead } = await handle.read(
+        chunk,
+        0,
+        Math.min(chunk.length, before.size - position),
+        position
+      );
+      if (bytesRead <= 0) break;
+      hash.update(chunk.subarray(0, bytesRead));
+      bytes += bytesRead;
+      position += bytesRead;
     }
-    return { sha256: hash.digest('hex'), size: stat.size };
+    const after = await handle.stat();
+    if (bytes !== before.size || statChanged(before, after)) {
+      throw new Error('文件在哈希期间发生变化');
+    }
+    return { sha256: hash.digest('hex'), size: before.size };
   } finally {
     await handle.close().catch(() => {});
   }
 }
 
-function tableExists(db: DatabaseSync, name: string): boolean {
-  return Boolean(
-    db
-      .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?")
-      .get(name)
+/**
+ * Reads a file once through a no-follow handle and computes its SHA-256 from the
+ * same bytes. Document/revision semantic checks use this result, so the verified
+ * hash and the parsed frontmatter/body can never come from two different reads.
+ */
+async function readFileNoFollow(filePath: string): Promise<FileReadResult> {
+  const pre = await fs.lstat(filePath);
+  if (pre.isSymbolicLink() || !pre.isFile()) {
+    throw new Error('不是普通文件');
+  }
+
+  const handle = await fs.open(filePath, openFlagsNoFollow());
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || !sameFileIdentity(pre, before)) {
+      throw new Error('文件在检查与打开之间被替换或修改');
+    }
+    const buffer = await handle.readFile();
+    const after = await handle.stat();
+    if (buffer.length !== before.size || statChanged(before, after)) {
+      throw new Error('文件在读取期间发生变化');
+    }
+    return {
+      buffer,
+      sha256: crypto.createHash('sha256').update(buffer).digest('hex'),
+      size: buffer.length,
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+function tableKind(db: DatabaseSync, name: string): string | null {
+  const row = db
+    .prepare("SELECT type FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')")
+    .get(name) as { type?: string } | undefined;
+  return row?.type ?? null;
+}
+
+/**
+ * Core data tables must be ordinary tables. `sqlite_master.type` reports both
+ * ordinary and virtual tables as 'table', so reject `CREATE VIRTUAL TABLE` too;
+ * a same-named VIEW or virtual table must never be trusted as the schema.
+ */
+function isRealTable(db: DatabaseSync, name: string): boolean {
+  const row = db
+    .prepare("SELECT type, sql FROM sqlite_master WHERE name = ? AND type IN ('table', 'view')")
+    .get(name) as { type?: string; sql?: string } | undefined;
+  return (
+    row?.type === 'table' && !/^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(row.sql ?? '')
   );
 }
 
+/** `documents_fts` is an FTS5 virtual table, not an ordinary table/view. */
+function isFts5VirtualTable(db: DatabaseSync, name: string): boolean {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE name = ? AND type = 'table'")
+    .get(name) as { sql?: string } | undefined;
+  const sql = row?.sql ?? '';
+  return /^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(sql) && /\bfts5\b/i.test(sql);
+}
+
 function readSqliteHeader(filePath: string): Promise<{ valid: boolean; walMode: boolean }> {
-  return fs.open(filePath, 'r').then(async handle => {
+  return fs.open(filePath, openFlagsNoFollow()).then(async handle => {
     try {
       const buffer = Buffer.alloc(100);
       const { bytesRead } = await handle.read(buffer, 0, 100, 0);
@@ -573,6 +856,15 @@ export async function verifyBackupDirectory(
   const addCheck = (name: string, ok: boolean, detail?: string): void => {
     checks.push({ name, ok, ...(detail ? { detail } : {}) });
   };
+
+  if (process.platform === 'win32' || fsSync.constants.O_NOFOLLOW === undefined) {
+    warnings.push({
+      code: 'PLATFORM_NO_NOFOLLOW',
+      message:
+        '当前平台不提供 O_NOFOLLOW：验证读取在 lstat→open 之间仍存在最终组件符号链接替换窗口。' +
+        '读取仍通过 fstat、读取前后状态比较及 manifest SHA-256 校验，但该竞态未被完全消除。',
+    });
+  }
 
   // 1. Manifest is re-read from disk; never reuse in-memory creation state.
   const manifestPath = path.join(target.directory, BACKUP_MANIFEST_FILE_NAME);
@@ -667,48 +959,6 @@ export async function verifyBackupDirectory(
     databaseBytes > 0 ? `${databaseBytes} 字节` : undefined
   );
 
-  let fileHashFailures = 0;
-  for (const file of manifest.files) {
-    if (!layout.files.has(file.path)) continue;
-    const absolutePath = path.join(target.directory, ...file.path.split('/'));
-    try {
-      const actual = await hashFileNoFollow(absolutePath);
-      hashed.set(file.path, actual);
-      if (actual.size !== file.size) {
-        fileHashFailures++;
-        issues.push({
-          code: 'SIZE_MISMATCH',
-          path: file.path,
-          message: `文件大小与 manifest 不一致：${file.path}`,
-          expected: file.size,
-          actual: actual.size,
-        });
-      }
-      if (actual.sha256 !== file.sha256) {
-        fileHashFailures++;
-        issues.push({
-          code: 'HASH_MISMATCH',
-          path: file.path,
-          message: `文件 SHA-256 与 manifest 不一致：${file.path}`,
-          expected: file.sha256,
-          actual: actual.sha256,
-        });
-      }
-    } catch (err: any) {
-      fileHashFailures++;
-      issues.push({
-        code: 'HASH_FAILED',
-        path: file.path,
-        message: `文件无法计算 SHA-256：${file.path}：${err?.message || err}`,
-      });
-    }
-  }
-  addCheck(
-    'fileHashes',
-    fileHashFailures === 0 && !issues.some(issue => issue.code === 'MISSING_FILE'),
-    fileHashFailures === 0 ? `${hashed.size} 个文件` : `${fileHashFailures} 个失败`
-  );
-
   // 4. Database-level checks. A WAL-mode file is rejected rather than opened:
   //    a read-only open could otherwise create a -shm file inside the backup.
   let state: DatabaseBackupState | null = null;
@@ -771,7 +1021,8 @@ export async function verifyBackupDirectory(
           });
         }
 
-        const schemaVersion = getUserVersion(db);        const schemaOk = schemaVersion === manifest.schemaVersion;
+        const schemaVersion = getUserVersion(db);
+        const schemaOk = schemaVersion === manifest.schemaVersion;
         addCheck('schemaVersion', schemaOk, `${schemaVersion} / manifest ${manifest.schemaVersion}`);
         if (!schemaOk) {
           issues.push({
@@ -783,8 +1034,20 @@ export async function verifyBackupDirectory(
         }
 
         const database = db;
-        const missingTables = REQUIRED_TABLES.filter(table => !tableExists(database, table));
-        addCheck('requiredTables', missingTables.length === 0, missingTables.join(', ') || 'ok');
+        // Core data tables must be real tables. A same-named VIEW would pass
+        // SELECT queries but is not the committed schema and must never be
+        // trusted for a backup.
+        const coreTables = REQUIRED_TABLES.filter(table => table !== 'documents_fts');
+        const missingTables = coreTables.filter(table => tableKind(database, table) === null);
+        const nonRealCore = coreTables.filter(
+          table => tableKind(database, table) !== null && !isRealTable(database, table)
+        );
+        const coreTablesOk = missingTables.length === 0 && nonRealCore.length === 0;
+        addCheck(
+          'requiredTables',
+          coreTablesOk,
+          coreTablesOk ? 'ok' : [...missingTables, ...nonRealCore].join(', ')
+        );
         if (missingTables.length > 0) {
           issues.push({
             code: 'REQUIRED_TABLE_MISSING',
@@ -792,22 +1055,44 @@ export async function verifyBackupDirectory(
             actual: missingTables,
           });
         }
-
-        const sessionCount = Number(
-          (db.prepare('SELECT COUNT(*) AS c FROM sessions').get() as any)?.c || 0
-        );
-        addCheck('sessionsExcluded', sessionCount === 0, `${sessionCount} 行`);
-        if (sessionCount !== 0) {
+        if (nonRealCore.length > 0) {
           issues.push({
-            code: 'SESSIONS_NOT_EXCLUDED',
-            message: `数据库快照仍包含 ${sessionCount} 条 sessions 记录`,
-            actual: sessionCount,
+            code: 'REQUIRED_TABLE_NOT_REAL',
+            message: `数据库快照的核心数据表被 VIEW/虚拟表冒充：${nonRealCore.join(', ')}`,
+            actual: nonRealCore,
           });
         }
 
-        if (tableExists(db, 'asset_deletions')) {
+        // FTS is a separate contract: an FTS5 virtual table, not an ordinary
+        // table and not a view.
+        const ftsIsVirtual = isFts5VirtualTable(database, 'documents_fts');
+        addCheck('ftsSchema', ftsIsVirtual, ftsIsVirtual ? 'fts5 virtual table' : 'invalid');
+        if (!ftsIsVirtual) {
+          issues.push({
+            code: 'FTS_TABLE_INVALID',
+            message: 'documents_fts 不是 FTS5 虚拟表（可能是普通表或 VIEW）',
+          });
+        }
+
+        if (isRealTable(database, 'sessions')) {
+          const sessionCount = Number(
+            (database.prepare('SELECT COUNT(*) AS c FROM sessions').get() as any)?.c || 0
+          );
+          addCheck('sessionsExcluded', sessionCount === 0, `${sessionCount} 行`);
+          if (sessionCount !== 0) {
+            issues.push({
+              code: 'SESSIONS_NOT_EXCLUDED',
+              message: `数据库快照仍包含 ${sessionCount} 条 sessions 记录`,
+              actual: sessionCount,
+            });
+          }
+        } else {
+          addCheck('sessionsExcluded', false, 'sessions 不是真实表');
+        }
+
+        if (isRealTable(database, 'asset_deletions')) {
           const tombstones = Number(
-            (db.prepare('SELECT COUNT(*) AS c FROM asset_deletions').get() as any)?.c || 0
+            (database.prepare('SELECT COUNT(*) AS c FROM asset_deletions').get() as any)?.c || 0
           );
           addCheck('assetDeletions', tombstones === 0, `${tombstones} 行`);
           if (tombstones !== 0) {
@@ -819,23 +1104,76 @@ export async function verifyBackupDirectory(
           }
         }
 
-        if (tableExists(db, 'schema_migrations')) {
-          const maxVersion = Number(
-            (db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as any)?.v || 0
+        if (isRealTable(database, 'schema_migrations')) {
+          // Normal invariant (see migrations.ts):
+          //   user_version = max(schema_migrations.version)
+          //   and every version 1..user_version has an audit row.
+          // A newer audit row than user_version is impossible in normal code and
+          // is a hard issue. Missing/gapped audit rows mean the history cannot be
+          // proven; they are explicit warnings, never silently ignored.
+          const migrationRows = database
+            .prepare('SELECT version FROM schema_migrations ORDER BY version ASC')
+            .all() as Array<{ version: number }>;
+          const versions = Array.from(
+            new Set(
+              migrationRows
+                .map(row => Number(row.version))
+                .filter(version => Number.isSafeInteger(version) && version > 0)
+            )
+          ).sort((a, b) => a - b);
+          const maxVersion = versions.length > 0 ? versions[versions.length - 1] : 0;
+          const expectedVersions = Array.from(
+            { length: Math.max(schemaVersion, 0) },
+            (_value, index) => index + 1
           );
-          if (maxVersion !== 0 && maxVersion !== schemaVersion) {
+          const missingVersions = expectedVersions.filter(version => !versions.includes(version));
+          let migrationAuditOk = true;
+
+          if (versions.length === 0) {
+            migrationAuditOk = false;
             warnings.push({
-              code: 'SCHEMA_MIGRATION_AUDIT_MISMATCH',
-              message: `schema_migrations 最大版本 ${maxVersion} 与 user_version ${schemaVersion} 不一致`,
+              code: 'SCHEMA_MIGRATION_AUDIT_MISSING',
+              message: `schema_migrations 没有任何审计记录，无法证明 user_version=${schemaVersion} 的迁移历史`,
             });
+          } else {
+            if (maxVersion > schemaVersion) {
+              migrationAuditOk = false;
+              issues.push({
+                code: 'SCHEMA_MIGRATION_AUDIT_AHEAD',
+                message: `schema_migrations 最大版本 ${maxVersion} 高于 user_version ${schemaVersion}`,
+                expected: schemaVersion,
+                actual: maxVersion,
+              });
+            } else if (maxVersion < schemaVersion) {
+              migrationAuditOk = false;
+              warnings.push({
+                code: 'SCHEMA_MIGRATION_AUDIT_INCOMPLETE',
+                message: `schema_migrations 最大版本 ${maxVersion} 低于 user_version ${schemaVersion}，迁移审计不完整`,
+                expected: schemaVersion,
+                actual: maxVersion,
+              });
+            }
+            if (missingVersions.length > 0) {
+              migrationAuditOk = false;
+              warnings.push({
+                code: 'SCHEMA_MIGRATION_AUDIT_GAPS',
+                message: `schema_migrations 缺少版本记录：${missingVersions.join(', ')}`,
+                details: { missingVersions },
+              });
+            }
           }
+          addCheck('migrationAudit', migrationAuditOk, migrationAuditOk ? 'ok' : 'mismatch');
         }
 
-        state = loadDatabaseBackupState(db);
-        addCheck('databaseState', true);
+        if (coreTablesOk) {
+          state = loadDatabaseBackupState(database);
+          addCheck('databaseState', true);
+        } else {
+          addCheck('databaseState', false, '核心数据表缺失或被 VIEW 冒充');
+        }
 
-        if (tableExists(db, 'documents_fts')) {
-          ftsRows = db
+        if (ftsIsVirtual) {
+          ftsRows = database
             .prepare('SELECT document_id, body FROM documents_fts')
             .all() as Array<{ document_id: string; body: string }>;
         }
@@ -861,6 +1199,9 @@ export async function verifyBackupDirectory(
   if (state) {
     const expectedPaths = expectedManagedFilePaths(state);
     const manifestPaths = new Set(manifest.files.map(file => file.path));
+    const documentPaths = new Set(state.documents.map(document => document.canonicalPath));
+    const revisionPaths = new Set(state.revisions.map(revision => revision.canonicalPath));
+    const assetPaths = new Set(state.assets.map(asset => asset.canonicalPath));
 
     for (const relativePath of expectedPaths) {
       if (!manifestPaths.has(relativePath)) {
@@ -869,6 +1210,9 @@ export async function verifyBackupDirectory(
           path: relativePath,
           message: `数据库引用但 manifest 未打包的文件：${relativePath}`,
         });
+        if (documentPaths.has(relativePath)) documentsOk = false;
+        if (revisionPaths.has(relativePath)) revisionsOk = false;
+        if (assetPaths.has(relativePath)) assetsOk = false;
       }
     }
     for (const relativePath of manifestPaths) {
@@ -882,194 +1226,130 @@ export async function verifyBackupDirectory(
     }
 
     const manifestByPath = new Map(manifest.files.map(file => [file.path, file]));
+    const documentByPath = new Map(
+      state.documents.map(document => [document.canonicalPath, document])
+    );
+    const revisionByPath = new Map(
+      state.revisions.map(revision => [revision.canonicalPath, revision])
+    );
     const assetIds = new Set(state.assets.map(asset => asset.id));
     const bodyByDocumentId = new Map<string, string>();
 
-    // Documents: full-file commit hash, body hash and frontmatter mapping.
-    for (const document of state.documents) {
-      const entry = manifestByPath.get(document.canonicalPath);
-      if (!entry) {
-        documentsOk = false;
+    // One read for each document/revision: the SHA-256 and the parsed
+    // frontmatter/body come from the same buffer. The manifest hash is checked
+    // against that buffer before any semantic decision is made.
+    let fileHashFailures = 0;
+    for (const file of manifest.files) {
+      const document = documentByPath.get(file.path);
+      const revision = revisionByPath.get(file.path);
+      if (!layout.files.has(file.path)) {
+        if (document) documentsOk = false;
+        if (revision) revisionsOk = false;
+        if (assetPaths.has(file.path)) assetsOk = false;
+        continue;
+      }
+      const absolutePath = path.join(target.directory, ...file.path.split('/'));
+
+      if (document || revision) {
+        let read: FileReadResult;
+        try {
+          read = await readFileNoFollow(absolutePath);
+        } catch (err: any) {
+          fileHashFailures++;
+          if (document) documentsOk = false;
+          if (revision) revisionsOk = false;
+          issues.push({
+            code: 'CONTENT_READ_FAILED',
+            path: file.path,
+            message: `文件无法安全读取：${file.path}：${err?.message || err}`,
+          });
+          continue;
+        }
+
+        hashed.set(file.path, { sha256: read.sha256, size: read.size });
+        if (read.size !== file.size) {
+          fileHashFailures++;
+          issues.push({
+            code: 'SIZE_MISMATCH',
+            path: file.path,
+            message: `文件大小与 manifest 不一致：${file.path}`,
+            expected: file.size,
+            actual: read.size,
+          });
+        }
+        if (read.sha256 !== file.sha256) {
+          fileHashFailures++;
+          issues.push({
+            code: 'HASH_MISMATCH',
+            path: file.path,
+            message: `文件 SHA-256 与 manifest 不一致：${file.path}`,
+            expected: file.sha256,
+            actual: read.sha256,
+          });
+        }
+
+        // Parse the exact bytes whose hash was just computed above.
+        await options.testHooks?.afterFileRead?.(file.path);
+        const raw = read.buffer.toString('utf-8');
+        if (document) {
+          if (
+            !verifyDocumentContent({
+              document,
+              raw,
+              actualSha256: read.sha256,
+              issues,
+              bodyByDocumentId,
+            })
+          ) {
+            documentsOk = false;
+          }
+        } else if (revision) {
+          if (!verifyRevisionContent({ revision, raw, issues })) {
+            revisionsOk = false;
+          }
+        }
         continue;
       }
 
-      const absolutePath = path.join(target.directory, ...document.canonicalPath.split('/'));
-      let raw: string;
+      // Assets and any manifest path without database semantics are hashed by
+      // streaming; they have no frontmatter to parse.
       try {
-        raw = await fs.readFile(absolutePath, 'utf-8');
+        const actual = await hashFileNoFollow(absolutePath);
+        hashed.set(file.path, actual);
+        if (actual.size !== file.size) {
+          fileHashFailures++;
+          issues.push({
+            code: 'SIZE_MISMATCH',
+            path: file.path,
+            message: `文件大小与 manifest 不一致：${file.path}`,
+            expected: file.size,
+            actual: actual.size,
+          });
+        }
+        if (actual.sha256 !== file.sha256) {
+          fileHashFailures++;
+          issues.push({
+            code: 'HASH_MISMATCH',
+            path: file.path,
+            message: `文件 SHA-256 与 manifest 不一致：${file.path}`,
+            expected: file.sha256,
+            actual: actual.sha256,
+          });
+        }
       } catch (err: any) {
-        documentsOk = false;
+        fileHashFailures++;
         issues.push({
-          code: 'DOCUMENT_READ_FAILED',
-          path: document.canonicalPath,
-          message: `文档 Markdown 无法读取：${document.id}：${err?.message || err}`,
-        });
-        continue;
-      }
-
-      if (entry.sha256 !== document.documentHash) {
-        documentsOk = false;
-        issues.push({
-          code: 'DOCUMENT_HASH_MISMATCH',
-          path: document.canonicalPath,
-          message: `文档 ${document.id} 的 document_hash 与快照内容不一致`,
-          expected: document.documentHash,
-          actual: entry.sha256,
-        });
-      }
-
-      const { frontmatter, body } = parseFrontmatter(raw);
-      bodyByDocumentId.set(document.id, body);
-
-      const bodyHash = calculateContentHash(body);
-      if (bodyHash !== document.contentHash) {
-        documentsOk = false;
-        issues.push({
-          code: 'DOCUMENT_CONTENT_HASH_MISMATCH',
-          path: document.canonicalPath,
-          message: `文档 ${document.id} 的正文哈希与数据库 content_hash 不一致`,
-          expected: document.contentHash,
-          actual: bodyHash,
-        });
-      }
-
-      const frontmatterId = decodeFrontmatterString(frontmatter.id);
-      if (frontmatterId === null) {
-        documentsOk = false;
-        issues.push({
-          code: 'DOCUMENT_FRONTMATTER_ID_MISSING',
-          path: document.canonicalPath,
-          message: `文档 ${document.id} 的 frontmatter 缺少 id`,
-        });
-      } else if (frontmatterId !== document.id) {
-        documentsOk = false;
-        issues.push({
-          code: 'DOCUMENT_FRONTMATTER_ID_MISMATCH',
-          path: document.canonicalPath,
-          message: `文档 ${document.id} 的 frontmatter id 不一致`,
-          expected: document.id,
-          actual: frontmatterId,
-        });
-      }
-
-      const frontmatterContentHash = decodeFrontmatterString(frontmatter.content_hash);
-      if (frontmatterContentHash === null) {
-        documentsOk = false;
-        issues.push({
-          code: 'DOCUMENT_FRONTMATTER_CONTENT_HASH_MISSING',
-          path: document.canonicalPath,
-          message: `文档 ${document.id} 的 frontmatter 缺少 content_hash`,
-        });
-      } else if (frontmatterContentHash !== document.contentHash) {
-        documentsOk = false;
-        issues.push({
-          code: 'DOCUMENT_FRONTMATTER_CONTENT_HASH_MISMATCH',
-          path: document.canonicalPath,
-          message: `文档 ${document.id} 的 frontmatter content_hash 与数据库不一致`,
-          expected: document.contentHash,
-          actual: frontmatterContentHash,
-        });
-      }
-
-      const frontmatterTitle = decodeFrontmatterString(frontmatter.title);
-      if (frontmatterTitle !== null && frontmatterTitle !== document.title) {
-        documentsOk = false;
-        issues.push({
-          code: 'DOCUMENT_FRONTMATTER_TITLE_MISMATCH',
-          path: document.canonicalPath,
-          message: `文档 ${document.id} 的 frontmatter title 与数据库不一致`,
-          expected: document.title,
-          actual: frontmatterTitle,
+          code: 'HASH_FAILED',
+          path: file.path,
+          message: `文件无法计算 SHA-256：${file.path}：${err?.message || err}`,
         });
       }
     }
-
-    // Revisions: body hash plus the real frontmatter contract (id is the
-    // document id; content_hash is the body hash; title is the version title).
-    for (const revision of state.revisions) {
-      const entry = manifestByPath.get(revision.canonicalPath);
-      if (!entry) {
-        revisionsOk = false;
-        continue;
-      }
-
-      const absolutePath = path.join(target.directory, ...revision.canonicalPath.split('/'));
-      let raw: string;
-      try {
-        raw = await fs.readFile(absolutePath, 'utf-8');
-      } catch (err: any) {
-        revisionsOk = false;
-        issues.push({
-          code: 'REVISION_READ_FAILED',
-          path: revision.canonicalPath,
-          message: `历史版本快照无法读取：${revision.id}：${err?.message || err}`,
-        });
-        continue;
-      }
-
-      const { frontmatter, body } = parseFrontmatter(raw);
-      const bodyHash = calculateContentHash(body);
-      if (bodyHash !== revision.contentHash) {
-        revisionsOk = false;
-        issues.push({
-          code: 'REVISION_CONTENT_HASH_MISMATCH',
-          path: revision.canonicalPath,
-          message: `历史版本 ${revision.id} 的正文哈希与数据库 content_hash 不一致`,
-          expected: revision.contentHash,
-          actual: bodyHash,
-        });
-      }
-
-      const frontmatterId = decodeFrontmatterString(frontmatter.id);
-      if (frontmatterId === null) {
-        revisionsOk = false;
-        issues.push({
-          code: 'REVISION_FRONTMATTER_ID_MISSING',
-          path: revision.canonicalPath,
-          message: `历史版本 ${revision.id} 的 frontmatter 缺少 id`,
-        });
-      } else if (frontmatterId !== revision.documentId) {
-        revisionsOk = false;
-        issues.push({
-          code: 'REVISION_FRONTMATTER_ID_MISMATCH',
-          path: revision.canonicalPath,
-          message: `历史版本 ${revision.id} 的 frontmatter id 与所属文档不一致`,
-          expected: revision.documentId,
-          actual: frontmatterId,
-        });
-      }
-
-      const frontmatterContentHash = decodeFrontmatterString(frontmatter.content_hash);
-      if (frontmatterContentHash === null) {
-        revisionsOk = false;
-        issues.push({
-          code: 'REVISION_FRONTMATTER_CONTENT_HASH_MISSING',
-          path: revision.canonicalPath,
-          message: `历史版本 ${revision.id} 的 frontmatter 缺少 content_hash`,
-        });
-      } else if (frontmatterContentHash !== revision.contentHash) {
-        revisionsOk = false;
-        issues.push({
-          code: 'REVISION_FRONTMATTER_CONTENT_HASH_MISMATCH',
-          path: revision.canonicalPath,
-          message: `历史版本 ${revision.id} 的 frontmatter content_hash 与数据库不一致`,
-          expected: revision.contentHash,
-          actual: frontmatterContentHash,
-        });
-      }
-
-      const frontmatterTitle = decodeFrontmatterString(frontmatter.title);
-      if (frontmatterTitle !== null && frontmatterTitle !== revision.title) {
-        revisionsOk = false;
-        issues.push({
-          code: 'REVISION_FRONTMATTER_TITLE_MISMATCH',
-          path: revision.canonicalPath,
-          message: `历史版本 ${revision.id} 的 frontmatter title 与数据库不一致`,
-          expected: revision.title,
-          actual: frontmatterTitle,
-        });
-      }
-    }
+    addCheck(
+      'fileHashes',
+      fileHashFailures === 0 && !issues.some(issue => issue.code === 'MISSING_FILE'),
+      fileHashFailures === 0 ? `${hashed.size} 个文件` : `${fileHashFailures} 个失败`
+    );
 
     // Assets: size and the complete SHA-256 anchor. Empty checksums are never
     // silently skipped; an uncalibrated attachment blocks formal verification.
@@ -1189,6 +1469,50 @@ export async function verifyBackupDirectory(
       }
     }
   } else {
+    // Database state is unusable, but the packaged file hashes must still be
+    // verified against the manifest.
+    let fileHashFailures = 0;
+    for (const file of manifest.files) {
+      if (!layout.files.has(file.path)) continue;
+      const absolutePath = path.join(target.directory, ...file.path.split('/'));
+      try {
+        const actual = await hashFileNoFollow(absolutePath);
+        hashed.set(file.path, actual);
+        if (actual.size !== file.size) {
+          fileHashFailures++;
+          issues.push({
+            code: 'SIZE_MISMATCH',
+            path: file.path,
+            message: `文件大小与 manifest 不一致：${file.path}`,
+            expected: file.size,
+            actual: actual.size,
+          });
+        }
+        if (actual.sha256 !== file.sha256) {
+          fileHashFailures++;
+          issues.push({
+            code: 'HASH_MISMATCH',
+            path: file.path,
+            message: `文件 SHA-256 与 manifest 不一致：${file.path}`,
+            expected: file.sha256,
+            actual: actual.sha256,
+          });
+        }
+      } catch (err: any) {
+        fileHashFailures++;
+        issues.push({
+          code: 'HASH_FAILED',
+          path: file.path,
+          message: `文件无法计算 SHA-256：${file.path}：${err?.message || err}`,
+        });
+      }
+    }
+    addCheck(
+      'fileHashes',
+      fileHashFailures === 0 && !issues.some(issue => issue.code === 'MISSING_FILE'),
+      fileHashFailures === 0 ? `${hashed.size} 个文件` : `${fileHashFailures} 个失败`
+    );
+
     documentsOk = false;
     revisionsOk = false;
     assetsOk = false;

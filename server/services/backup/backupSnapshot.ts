@@ -189,9 +189,220 @@ export async function sha256File(filePath: string): Promise<string> {
   return hash.digest('hex');
 }
 
-async function defaultCopyFile(source: string, destination: string): Promise<void> {
-  // COPYFILE_EXCL: a snapshot must never silently overwrite an existing file.
-  await fs.copyFile(source, destination, fsSync.constants.COPYFILE_EXCL);
+function statChanged(before: fsSync.Stats, after: fsSync.Stats): boolean {
+  return (
+    before.size !== after.size ||
+    before.mtimeMs !== after.mtimeMs ||
+    before.ctimeMs !== after.ctimeMs ||
+    before.ino !== after.ino
+  );
+}
+
+function openFlagsNoFollow(): number {
+  const noFollow =
+    process.platform === 'win32' || fsSync.constants.O_NOFOLLOW === undefined
+      ? 0
+      : fsSync.constants.O_NOFOLLOW;
+  return fsSync.constants.O_RDONLY | noFollow;
+}
+
+/**
+ * Copies one source file through an already-opened file descriptor.
+ *
+ * The source is opened with O_NOFOLLOW (POSIX), fstat'ed, read exclusively from
+ * that handle, and fstat'ed again afterwards. The destination is written through
+ * a private `wx+` handle, then read back from the same handle and hashed. Any
+ * size/inode/mtime change on the source, a short/long read, or a destination hash
+ * mismatch aborts the backup.
+ *
+ * Windows cannot express O_NOFOLLOW through Node. The final lstat→open window
+ * therefore remains a documented residual race; O_NOFOLLOW-free copying is still
+ * fstat/realpath checked and hash-verified, but it must not be described as a
+ * complete elimination of the path-swap race there.
+ */
+async function safeCopyFile(params: {
+  sourcePath: string;
+  destinationPath: string;
+  expectedStat: fsSync.Stats;
+  storageRootReal: string;
+  relativePath: string;
+  onChunk?: (bytesReadTotal: number) => Promise<void>;
+}): Promise<void> {
+  let sourceHandle: fs.FileHandle;
+  try {
+    sourceHandle = await fs.open(params.sourcePath, openFlagsNoFollow());
+  } catch (err: any) {
+    throw new BackupError(
+      'BACKUP_FILE_SNAPSHOT_FAILED',
+      `无法安全打开快照源文件：${params.relativePath}：${err?.message || err}`,
+      { path: params.relativePath },
+      { cause: err }
+    );
+  }
+
+  try {
+    const before = await sourceHandle.stat();
+    if (!before.isFile()) {
+      throw new BackupError(
+        'BACKUP_FILE_SNAPSHOT_FAILED',
+        `快照源文件句柄不是普通文件：${params.relativePath}`,
+        { path: params.relativePath }
+      );
+    }
+    if (
+      before.size !== params.expectedStat.size ||
+      before.ino !== params.expectedStat.ino ||
+      before.dev !== params.expectedStat.dev ||
+      before.mtimeMs !== params.expectedStat.mtimeMs
+    ) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `快照源文件在检查与打开之间被替换或修改：${params.relativePath}`,
+        {
+          path: params.relativePath,
+          expectedSize: params.expectedStat.size,
+          actualSize: before.size,
+          expectedIno: params.expectedStat.ino,
+          actualIno: before.ino,
+        }
+      );
+    }
+
+    // Re-check provenance after opening. On POSIX O_NOFOLLOW already rejects a
+    // final symlink; on Windows this narrows (but does not eliminate) the race.
+    let realPath: string;
+    try {
+      realPath = await fs.realpath(params.sourcePath);
+    } catch (err: any) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `无法解析快照源文件真实路径：${params.relativePath}：${err?.message || err}`,
+        { path: params.relativePath },
+        { cause: err }
+      );
+    }
+    if (!isStrictlyInside(params.storageRootReal, realPath)) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `快照源文件解析到存储目录之外（符号链接逃逸）：${params.relativePath}`,
+        { path: params.relativePath }
+      );
+    }
+
+    let destinationHandle: fs.FileHandle;
+    try {
+      destinationHandle = await fs.open(params.destinationPath, 'wx+');
+    } catch (err: any) {
+      throw new BackupError(
+        'BACKUP_FILE_SNAPSHOT_FAILED',
+        `无法创建快照目标文件：${params.relativePath}：${err?.message || err}`,
+        { path: params.relativePath },
+        { cause: err }
+      );
+    }
+
+    try {
+      const chunk = Buffer.alloc(64 * 1024);
+      let position = 0;
+      let bytesReadTotal = 0;
+      const sourceHash = crypto.createHash('sha256');
+
+      while (position < before.size) {
+        const { bytesRead } = await sourceHandle.read(
+          chunk,
+          0,
+          Math.min(chunk.length, before.size - position),
+          position
+        );
+        if (bytesRead <= 0) break;
+
+        const block = chunk.subarray(0, bytesRead);
+        sourceHash.update(block);
+        bytesReadTotal += bytesRead;
+
+        let written = 0;
+        while (written < bytesRead) {
+          const { bytesWritten } = await destinationHandle.write(
+            block,
+            written,
+            bytesRead - written,
+            position + written
+          );
+          if (bytesWritten <= 0) break;
+          written += bytesWritten;
+        }
+        if (written !== bytesRead) {
+          throw new BackupError(
+            'BACKUP_FILE_SNAPSHOT_FAILED',
+            `快照目标文件写入不完整：${params.relativePath}`,
+            { path: params.relativePath, expectedBytes: bytesRead, writtenBytes: written }
+          );
+        }
+        position += bytesRead;
+        await params.onChunk?.(bytesReadTotal);
+      }
+
+      const after = await sourceHandle.stat();
+      if (bytesReadTotal !== before.size || statChanged(before, after)) {
+        throw new BackupError(
+          'BACKUP_INCONSISTENT_STATE',
+          `快照源文件在复制期间发生变化：${params.relativePath}`,
+          {
+            path: params.relativePath,
+            expectedSize: before.size,
+            actualSize: after.size,
+            bytesRead: bytesReadTotal,
+          }
+        );
+      }
+
+      const destinationStat = await destinationHandle.stat();
+      if (!destinationStat.isFile() || destinationStat.size !== bytesReadTotal) {
+        throw new BackupError(
+          'BACKUP_FILE_SNAPSHOT_FAILED',
+          `快照目标文件大小不一致：${params.relativePath}（期望 ${bytesReadTotal} 字节，实际 ${destinationStat.size}）`,
+          {
+            path: params.relativePath,
+            expectedSize: bytesReadTotal,
+            actualSize: destinationStat.size,
+          }
+        );
+      }
+
+      // Read the destination back through the same private handle and compare
+      // the actual copied bytes with the bytes hashed from the source handle.
+      const destinationHash = crypto.createHash('sha256');
+      let verifyPosition = 0;
+      while (verifyPosition < bytesReadTotal) {
+        const { bytesRead } = await destinationHandle.read(
+          chunk,
+          0,
+          Math.min(chunk.length, bytesReadTotal - verifyPosition),
+          verifyPosition
+        );
+        if (bytesRead <= 0) break;
+        destinationHash.update(chunk.subarray(0, bytesRead));
+        verifyPosition += bytesRead;
+      }
+      const sourceDigest = sourceHash.digest('hex');
+      const destinationDigest = destinationHash.digest('hex');
+      if (verifyPosition !== bytesReadTotal || sourceDigest !== destinationDigest) {
+        throw new BackupError(
+          'BACKUP_FILE_SNAPSHOT_FAILED',
+          `快照复制内容校验失败：${params.relativePath}`,
+          {
+            path: params.relativePath,
+            sourceSha256: sourceDigest,
+            destinationSha256: destinationDigest,
+          }
+        );
+      }
+    } finally {
+      await destinationHandle.close().catch(() => {});
+    }
+  } finally {
+    await sourceHandle.close().catch(() => {});
+  }
 }
 
 function resolveSnapshotDestination(stagingDir: string, relativePath: string): string {
@@ -221,7 +432,7 @@ function isStrictlyInside(root: string, candidate: string): boolean {
 async function assertSnapshotSourceUnchanged(
   file: SnapshotInventoryEntry,
   storageRootReal: string
-): Promise<void> {
+): Promise<fsSync.Stats> {
   let stat: fsSync.Stats;
   try {
     stat = await fs.lstat(file.absolutePath);
@@ -266,6 +477,7 @@ async function assertSnapshotSourceUnchanged(
       { path: file.relativePath }
     );
   }
+  return stat;
 }
 
 /**
@@ -301,10 +513,20 @@ export async function createFileSnapshot(params: {
   forceCopy?: boolean;
   linkFile?: (source: string, destination: string) => Promise<void>;
   copyFile?: (source: string, destination: string) => Promise<void>;
-}): Promise<{ entries: BackupFileEntry[]; mode: SnapshotMode }> {
+  /** Test/diagnostic hook: runs after source pre-checks and before open/link. */
+  beforeSourceOpen?: (relativePath: string, absolutePath: string) => Promise<void>;
+  /** Test/diagnostic hook: runs after each copied 64 KiB chunk. */
+  afterSourceCopyChunk?: (relativePath: string, bytesReadTotal: number) => Promise<void>;
+}): Promise<{ entries: BackupFileEntry[]; mode: SnapshotMode; warnings: string[] }> {
   const linkFile = params.linkFile ?? fs.link;
-  const copyFile = params.copyFile ?? defaultCopyFile;
   const useHardlinks = params.useHardlinks === true && params.forceCopy !== true;
+  const warnings: string[] = [];
+  if (!useHardlinks && (process.platform === 'win32' || fsSync.constants.O_NOFOLLOW === undefined)) {
+    warnings.push(
+      '当前平台无法使用 O_NOFOLLOW：源文件在 lstat 检查与 open 之间仍存在符号链接替换窗口。' +
+        '复制内容仍通过句柄 fstat、前后状态比较和 SHA-256 回读校验，但该竞态未被完全消除。'
+    );
+  }
   let storageRootReal: string;
   try {
     storageRootReal = await fs.realpath(params.storageRoot);
@@ -321,7 +543,8 @@ export async function createFileSnapshot(params: {
   const entries: BackupFileEntry[] = [];
 
   for (const file of params.files) {
-    await assertSnapshotSourceUnchanged(file, storageRootReal);
+    const sourceStat = await assertSnapshotSourceUnchanged(file, storageRootReal);
+    await params.beforeSourceOpen?.(file.relativePath, file.absolutePath);
     const destination = resolveSnapshotDestination(params.stagingDir, file.relativePath);
     await fs.mkdir(path.dirname(destination), { recursive: true });
 
@@ -337,11 +560,56 @@ export async function createFileSnapshot(params: {
       }
     }
 
-    if (!usedHardlink) {
+    if (usedHardlink) {
+      // The link itself is path-based; re-check the source immediately after it
+      // to detect a change during link creation. A final-component symlink swap
+      // remains a residual TOCTOU risk in hardlink mode (documented above).
+      let after: fsSync.Stats;
       try {
-        await copyFile(file.absolutePath, destination);
+        after = await fs.lstat(file.absolutePath);
+      } catch (err: any) {
+        throw new BackupError(
+          'BACKUP_INCONSISTENT_STATE',
+          `硬链接后源文件不可访问：${file.relativePath}：${err?.message || err}`,
+          { path: file.relativePath },
+          { cause: err }
+        );
+      }
+      // Creating a hardlink updates the inode ctime/nlink, so only compare the
+      // attributes that indicate a content replacement here.
+      if (
+        after.isSymbolicLink() ||
+        !after.isFile() ||
+        after.size !== sourceStat.size ||
+        after.mtimeMs !== sourceStat.mtimeMs ||
+        after.ino !== sourceStat.ino
+      ) {
+        throw new BackupError(
+          'BACKUP_INCONSISTENT_STATE',
+          `硬链接建立期间源文件发生变化：${file.relativePath}`,
+          { path: file.relativePath }
+        );
+      }
+      hardlinkCount++;
+    } else {
+      try {
+        if (params.copyFile) {
+          await params.copyFile(file.absolutePath, destination);
+        } else {
+          await safeCopyFile({
+            sourcePath: file.absolutePath,
+            destinationPath: destination,
+            expectedStat: sourceStat,
+            storageRootReal,
+            relativePath: file.relativePath,
+            onChunk: params.afterSourceCopyChunk
+              ? bytesReadTotal => params.afterSourceCopyChunk!(file.relativePath, bytesReadTotal)
+              : undefined,
+          });
+        }
         copyCount++;
       } catch (err: any) {
+        if (err instanceof BackupError) throw err;
         throw new BackupError(
           'BACKUP_FILE_SNAPSHOT_FAILED',
           `复制快照文件失败：${file.relativePath}：${err?.message || err}`,
@@ -349,8 +617,6 @@ export async function createFileSnapshot(params: {
           { cause: err }
         );
       }
-    } else {
-      hardlinkCount++;
     }
 
     const stat = await fs.lstat(destination).catch((err: any) => {
@@ -386,7 +652,7 @@ export async function createFileSnapshot(params: {
   else if (hardlinkCount === 0) mode = 'copy';
   else mode = 'mixed';
 
-  return { entries, mode };
+  return { entries, mode, warnings };
 }
 
 async function walkSnapshotDirectory(
