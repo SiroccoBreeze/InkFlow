@@ -22,7 +22,7 @@ export const CRITICAL_TABLES = [
 
 export type CriticalTable = (typeof CRITICAL_TABLES)[number];
 
-const REQUIRED_TABLES = [
+export const REQUIRED_TABLES = [
   'users',
   'sessions',
   'categories',
@@ -44,6 +44,7 @@ export interface DatabaseBackupState {
   schemaVersion: number;
   documents: Array<{
     id: string;
+    title: string;
     canonicalPath: string;
     /** Full-file SHA-256 commit marker. Required after pending-save recovery. */
     documentHash: string;
@@ -53,6 +54,7 @@ export interface DatabaseBackupState {
   revisions: Array<{
     id: string;
     documentId: string;
+    title: string;
     canonicalPath: string;
     /** Body-only content hash stored in the revision row. */
     contentHash: string;
@@ -113,10 +115,10 @@ function canonicalAssetPath(raw: unknown, assetId: string): string {
 /** Reads and validates the production DB index used to cross-check the file snapshot. */
 export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
   const documentRows = db
-    .prepare('SELECT id, file_path, document_hash, content_hash FROM documents')
+    .prepare('SELECT id, title, file_path, document_hash, content_hash FROM documents')
     .all() as any[];
   const revisionRows = db
-    .prepare('SELECT id, document_id, snapshot_path, content_hash FROM document_revisions')
+    .prepare('SELECT id, document_id, title, snapshot_path, content_hash FROM document_revisions')
     .all() as any[];
   const assetRows = db.prepare('SELECT id, storage_path, size, checksum FROM assets').all() as any[];
   const associationRows = db
@@ -141,6 +143,7 @@ export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
     }
     return {
       id,
+      title: String(row.title ?? ''),
       canonicalPath: canonicalExpectedPath(row.file_path, `documents/${id}/index.md`, `文档 ${id} 的 file_path`),
       documentHash,
       contentHash,
@@ -160,6 +163,7 @@ export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
     return {
       id,
       documentId,
+      title: String(row.title ?? ''),
       contentHash,
       canonicalPath: canonicalExpectedPath(
         row.snapshot_path,
@@ -247,6 +251,19 @@ export function loadDatabaseBackupState(db: DatabaseSync): DatabaseBackupState {
     documentAssetIds,
     criticalCounts,
   };
+}
+
+/**
+ * The exact set of managed files a consistent snapshot may contain, derived from
+ * the database rows. Anything else under documents/, revisions/ or assets/ is
+ * unknown data and must not be packaged (or accepted by verification).
+ */
+export function expectedManagedFilePaths(state: DatabaseBackupState): Set<string> {
+  return new Set<string>([
+    ...state.documents.map(document => document.canonicalPath),
+    ...state.revisions.map(revision => revision.canonicalPath),
+    ...state.assets.map(asset => asset.canonicalPath),
+  ]);
 }
 
 function assertSamePathSet(
@@ -352,6 +369,45 @@ export function assertDatabaseMatchesInventory(
       );
     }
   }
+
+  // Reject unknown files inside a managed root. This closes the gap where an
+  // extra file inside an existing document/revision folder used to be packaged
+  // without any database row describing it.
+  const expectedPaths = expectedManagedFilePaths(state);
+  const unknownPaths = inventory
+    .map(file => file.relativePath)
+    .filter(relativePath => !expectedPaths.has(relativePath))
+    .sort();
+  if (unknownPaths.length > 0) {
+    throw new BackupError(
+      'BACKUP_INCONSISTENT_STATE',
+      `受管目录中存在数据库未登记的文件，拒绝创建备份（${unknownPaths.length} 项）。` +
+        '请先确认/清理这些文件，不要把它们打包进快照。',
+      { unknownPaths }
+    );
+  }
+}
+
+/**
+ * Computes the asset references a document body declares.
+ *
+ * `missing` lists referenced IDs that have no `assets` row. They must be treated
+ * as an error: filtering them out (as the old implementation did) would let a
+ * backup succeed while packing a document whose attachment can never be restored.
+ */
+export function computeDocumentAssetReferences(
+  body: string,
+  assetIds: ReadonlySet<string>
+): { expected: Set<string>; missing: string[] } {
+  const referenced = extractAssetReferences(body);
+  const expected = new Set<string>();
+  const missing: string[] = [];
+  for (const assetId of referenced) {
+    if (assetIds.has(assetId)) expected.add(assetId);
+    else missing.push(assetId);
+  }
+  missing.sort();
+  return { expected, missing };
 }
 
 /**
@@ -405,9 +461,17 @@ export async function assertAssetAssociationsMatchMarkdown(
       );
     }
 
-    const expected = new Set(
-      extractAssetReferences(body).filter(assetId => assetIds.has(assetId))
-    );
+    const { expected, missing: missingAssetReferences } =
+      computeDocumentAssetReferences(body, assetIds);
+    if (missingAssetReferences.length > 0) {
+      throw new BackupError(
+        'BACKUP_INCONSISTENT_STATE',
+        `文档 ${document.id} 引用了数据库中不存在的附件，拒绝创建备份：` +
+          `${missingAssetReferences.join(', ')}。请先修复引用或运行附件对账。`,
+        { documentId: document.id, missingAssetReferences }
+      );
+    }
+
     const actual = state.documentAssetIds.get(document.id) ?? new Set<string>();
     const missing = [...expected].filter(assetId => !actual.has(assetId)).sort();
     const extra = [...actual].filter(assetId => !expected.has(assetId)).sort();

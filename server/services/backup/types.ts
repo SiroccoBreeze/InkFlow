@@ -1,4 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
+import type { BackupVerificationReport } from './backupVerifier';
 
 /**
  * Backup snapshot package format (V1.2 Batch 2A).
@@ -67,7 +68,9 @@ export type BackupErrorCode =
   | 'BACKUP_FILE_SNAPSHOT_FAILED'
   | 'BACKUP_MANIFEST_INVALID'
   | 'BACKUP_STAGING_FAILED'
-  | 'BACKUP_UNSUPPORTED';
+  | 'BACKUP_UNSUPPORTED'
+  | 'BACKUP_VERIFICATION_FAILED'
+  | 'BACKUP_VERIFICATION_TARGET_INVALID';
 
 export class BackupError extends Error {
   public readonly code: BackupErrorCode;
@@ -89,8 +92,18 @@ export class BackupError extends Error {
 /** Injectable filesystem/database operations (defaults are production safe). */
 export interface CreateBackupOptions {
   /**
-   * Force copy snapshots. Hardlinks are never attempted. Useful for filesystems
-   * where the caller already knows hardlinks are unavailable.
+   * Opt into hardlink-first snapshots (with copy fallback).
+   *
+   * Default: false. A backup must be an independent copy. Hardlinked snapshots
+   * share inodes with the production files, so any in-place modification of a
+   * source file (a text editor, `>` redirection, `rsync --inplace`, a sync tool,
+   * or a future writer that truncates instead of renaming) would corrupt the
+   * backup and the live file at the same time. Hardlinks are therefore a fast
+   * mode, not an independent or immutable backup.
+   */
+  useHardlinks?: boolean;
+  /**
+   * @deprecated Use `useHardlinks` instead. When true, always forces copy mode.
    */
   forceCopy?: boolean;
   /** Test/diagnostic injection; defaults to fs.link. */
@@ -99,6 +112,12 @@ export interface CreateBackupOptions {
   copyFile?: (source: string, destination: string) => Promise<void>;
   /** Test/diagnostic injection; defaults to node:sqlite backup(). */
   backupDatabase?: (source: DatabaseSync, destination: string) => Promise<number>;
+  /**
+   * Test/diagnostic hook invoked after the manifest has been written and before
+   * the staged snapshot is re-read and verified for publication. Production
+   * callers never set it.
+   */
+  beforePublishVerification?: (stagingDir: string, manifest: BackupManifest) => Promise<void>;
 }
 
 export interface BackupSnapshotResult {
@@ -107,4 +126,10 @@ export interface BackupSnapshotResult {
   directory: string;
   manifestPath: string;
   manifest: BackupManifest;
+  /**
+   * Result of the pre-publication verification. The same report shape is
+   * returned by `verifyBackupSnapshot()` for published backups; it records the
+   * effective snapshotMode and any hardlink warning.
+   */
+  verification: BackupVerificationReport;
 }

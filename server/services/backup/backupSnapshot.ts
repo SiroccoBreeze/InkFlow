@@ -271,20 +271,19 @@ async function assertSnapshotSourceUnchanged(
 /**
  * Materialises the file inventory inside `stagingDir`.
  *
- * HARD-LINK SAFETY AUDIT (V1.2 Batch 2A):
- *  - documents/<id>/index.md is written by `atomicWriteFile` (temp + rename) and the
- *    crash-recovery path restores it with `rename`; it is never truncated/appended
- *    in place.
- *  - revisions/<docId>/<revisionId>.md is written by the same `atomicWriteFile`
- *    helper and removed with `unlink`; no in-place mutation exists.
- *  - assets/<file> is created with an exclusive `writeFile({ flag: 'wx' })`, never
- *    overwritten, and deleted with `unlink`. Reconciliation only inserts DB rows.
- * Because every future change replaces the directory entry instead of mutating the
- * inode, an existing hardlink keeps the snapshot's bytes immutable. Any future
- * in-place writer must switch this code to copy mode first.
+ * SNAPSHOT MODES (V1.2 Batch 2B):
+ *  - Default: independent COPY. Every backup file is a private inode, so a later
+ *    in-place write to a production file (or any external tool rewriting it)
+ *    cannot alter the backup.
+ *  - Opt-in `useHardlinks`: link first, copy on failure. This is a fast mode, NOT
+ *    an independent or immutable backup: the staged file and the production file
+ *    share one inode, so any in-place truncate/write corrupts both. Project code
+ *    currently only replaces directory entries (atomic temp+rename writes, `wx`
+ *    creation, unlink), but external/manual writers are outside that guarantee.
+ *    The manifest records the mode and verification reports a warning for it.
  *
  * Link failures (EXDEV, EPERM, unsupported filesystems, Windows restrictions) fall
- * back to a real copy file-by-file. The manifest records hardlink/copy/mixed.
+ * back to a real copy file-by-file. The manifest records the effective mode.
  *
  * Defence in depth: every inventory entry is lstat'ed and realpath-checked again
  * immediately before materialisation (regular file, still inside the real storage
@@ -296,12 +295,16 @@ export async function createFileSnapshot(params: {
   /** Real storage root used to verify that no source escaped through a symlink. */
   storageRoot: string;
   files: SnapshotInventoryEntry[];
+  /** Default false: independent copy. True: hardlink-first (not independent). */
+  useHardlinks?: boolean;
+  /** @deprecated Use `useHardlinks`; kept for existing callers/tests. */
   forceCopy?: boolean;
   linkFile?: (source: string, destination: string) => Promise<void>;
   copyFile?: (source: string, destination: string) => Promise<void>;
 }): Promise<{ entries: BackupFileEntry[]; mode: SnapshotMode }> {
   const linkFile = params.linkFile ?? fs.link;
   const copyFile = params.copyFile ?? defaultCopyFile;
+  const useHardlinks = params.useHardlinks === true && params.forceCopy !== true;
   let storageRootReal: string;
   try {
     storageRootReal = await fs.realpath(params.storageRoot);
@@ -323,7 +326,7 @@ export async function createFileSnapshot(params: {
     await fs.mkdir(path.dirname(destination), { recursive: true });
 
     let usedHardlink = false;
-    if (!params.forceCopy) {
+    if (useHardlinks) {
       try {
         await linkFile(file.absolutePath, destination);
         usedHardlink = true;
@@ -378,11 +381,10 @@ export async function createFileSnapshot(params: {
   }
 
   let mode: SnapshotMode;
-  if (copyCount === 0) mode = 'hardlink';
+  if (entries.length === 0 || !useHardlinks) mode = 'copy';
+  else if (copyCount === 0) mode = 'hardlink';
   else if (hardlinkCount === 0) mode = 'copy';
   else mode = 'mixed';
-  // An empty content snapshot claims neither strategy.
-  if (entries.length === 0) mode = 'copy';
 
   return { entries, mode };
 }
@@ -408,9 +410,12 @@ async function walkSnapshotDirectory(
 }
 
 /**
- * Final consistency check: the staging directory must contain exactly the files
- * described by the manifest plus manifest.json itself. Sizes must match. This
- * catches stray temp files, missing copies and accidental extra data.
+ * Legacy size-only layout check.
+ *
+ * Production creation and verification now use `backupVerifier`, which re-reads
+ * the manifest, rejects unknown/non-regular/symlink entries and recomputes every
+ * SHA-256. This helper is kept for low-level callers/tests that only need the
+ * path/size contract.
  */
 export async function verifySnapshotLayout(
   directory: string,

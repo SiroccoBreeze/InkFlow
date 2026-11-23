@@ -23,13 +23,13 @@ import {
   collectManagedFiles,
   createFileSnapshot,
   sha256File,
-  verifySnapshotLayout,
 } from './backupSnapshot';
 import {
   buildBackupManifest,
   getApplicationVersion,
   writeBackupManifest,
 } from './backupManifest';
+import { assertStagingSnapshotValid } from './backupVerifier';
 import {
   BACKUP_DATABASE_RELATIVE_PATH,
   BackupError,
@@ -331,9 +331,11 @@ export class BackupService {
    * Creates a complete snapshot directory under storage/backups/.
    *
    * Lifecycle: exclusive lease → pending recovery → DB/file preflight → SQLite
-   * online backup (sessions stripped) → file snapshot → manifest → layout check
-   * → atomic rename out of `.staging`. Any failure removes only this run's
-   * staging directory; production data is never deleted or repaired.
+   * online backup (sessions stripped) → file snapshot (independent copy by
+   * default) → manifest → independent staging verification (manifest re-read,
+   * all SHA-256 recomputed) → atomic rename out of `.staging`. Any failure
+   * removes only this run's staging directory; production data is never deleted
+   * or repaired. Batch 2B keeps the exclusive lease for the whole operation.
    */
   public async createBackupSnapshot(options: CreateBackupOptions = {}): Promise<BackupSnapshotResult> {
     return consistencyGate.withExclusive(async () => {
@@ -394,6 +396,7 @@ export class BackupService {
           stagingDir,
           storageRoot,
           files: inventory,
+          useHardlinks: options.useHardlinks,
           forceCopy: options.forceCopy,
           linkFile: options.linkFile,
           copyFile: options.copyFile,
@@ -416,7 +419,23 @@ export class BackupService {
           snapshotMode: mode,
         });
         await writeBackupManifest(stagingDir, manifest);
-        await verifySnapshotLayout(stagingDir, manifest);
+
+        // Publication gate: the staged directory is re-read from disk and every
+        // database/file SHA-256 is recomputed. A snapshot is never published
+        // based on creation-time memory state. This is the same verification
+        // path used later for already published backups.
+        await options.beforePublishVerification?.(stagingDir, manifest);
+        const verification = await assertStagingSnapshotValid(stagingDir, id);
+        if (JSON.stringify(verification.manifest) !== JSON.stringify(manifest)) {
+          throw new BackupError(
+            'BACKUP_VERIFICATION_FAILED',
+            '重新读取的 manifest 与写入前内容不一致，拒绝发布',
+            { stagingDir }
+          );
+        }
+        for (const warning of verification.warnings) {
+          console.warn(`[InkFlow Backup] ${warning.message}`);
+        }
 
         const finalDir = path.join(backupsRoot, id);
         if (fsSync.existsSync(finalDir)) {
@@ -441,6 +460,7 @@ export class BackupService {
           directory: finalDir,
           manifestPath: path.join(finalDir, 'manifest.json'),
           manifest,
+          verification,
         };
       } catch (err) {
         if (err instanceof BackupError) throw err;

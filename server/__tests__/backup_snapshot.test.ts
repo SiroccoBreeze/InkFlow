@@ -437,6 +437,7 @@ describe('V1.2 Batch 2A backup snapshot infrastructure', () => {
 
   it('falls back to copy when hardlinks are unsupported, and reports mixed mode', async () => {
     const allCopies = await backupService.createBackupSnapshot({
+      useHardlinks: true,
       linkFile: async () => {
         const err: any = new Error('simulated EXDEV');
         err.code = 'EXDEV';
@@ -452,6 +453,7 @@ describe('V1.2 Batch 2A backup snapshot infrastructure', () => {
     ).toContain('第二版正文');
 
     const mixed = await backupService.createBackupSnapshot({
+      useHardlinks: true,
       linkFile: async (source, destination) => {
         if (source.endsWith(path.join('doc_backup_base', 'index.md'))) {
           const err: any = new Error('simulated EPERM');
@@ -576,6 +578,8 @@ describe('V1.2 Batch 2A backup snapshot infrastructure', () => {
     let firstLink = true;
 
     const backupPromise = backupService.createBackupSnapshot({
+      // Opt into hardlink mode so the injected link barrier is exercised.
+      useHardlinks: true,
       linkFile: async (source, destination) => {
         if (firstLink) {
           firstLink = false;
