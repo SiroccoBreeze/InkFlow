@@ -978,4 +978,176 @@ describe('V1.2 Batch 2B-1 independent backup verifier', () => {
     expect(report.ok).toBe(false);
     expect(codes(report)).toContain('SCHEMA_MIGRATION_AUDIT_AHEAD');
   });
+
+  it('verifies SQLite semantics against the copied database, not the original path', async () => {
+    const result = await createBackup();
+    const sourcePath = snapshotDatabasePath(result.directory);
+    const originalBytes = fs.readFileSync(sourcePath);
+    const originalSha = crypto.createHash('sha256').update(originalBytes).digest('hex');
+
+    const tamperedPath = path.join(
+      os.tmpdir(),
+      `inkflow_verify_sessions_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.sqlite`
+    );
+    fs.writeFileSync(tamperedPath, originalBytes);
+    const tamperedDb = new DatabaseSync(tamperedPath);
+    try {
+      tamperedDb.prepare(
+        `INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(
+        'sess_temp_copy_probe',
+        ownerId,
+        crypto.randomBytes(32).toString('hex'),
+        new Date(Date.now() + 3600_000).toISOString(),
+        new Date().toISOString(),
+        new Date().toISOString()
+      );
+    } finally {
+      tamperedDb.close();
+    }
+    const tamperedBytes = fs.readFileSync(tamperedPath);
+
+    try {
+      let replaced = false;
+      const report = await verifyBackupSnapshot(result.id, {
+        testHooks: {
+          afterDatabaseCopy: async ({ sourcePath: hookPath, tempPath, sha256, size }) => {
+            expect(fs.readFileSync(tempPath)).toEqual(originalBytes);
+            expect(sha256).toBe(originalSha);
+            expect(size).toBe(originalBytes.length);
+            // Replace the original path after the copy/hash. SQLite checks must
+            // keep using the temp copy and must not report the injected session.
+            fs.writeFileSync(hookPath, tamperedBytes);
+            replaced = true;
+          },
+        },
+      });
+      expect(replaced).toBe(true);
+      expect(report.ok).toBe(true);
+      expect(codes(report)).not.toContain('SESSIONS_NOT_EXCLUDED');
+    } finally {
+      fs.writeFileSync(sourcePath, originalBytes, 'utf-8');
+      fs.rmSync(tamperedPath, { force: true });
+    }
+  });
+
+  it('does not reopen the original database path when it is replaced by a symlink', async () => {
+    const result = await createBackup();
+    const sourcePath = snapshotDatabasePath(result.directory);
+    const originalBytes = fs.readFileSync(sourcePath);
+    const outsidePath = path.join(
+      os.tmpdir(),
+      `inkflow_verify_outside_db_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.sqlite`
+    );
+    fs.writeFileSync(outsidePath, 'NOT-A-SQLITE-DATABASE', 'utf-8');
+
+    const probePath = path.join(testDataDir, 'db-symlink-probe');
+    try {
+      fs.symlinkSync(outsidePath, probePath);
+      fs.rmSync(probePath, { force: true });
+    } catch {
+      fs.rmSync(outsidePath, { force: true });
+      return;
+    }
+
+    try {
+      let replaced = false;
+      const report = await verifyBackupSnapshot(result.id, {
+        testHooks: {
+          afterDatabaseCopy: async ({ sourcePath: hookPath }) => {
+            fs.rmSync(hookPath, { force: true });
+            fs.symlinkSync(outsidePath, hookPath);
+            replaced = true;
+          },
+        },
+      });
+      expect(replaced).toBe(true);
+      expect(report.ok).toBe(true);
+    } finally {
+      fs.rmSync(sourcePath, { force: true });
+      fs.writeFileSync(sourcePath, originalBytes, 'utf-8');
+      fs.rmSync(outsidePath, { force: true });
+    }
+  });
+
+  it('cleans the private database verification temp directory after success and failure', async () => {
+    const success = await createBackup();
+    const sourcePath = snapshotDatabasePath(success.directory);
+    const beforeBytes = fs.readFileSync(sourcePath);
+    let successTemp = '';
+
+    const successReport = await verifyBackupSnapshot(success.id, {
+      testHooks: {
+        afterDatabaseCopy: async ({ tempDirectory }) => {
+          successTemp = tempDirectory;
+        },
+      },
+    });
+    expect(successReport.ok).toBe(true);
+    expect(successTemp).not.toBe('');
+    expect(fs.existsSync(successTemp)).toBe(false);
+    // The original backup database must be byte-identical after verification.
+    expect(fs.readFileSync(sourcePath)).toEqual(beforeBytes);
+
+    const failure = await createBackup();
+    let failureTemp = '';
+    const failureReport = await verifyBackupSnapshot(failure.id, {
+      testHooks: {
+        afterDatabaseCopy: async ({ tempDirectory, tempPath }) => {
+          failureTemp = tempDirectory;
+          // Corrupt only the temp object after it was hashed. SQLite checks must
+          // fail, and the temp directory must still be removed.
+          fs.truncateSync(tempPath, 0);
+        },
+      },
+    });
+    expect(failureReport.ok).toBe(false);
+    expect(failureTemp).not.toBe('');
+    expect(fs.existsSync(failureTemp)).toBe(false);
+  });
+
+  it('fails closed when the database verification temp directory cannot be created', async () => {
+    const result = await createBackup();
+    const blocker = path.join(
+      os.tmpdir(),
+      `inkflow_verify_blocker_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+    );
+    fs.writeFileSync(blocker, 'not-a-directory', 'utf-8');
+    try {
+      const report = await verifyBackupSnapshot(result.id, { tempRoot: blocker });
+      expect(report.ok).toBe(false);
+      expect(codes(report)).toContain('DATABASE_COPY_FAILED');
+      expect(report.checks.find(check => check.name === 'databaseHash')?.ok).toBe(false);
+    } finally {
+      fs.rmSync(blocker, { force: true });
+    }
+  });
+
+  it('records a warning when the private verification temp directory cannot be cleaned', async () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) {
+      // Windows ACLs and root privileges make chmod-based denial unreliable.
+      return;
+    }
+    const result = await createBackup();
+    let tempDirectory = '';
+    try {
+      const report = await verifyBackupSnapshot(result.id, {
+        testHooks: {
+          afterDatabaseCopy: async context => {
+            tempDirectory = context.tempDirectory;
+            fs.chmodSync(tempDirectory, 0o500);
+          },
+        },
+      });
+      expect(report.warnings.map(warning => warning.code)).toContain(
+        'VERIFICATION_TEMP_CLEANUP_FAILED'
+      );
+    } finally {
+      if (tempDirectory && fs.existsSync(tempDirectory)) {
+        fs.chmodSync(tempDirectory, 0o700);
+        fs.rmSync(tempDirectory, { recursive: true, force: true });
+      }
+    }
+  });
 });

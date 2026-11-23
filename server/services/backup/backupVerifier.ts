@@ -1,4 +1,5 @@
 import path from 'node:path';
+import os from 'node:os';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import crypto from 'node:crypto';
@@ -76,6 +77,8 @@ export interface BackupVerificationOptions {
   expectedId?: string;
   maxEntries?: number;
   maxManifestBytes?: number;
+  /** Diagnostic override for the private verification temp directory root. */
+  tempRoot?: string;
   /**
    * Test/diagnostic hook used to prove that verification does not hold the
    * consistency gate while it hashes files. Production callers never set it.
@@ -84,6 +87,18 @@ export interface BackupVerificationOptions {
     beforeHashing?: () => Promise<void>;
     /** Runs after a document/revision read+hash and before semantic parsing. */
     afterFileRead?: (relativePath: string) => Promise<void>;
+    /**
+     * Runs after the database has been copied/hashed into the private temp
+     * object, and before SQLite opens that temp copy. The hook may replace the
+     * original path; verification must keep using the already-copied bytes.
+     */
+    afterDatabaseCopy?: (context: {
+      sourcePath: string;
+      tempDirectory: string;
+      tempPath: string;
+      sha256: string;
+      size: number;
+    }) => Promise<void>;
   };
 }
 
@@ -815,21 +830,272 @@ function isFts5VirtualTable(db: DatabaseSync, name: string): boolean {
   return /^\s*CREATE\s+VIRTUAL\s+TABLE/i.test(sql) && /\bfts5\b/i.test(sql);
 }
 
-function readSqliteHeader(filePath: string): Promise<{ valid: boolean; walMode: boolean }> {
-  return fs.open(filePath, openFlagsNoFollow()).then(async handle => {
-    try {
-      const buffer = Buffer.alloc(100);
-      const { bytesRead } = await handle.read(buffer, 0, 100, 0);
-      if (bytesRead < 100) return { valid: false, walMode: false };
-      const magic = buffer.subarray(0, 16).toString('binary');
-      const valid = magic === 'SQLite format 3\u0000';
-      // Offset 18/19: file format write/read version. 2 means WAL.
-      const walMode = buffer[18] === 2 || buffer[19] === 2;
-      return { valid, walMode };
-    } finally {
-      await handle.close().catch(() => {});
-    }
+interface SqliteHeader {
+  valid: boolean;
+  walMode: boolean;
+}
+
+function parseSqliteHeader(buffer: Buffer): SqliteHeader {
+  if (buffer.length < 100) return { valid: false, walMode: false };
+  const magic = buffer.subarray(0, 16).toString('binary');
+  const valid = magic === 'SQLite format 3\u0000';
+  // Offset 18/19: file format write/read version. 2 means WAL.
+  const walMode = buffer[18] === 2 || buffer[19] === 2;
+  return { valid, walMode };
+}
+
+interface DatabaseTempCopy {
+  directory: string;
+  path: string;
+  sha256: string;
+  size: number;
+  header: SqliteHeader;
+}
+
+/**
+ * Copies the backup database through a no-follow source handle into a private,
+ * randomly named temp file. The SHA-256 and SQLite header are computed from the
+ * temp copy's actual bytes. All SQLite checks then use this temp path, never the
+ * original backup path again.
+ *
+ * The temp directory is created with mkdtemp (0700), the file with `wx` (0600),
+ * and only this function's own directory is ever removed.
+ */
+async function copyDatabaseForVerification(params: {
+  sourcePath: string;
+  backupDirectory: string;
+  tempRoot: string;
+}): Promise<DatabaseTempCopy> {
+  const pre = await fs.lstat(params.sourcePath).catch((err: any) => {
+    throw new BackupError(
+      'BACKUP_VERIFICATION_FAILED',
+      `数据库快照不可访问：${err?.message || err}`,
+      { path: params.sourcePath },
+      { cause: err }
+    );
   });
+  if (pre.isSymbolicLink() || !pre.isFile()) {
+    throw new BackupError(
+      'BACKUP_VERIFICATION_FAILED',
+      '数据库快照不是普通文件（拒绝跟随符号链接）',
+      { path: params.sourcePath }
+    );
+  }
+
+  let sourceHandle: fs.FileHandle;
+  try {
+    sourceHandle = await fs.open(params.sourcePath, openFlagsNoFollow());
+  } catch (err: any) {
+    throw new BackupError(
+      'BACKUP_VERIFICATION_FAILED',
+      `无法安全打开数据库快照：${err?.message || err}`,
+      { path: params.sourcePath },
+      { cause: err }
+    );
+  }
+
+  let tempDirectory: string | null = null;
+  let tempPath: string | null = null;
+  let tempHandle: fs.FileHandle | null = null;
+  let success = false;
+
+  try {
+    const before = await sourceHandle.stat();
+    if (!before.isFile() || !sameFileIdentity(pre, before)) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        '数据库快照在检查与打开之间被替换或修改',
+        { path: params.sourcePath }
+      );
+    }
+
+    let realSource: string;
+    try {
+      realSource = await fs.realpath(params.sourcePath);
+    } catch (err: any) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        `无法解析数据库快照真实路径：${err?.message || err}`,
+        { path: params.sourcePath },
+        { cause: err }
+      );
+    }
+    if (!isStrictlyInside(params.backupDirectory, realSource)) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        '数据库快照解析到备份目录之外',
+        { path: params.sourcePath }
+      );
+    }
+
+    try {
+      tempDirectory = await fs.mkdtemp(path.join(params.tempRoot, 'inkflow-verify-'));
+    } catch (err: any) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        `无法创建数据库验证临时目录：${err?.message || err}`,
+        { tempRoot: params.tempRoot },
+        { cause: err }
+      );
+    }
+
+    if (process.platform !== 'win32') {
+      await fs.chmod(tempDirectory, 0o700);
+    }
+    const tempDirStat = await fs.lstat(tempDirectory);
+    if (tempDirStat.isSymbolicLink() || !tempDirStat.isDirectory()) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        '数据库验证临时目录不是普通目录',
+        { tempDirectory }
+      );
+    }
+
+    tempPath = path.join(
+      tempDirectory,
+      `database-${crypto.randomBytes(16).toString('hex')}.sqlite`
+    );
+    try {
+      tempHandle = await fs.open(tempPath, 'wx+', 0o600);
+    } catch (err: any) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        `无法创建数据库验证临时副本：${err?.message || err}`,
+        { tempPath },
+        { cause: err }
+      );
+    }
+
+    const chunk = Buffer.alloc(64 * 1024);
+    let position = 0;
+    let bytesReadTotal = 0;
+    const sourceHash = crypto.createHash('sha256');
+
+    while (position < before.size) {
+      const { bytesRead } = await sourceHandle.read(
+        chunk,
+        0,
+        Math.min(chunk.length, before.size - position),
+        position
+      );
+      if (bytesRead <= 0) break;
+
+      const block = chunk.subarray(0, bytesRead);
+      sourceHash.update(block);
+      bytesReadTotal += bytesRead;
+
+      let written = 0;
+      while (written < bytesRead) {
+        const { bytesWritten } = await tempHandle.write(
+          block,
+          written,
+          bytesRead - written,
+          position + written
+        );
+        if (bytesWritten <= 0) break;
+        written += bytesWritten;
+      }
+      if (written !== bytesRead) {
+        throw new BackupError(
+          'BACKUP_VERIFICATION_FAILED',
+          '数据库验证临时副本写入不完整',
+          { tempPath, expectedBytes: bytesRead, writtenBytes: written }
+        );
+      }
+      position += bytesRead;
+    }
+
+    const after = await sourceHandle.stat();
+    if (bytesReadTotal !== before.size || statChanged(before, after)) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        '数据库快照在复制期间发生变化',
+        {
+          path: params.sourcePath,
+          expectedSize: before.size,
+          actualSize: after.size,
+          bytesRead: bytesReadTotal,
+        }
+      );
+    }
+
+    const tempStat = await tempHandle.stat();
+    if (!tempStat.isFile() || tempStat.size !== bytesReadTotal) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        '数据库验证临时副本大小不一致',
+        { tempPath, expectedSize: bytesReadTotal, actualSize: tempStat.size }
+      );
+    }
+
+    // Hash the temp copy's actual bytes and capture the first 100 header bytes
+    // from the same readback.
+    const tempHash = crypto.createHash('sha256');
+    const headerParts: Buffer[] = [];
+    let headerBytes = 0;
+    let verifyPosition = 0;
+    while (verifyPosition < bytesReadTotal) {
+      const { bytesRead } = await tempHandle.read(
+        chunk,
+        0,
+        Math.min(chunk.length, bytesReadTotal - verifyPosition),
+        verifyPosition
+      );
+      if (bytesRead <= 0) break;
+      const block = chunk.subarray(0, bytesRead);
+      tempHash.update(block);
+      if (headerBytes < 100) {
+        const need = 100 - headerBytes;
+        const part = block.subarray(0, Math.min(need, block.length));
+        headerParts.push(Buffer.from(part));
+        headerBytes += part.length;
+      }
+      verifyPosition += bytesRead;
+    }
+
+    const sourceDigest = sourceHash.digest('hex');
+    const tempDigest = tempHash.digest('hex');
+    if (verifyPosition !== bytesReadTotal || sourceDigest !== tempDigest) {
+      throw new BackupError(
+        'BACKUP_VERIFICATION_FAILED',
+        '数据库验证临时副本内容校验失败',
+        { tempPath, sourceSha256: sourceDigest, tempSha256: tempDigest }
+      );
+    }
+
+    const headerBuffer = Buffer.concat(headerParts).subarray(0, 100);
+    success = true;
+    return {
+      directory: tempDirectory,
+      path: tempPath,
+      sha256: tempDigest,
+      size: bytesReadTotal,
+      header: parseSqliteHeader(headerBuffer),
+    };
+  } finally {
+    await tempHandle?.close().catch(() => {});
+    await sourceHandle.close().catch(() => {});
+    if (!success && tempDirectory) {
+      const cleanupError = await removeVerificationTempDirectory(tempDirectory);
+      if (cleanupError) {
+        console.error(
+          `[InkFlow Backup] 数据库验证临时目录清理失败 ${tempDirectory}:`,
+          cleanupError
+        );
+      }
+    }
+  }
+}
+
+async function removeVerificationTempDirectory(
+  directory: string
+): Promise<string | null> {
+  try {
+    await fs.rm(directory, { recursive: true, force: true });
+    return null;
+  } catch (err: any) {
+    return err?.message || String(err);
+  }
 }
 
 /**
@@ -914,86 +1180,95 @@ export async function verifyBackupDirectory(
 
   await options.testHooks?.beforeHashing?.();
 
-  // 3. Recompute the database and every file hash from the packaged bytes.
+  // 3. Copy the database once, through a secure handle, into a private temp
+  //    object. The SHA-256 and SQLite header are computed from that copy, and
+  //    every SQLite check opens that same copy -- never the original path again.
   const hashed = new Map<string, HashedFile>();
   let databaseBytes = 0;
+  let databaseTemp: DatabaseTempCopy | null = null;
   const databaseAbsolutePath = path.join(
     target.directory,
     ...manifest.database.path.split('/')
   );
+
   if (layout.files.has(manifest.database.path)) {
     try {
-      const actual = await hashFileNoFollow(databaseAbsolutePath);
-      databaseBytes = actual.size;
-      if (actual.size !== manifest.database.size) {
+      databaseTemp = await copyDatabaseForVerification({
+        sourcePath: databaseAbsolutePath,
+        backupDirectory: target.directory,
+        tempRoot: options.tempRoot ?? os.tmpdir(),
+      });
+      await options.testHooks?.afterDatabaseCopy?.({
+        sourcePath: databaseAbsolutePath,
+        tempDirectory: databaseTemp.directory,
+        tempPath: databaseTemp.path,
+        sha256: databaseTemp.sha256,
+        size: databaseTemp.size,
+      });
+      databaseBytes = databaseTemp.size;
+      if (databaseTemp.size !== manifest.database.size) {
         issues.push({
           code: 'DATABASE_SIZE_MISMATCH',
           path: manifest.database.path,
           message: '数据库快照大小与 manifest 不一致',
           expected: manifest.database.size,
-          actual: actual.size,
+          actual: databaseTemp.size,
         });
       }
-      if (actual.sha256 !== manifest.database.sha256) {
+      if (databaseTemp.sha256 !== manifest.database.sha256) {
         issues.push({
           code: 'DATABASE_HASH_MISMATCH',
           path: manifest.database.path,
           message: '数据库快照 SHA-256 与 manifest 不一致',
           expected: manifest.database.sha256,
-          actual: actual.sha256,
+          actual: databaseTemp.sha256,
         });
       }
     } catch (err: any) {
       issues.push({
-        code: 'DATABASE_HASH_FAILED',
+        code: 'DATABASE_COPY_FAILED',
         path: manifest.database.path,
-        message: `数据库快照无法计算 SHA-256：${err?.message || err}`,
+        message: `无法建立数据库验证副本：${err?.message || err}`,
       });
     }
   }
   addCheck(
     'databaseHash',
     !issues.some(issue =>
-      ['DATABASE_SIZE_MISMATCH', 'DATABASE_HASH_MISMATCH', 'DATABASE_HASH_FAILED'].includes(issue.code)
+      [
+        'DATABASE_SIZE_MISMATCH',
+        'DATABASE_HASH_MISMATCH',
+        'DATABASE_HASH_FAILED',
+        'DATABASE_COPY_FAILED',
+      ].includes(issue.code)
     ),
     databaseBytes > 0 ? `${databaseBytes} 字节` : undefined
   );
 
-  // 4. Database-level checks. A WAL-mode file is rejected rather than opened:
-  //    a read-only open could otherwise create a -shm file inside the backup.
   let state: DatabaseBackupState | null = null;
   let ftsRows: Array<{ document_id: string; body: string }> = [];
-  if (layout.files.has(manifest.database.path)) {
-    let header: { valid: boolean; walMode: boolean };
-    try {
-      header = await readSqliteHeader(databaseAbsolutePath);
-    } catch (err: any) {
-      header = { valid: false, walMode: false };
-      issues.push({
-        code: 'DATABASE_HEADER_UNREADABLE',
-        path: manifest.database.path,
-        message: `数据库快照文件头不可读：${err?.message || err}`,
-      });
-    }
+  try {
+    if (databaseTemp) {
+      const header = databaseTemp.header;
 
-    if (!header.valid) {
-      issues.push({
-        code: 'DATABASE_HEADER_INVALID',
-        path: manifest.database.path,
-        message: '数据库快照不是合法的 SQLite 文件',
-      });
-      addCheck('sqliteIntegrity', false, '文件头无效');
-    } else if (header.walMode) {
-      issues.push({
-        code: 'DATABASE_WAL_MODE',
-        path: manifest.database.path,
-        message: '数据库快照仍处于 WAL 模式，不是自包含单文件；拒绝打开以避免写入旁文件',
-      });
-      addCheck('sqliteIntegrity', false, 'WAL 模式');
-    } else {
-      let db: DatabaseSync | null = null;
-      try {
-        db = new DatabaseSync(databaseAbsolutePath, { readOnly: true });
+      if (!header.valid) {
+        issues.push({
+          code: 'DATABASE_HEADER_INVALID',
+          path: manifest.database.path,
+          message: '数据库快照不是合法的 SQLite 文件',
+        });
+        addCheck('sqliteIntegrity', false, '文件头无效');
+      } else if (header.walMode) {
+        issues.push({
+          code: 'DATABASE_WAL_MODE',
+          path: manifest.database.path,
+          message: '数据库快照仍处于 WAL 模式，不是自包含单文件；拒绝打开以避免写入旁文件',
+        });
+        addCheck('sqliteIntegrity', false, 'WAL 模式');
+      } else {
+        let db: DatabaseSync | null = null;
+        try {
+          db = new DatabaseSync(databaseTemp.path, { readOnly: true });
         db.exec('PRAGMA query_only = ON;');
 
         const integrityRows = db.prepare('PRAGMA integrity_check').all() as any[];
@@ -1185,6 +1460,21 @@ export async function verifyBackupDirectory(
         });
       } finally {
         db?.close();
+      }
+      }
+    }
+  } finally {
+    if (databaseTemp) {
+      const cleanupError = await removeVerificationTempDirectory(databaseTemp.directory);
+      if (cleanupError) {
+        warnings.push({
+          code: 'VERIFICATION_TEMP_CLEANUP_FAILED',
+          message: `数据库验证临时目录清理失败：${cleanupError}（路径：${databaseTemp.directory}）`,
+        });
+        console.error(
+          `[InkFlow Backup] 数据库验证临时目录清理失败 ${databaseTemp.directory}:`,
+          cleanupError
+        );
       }
     }
   }
