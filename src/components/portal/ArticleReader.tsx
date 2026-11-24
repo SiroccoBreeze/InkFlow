@@ -414,12 +414,15 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  // Container width classes
-  const containerWidthClass = {
-    cozy: 'max-w-2xl',
-    standard: 'max-w-4xl',
-    wide: 'max-w-6xl',
-  }[containerWidth];
+  // Zen mode always uses the wide viewport layout (the card expands to fit it);
+  // the "正文版宽" preference now tunes the prose measure inside that card so
+  // code blocks, tables and images can use the full width without long lines.
+  const zenProseClass =
+    {
+      cozy: 'reader-zen-prose--cozy',
+      standard: 'reader-zen-prose--standard',
+      wide: 'reader-zen-prose--wide',
+    }[containerWidth] || 'reader-zen-prose--standard';
 
   // Font size classes
   const fontSizeClass = {
@@ -693,11 +696,12 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
       )}
 
       {/* Main Container */}
-      <div className={`mx-auto px-4 sm:px-6 pt-8 ${zenMode ? containerWidthClass : 'max-w-7xl'}`}>
+      <div className={`mx-auto px-4 sm:px-6 pt-8 ${zenMode ? '' : 'max-w-7xl'}`}>
         <div className={`grid grid-cols-1 ${zenMode ? 'grid-cols-1' : 'lg:grid-cols-12'} gap-8 lg:gap-12`}>
-          
+
           {/* Main Article Content Column (Left, Span 8) */}
-          <article className={`${zenMode ? 'w-full' : 'lg:col-span-8'} min-w-0 max-w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-6 sm:p-12 shadow-xs transition-all`}>
+          {/* Zen mode drops the reading-width preference cap and expands with the viewport. */}
+          <article className={`${zenMode ? `reader-zen-article ${zenProseClass}` : 'lg:col-span-8'} min-w-0 max-w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-6 sm:p-12 shadow-xs transition-all`}>
             
             {/* Breadcrumbs (hidden in zen mode) */}
             {!zenMode && (

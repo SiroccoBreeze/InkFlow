@@ -38,6 +38,61 @@
 }
 
 /*
+ * Zen reader layout.
+ * The card follows the wide viewport instead of the normal reading-width cap,
+ * while prose keeps a comfortable measure so paragraphs do not run edge to edge
+ * across a 1600px card. Code blocks, tables and images use the full card width.
+ */
+.reader-zen-article {
+  width: 100%;
+  max-width: 1600px;
+  margin-inline: auto;
+}
+
+@media (min-width: 1024px) {
+  .reader-zen-article {
+    /* 1600px on wide desktops (e.g. 2048px), shrinking with the viewport. */
+    width: min(92vw, 1600px);
+  }
+
+  .reader-zen-article.reader-zen-prose--cozy .markdown-body > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
+    max-width: 62ch;
+  }
+
+  .reader-zen-article.reader-zen-prose--standard .markdown-body > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
+    max-width: 74ch;
+  }
+
+  .reader-zen-article.reader-zen-prose--wide .markdown-body > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
+    max-width: 88ch;
+  }
+
+  /* A paragraph that only holds an image may use the whole card width. */
+  .reader-zen-article .markdown-body > p:has(.article-img-frame) {
+    max-width: 100%;
+  }
+}
+
+.reader-zen-article .markdown-body .code-block-container {
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Code keeps its original formatting: no forced wrapping, scroll inside the
+   block when a line is wider than the card. */
+.reader-zen-article .markdown-body .code-block-container pre,
+.reader-zen-article .markdown-body .code-block-container code {
+  max-width: 100%;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.reader-zen-article .markdown-body .code-block-container pre {
+  overflow-x: auto;
+}
+
+/*
  * Reader-only image presentation.
  * Every selector is scoped to `.markdown-body--zoomable`, a class only the
  * article reader sets, so the admin dashboard, editor previews and other pages
