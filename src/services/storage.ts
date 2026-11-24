@@ -402,7 +402,7 @@ export class StorageService {
         status: docInput.status || 'draft',
         unlistedKey:
           docInput.visibility === 'unlisted' ? Math.random().toString(36).slice(2, 10) : undefined,
-        author: docInput.author || 'Owner',
+        author: docInput.author || this.getOwnerAccountName(),
         createdAt: now,
         updatedAt: now,
         versionCount: 0,
@@ -634,30 +634,38 @@ export class StorageService {
 
       if (res.data && Array.isArray(res.data)) {
         // True physical sync from backend: backend disk is SSOT!
-        const backendDocs: KnowledgeDoc[] = res.data.map((backendDoc: any) => ({
-          id: backendDoc.id,
-          slug: backendDoc.slug,
-          title: backendDoc.title,
-          rawMarkdown: backendDoc.rawMarkdown || `# ${backendDoc.title}\n\n`,
-          category: backendDoc.category || '未分类',
-          tags: backendDoc.tags || [],
-          // Fail closed: an unexpected visibility/status from the server must never render as public content
-          visibility: (['public', 'private', 'unlisted'].includes(backendDoc.visibility)
-            ? backendDoc.visibility
-            : 'private'),
-          status: (['draft', 'published', 'archived'].includes(backendDoc.status)
-            ? backendDoc.status
-            : 'draft'),
-          pinned: Boolean(backendDoc.pinned),
-          author: backendDoc.author || 'Hecker',
-          createdAt: backendDoc.createdAt || backendDoc.created_at || new Date().toISOString(),
-          updatedAt: backendDoc.updatedAt || backendDoc.updated_at || new Date().toISOString(),
-          versionCount: backendDoc.versionCount || backendDoc.version_count || 1,
-          wordCount: backendDoc.wordCount || backendDoc.word_count || 0,
-          readingTimeMinutes: backendDoc.readingTime || backendDoc.reading_time || 1,
-          attachments: [],
-          unlistedKey: backendDoc.unlistedKey,
-        }));
+        const backendDocs: KnowledgeDoc[] = res.data.map((backendDoc: any) => {
+          const rawMarkdown = backendDoc.rawMarkdown || `# ${backendDoc.title}\n\n`;
+          // Author is derived from the Markdown frontmatter; never fabricate a
+          // fallback name when the document has none.
+          const frontmatterAuthor = parseFrontmatter(rawMarkdown).frontmatter.author;
+          return {
+            id: backendDoc.id,
+            slug: backendDoc.slug,
+            title: backendDoc.title,
+            rawMarkdown,
+            category: backendDoc.category || '未分类',
+            tags: backendDoc.tags || [],
+            // Fail closed: an unexpected visibility/status from the server must never render as public content
+            visibility: (['public', 'private', 'unlisted'].includes(backendDoc.visibility)
+              ? backendDoc.visibility
+              : 'private'),
+            status: (['draft', 'published', 'archived'].includes(backendDoc.status)
+              ? backendDoc.status
+              : 'draft'),
+            pinned: Boolean(backendDoc.pinned),
+            author:
+              backendDoc.author ||
+              (typeof frontmatterAuthor === 'string' ? frontmatterAuthor : ''),
+            createdAt: backendDoc.createdAt || backendDoc.created_at || new Date().toISOString(),
+            updatedAt: backendDoc.updatedAt || backendDoc.updated_at || new Date().toISOString(),
+            versionCount: backendDoc.versionCount || backendDoc.version_count || 1,
+            wordCount: backendDoc.wordCount || backendDoc.word_count || 0,
+            readingTimeMinutes: backendDoc.readingTime || backendDoc.reading_time || 1,
+            attachments: [],
+            unlistedKey: backendDoc.unlistedKey,
+          };
+        });
 
         this.persistDocs(backendDocs);
       }
@@ -1331,7 +1339,9 @@ export class StorageService {
         visibility,
         status,
         unlistedKey: frontmatter.unlistedKey,
-        author: frontmatter.author || 'Owner',
+        author:
+          (typeof frontmatter.author === 'string' && frontmatter.author) ||
+          this.getOwnerAccountName(),
       },
       `导入 Markdown 文件: ${filename || title}`
     );
@@ -1473,6 +1483,22 @@ export class StorageService {
     };
   }
 
+  /**
+   * The verified owner account name, used as the default author for new
+   * documents. Sessions created before `accountName` existed only stored the
+   * display label, so strip the known suffix instead of inventing a name.
+   */
+  public getOwnerAccountName(): string {
+    const session = this.getSession();
+    if (!session.isOwner) return '';
+    if (session.accountName && session.accountName.trim()) {
+      return session.accountName.trim();
+    }
+    return (session.username || '')
+      .replace(/\s*\((?:主理人|知识库主理人|Owner)\)\s*$/i, '')
+      .trim();
+  }
+
   public setSession(session: UserSession): void {
     localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(session));
   }
@@ -1585,11 +1611,13 @@ export class StorageService {
   }
 
   public loginAsOwner(token: string, username?: string): void {
+    const accountName = (username || '').trim();
     const session: UserSession = {
       isOwner: true,
-      username: username ? `${username} (主理人)` : 'Hecker (知识库主理人)',
+      username: accountName ? `${accountName} (主理人)` : '知识库主理人',
       role: 'owner',
       token,
+      accountName: accountName || undefined,
     };
     this.setSession(session);
     apiClient.setToken(token);

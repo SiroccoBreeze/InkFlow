@@ -557,7 +557,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       pinned: false,
       wordCount: 0,
       readingTimeMinutes: 1,
-      author: 'Hecker',
+      author: storage.getOwnerAccountName(),
       versionCount: 1,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),

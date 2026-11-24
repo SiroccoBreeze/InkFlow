@@ -66,6 +66,8 @@ export interface UserSession {
   username: string;
   role: UserRole;
   token?: string;
+  /** Raw verified owner account name (without the display suffix). */
+  accountName?: string;
 }
 
 export interface TableOfContentItem {

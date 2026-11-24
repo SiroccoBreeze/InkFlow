@@ -40,8 +40,8 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   const [activeTab, setActiveTab] = useState<'profile' | 'security' | 'stats'>('profile');
 
   // Profile form state
-  const [username, setUsername] = useState('Hecker');
-  const [email, setEmail] = useState('heckerchong@gmail.com');
+  const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
   const [isSavingProfile, setIsSavingProfile] = useState(false);
   const [profileMessage, setProfileMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -71,8 +71,8 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
     try {
       const res = await apiClient.getProfile();
       if (res.data) {
-        setUsername(res.data.username || 'Hecker');
-        setEmail(res.data.email || 'heckerchong@gmail.com');
+        setUsername(res.data.username || '');
+        setEmail(res.data.email || '');
       }
     } catch {}
 
@@ -98,6 +98,16 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
     try {
       const res = await apiClient.updateProfile({ username, email });
       if (res.data?.success) {
+        // Keep the local session in sync so new documents default to the
+        // renamed owner identity without requiring a fresh login.
+        const current = storage.getSession();
+        if (username.trim()) {
+          storage.setSession({
+            ...current,
+            username: `${username.trim()} (主理人)`,
+            accountName: username.trim(),
+          });
+        }
         setProfileMessage({ type: 'success', text: '主理人个人信息已成功更新' });
         onProfileUpdated();
       } else {

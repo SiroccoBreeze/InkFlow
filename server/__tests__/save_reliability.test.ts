@@ -121,7 +121,7 @@ function fullMarkdownWithMetadata(
       tags: overrides.tags ?? (Array.isArray(frontmatter.tags) ? frontmatter.tags : []),
       visibility: overrides.visibility ?? row.visibility,
       status: overrides.status ?? row.status,
-      author: frontmatter.author || 'Hecker',
+      author: frontmatter.author || '',
       pinned: Boolean(row.pinned),
       content_hash: calculateContentHash(body.trim()),
       created_at: row.created_at,

@@ -263,7 +263,7 @@ export function serializeToMarkdown(doc: KnowledgeDoc): string {
     `category: "${doc.category}"`,
     `tags: ${tagsStr}`,
     `visibility: "${doc.visibility}"`,
-    `author: "${doc.author || 'Owner'}"`,
+    `author: "${(doc.author || '').replace(/"/g, '\\"')}"`,
     `createdAt: "${doc.createdAt}"`,
     `updatedAt: "${doc.updatedAt}"`,
     doc.unlistedKey ? `unlistedKey: "${doc.unlistedKey}"` : null,

@@ -69,6 +69,7 @@ const MAX_TITLE_LENGTH = 500;
 const MAX_CATEGORY_LENGTH = 120;
 const MAX_TAGS = 100;
 const MAX_TAG_LENGTH = 80;
+const MAX_AUTHOR_LENGTH = 120;
 
 /** Validates a document save payload before any file or DB mutation. */
 export function assertValidDocumentInput(input: DocumentInput): void {
@@ -107,6 +108,15 @@ export function assertValidDocumentInput(input: DocumentInput): void {
   }
   if (input.status !== undefined && !['draft', 'published', 'archived'].includes(input.status)) {
     throw new DocumentValidationError('status 仅允许 draft / published / archived');
+  }
+  if (input.author !== undefined) {
+    if (
+      typeof input.author !== 'string' ||
+      input.author.length > MAX_AUTHOR_LENGTH ||
+      /[\u0000-\u001f\u007f]/.test(input.author)
+    ) {
+      throw new DocumentValidationError(`作者必须为不超过 ${MAX_AUTHOR_LENGTH} 字符的单行文本`);
+    }
   }
   if (input.expectedVersionCount !== undefined) {
     if (!Number.isInteger(input.expectedVersionCount) || input.expectedVersionCount < 1) {
@@ -180,7 +190,7 @@ export function buildFrontmatterBlock(meta: {
     `tags: ${tagsStr}`,
     `visibility: "${meta.visibility}"`,
     `status: "${meta.status}"`,
-    `author: "${meta.author || 'Hecker'}"`,
+    `author: "${meta.author.replace(/"/g, '\\"')}"`,
     `pinned: ${meta.pinned ? 'true' : 'false'}`,
     `content_hash: "${meta.content_hash}"`,
     `created_at: "${meta.created_at}"`,
@@ -396,10 +406,15 @@ export class DocumentService {
           .all(row.id) as any[];
 
         const rawMarkdown = await fileStorage.readDocumentMarkdown(row.id);
+        const content = rawMarkdown || `# ${row.title}\n\n${row.description || ''}`;
+        // Author is not duplicated in SQLite: the Markdown frontmatter is the SSOT.
+        // Expose it in API payloads so every reader/editor sees the real byline.
+        const frontmatterAuthor = parseFrontmatter(content).frontmatter.author;
 
         const doc = {
           ...row,
-          rawMarkdown: rawMarkdown || `# ${row.title}\n\n${row.description || ''}`,
+          rawMarkdown: content,
+          author: typeof frontmatterAuthor === 'string' ? frontmatterAuthor.trim() : '',
           pinned: Boolean(row.pinned),
           tags: tagRows.map(t => t.name),
         };
@@ -447,11 +462,14 @@ export class DocumentService {
       )
       .all(id) as any[];
 
+    const frontmatterAuthor = parseFrontmatter(rawMarkdown || '').frontmatter.author;
     const result = {
       ...docRow,
       category: docRow.category_name,
       pinned: Boolean(docRow.pinned),
       tags: tagRows.map(t => t.name),
+      // Author lives in the Markdown frontmatter (SSOT), not in the SQLite row.
+      author: typeof frontmatterAuthor === 'string' ? frontmatterAuthor.trim() : '',
       rawMarkdown,
     };
 
@@ -841,6 +859,41 @@ export class DocumentService {
     const createdAt = existing?.created_at || now;
     const versionCount = (existing?.version_count || 0) + 1;
 
+    // 1. Read the file being edited before composing the new metadata: on an
+    //    update, an omitted author must fall back to the author already recorded
+    //    on disk instead of overwriting the byline.
+    const previousMarkdown = await fileStorage.readDocumentMarkdown(docId);
+    const previousAuthor = existing
+      ? parseFrontmatter(previousMarkdown || '').frontmatter.author
+      : undefined;
+
+    // Author policy:
+    // - Markdown frontmatter remains the SSOT; the verified owner identity is the
+    //   only default, never a hardcoded name.
+    // - The owner may still set a custom byline (the existing author field).
+    // - Any non-owner principal is pinned to its own verified username so a
+    //   tampered `author` field cannot impersonate someone else.
+    // - Updates without an explicit author preserve the existing byline.
+    const owner = db
+      .prepare('SELECT username, role FROM users WHERE id = ?')
+      .get(ownerId) as { username?: string; role?: string } | undefined;
+    const verifiedAuthor = typeof owner?.username === 'string' ? owner.username.trim() : '';
+    const requestedAuthor = typeof input.author === 'string' ? input.author.trim() : '';
+    const preservedAuthor = typeof previousAuthor === 'string' ? previousAuthor.trim() : '';
+
+    let author: string;
+    if (owner && owner.role !== 'owner') {
+      // Non-owner principals cannot choose a byline: a create is attributed to
+      // themselves, and an edit keeps the author already on disk.
+      author = (existing ? preservedAuthor : '') || verifiedAuthor;
+    } else if (requestedAuthor) {
+      author = requestedAuthor;
+    } else if (existing) {
+      author = preservedAuthor || verifiedAuthor;
+    } else {
+      author = verifiedAuthor;
+    }
+
     const fullMarkdown = [
       buildFrontmatterBlock({
         id: docId,
@@ -850,7 +903,7 @@ export class DocumentService {
         tags,
         visibility,
         status,
-        author: input.author || 'Hecker',
+        author,
         pinned: Boolean(pinned),
         content_hash: contentHash,
         created_at: createdAt,
@@ -862,9 +915,8 @@ export class DocumentService {
     // Full-file hash (frontmatter + body) is the commit marker used by recovery.
     const documentHash = calculateDocumentHash(fullMarkdown);
 
-    // 1. Stage the new Markdown and back up the previous file. index.md is untouched
+    // 2. Stage the new Markdown and back up the previous file. index.md is untouched
     //    until commitStagedDocumentSave() renames the temp file.
-    const previousMarkdown = await fileStorage.readDocumentMarkdown(docId);
     const artifacts = await fileStorage.prepareDocumentSave(docId, previousMarkdown, fullMarkdown);
     if (!artifacts) {
       throw new Error('无法准备文档存储路径');
@@ -874,17 +926,17 @@ export class DocumentService {
     let revisionId: string | null = null;
 
     try {
-      // 2. Commit the file change (atomic rename on the same filesystem).
+      // 3. Commit the file change (atomic rename on the same filesystem).
       await fileStorage.commitStagedDocumentSave(artifacts.stagedPath, artifacts.finalPath);
 
-      // 3. Write the revision snapshot BEFORE opening the SQLite transaction.
+      // 4. Write the revision snapshot BEFORE opening the SQLite transaction.
       //    The transaction below must be fully synchronous: `node:sqlite` has one
       //    connection per process, so any `await` inside a transaction lets other
       //    request handlers run SQL in the same transaction (or roll it back).
       revisionId = generateId('rev');
       const snapshotPath = await fileStorage.saveRevisionSnapshot(docId, revisionId, fullMarkdown);
 
-      // 4. All SQLite writes happen in one synchronous transaction. If anything
+      // 5. All SQLite writes happen in one synchronous transaction. If anything
       //    fails (FTS, tag, asset association), the DB rolls back and the Markdown
       //    file is restored from the backup below.
       runInTransaction(db, () => {
@@ -1004,7 +1056,7 @@ export class DocumentService {
       });
       dbCommitted = true;
 
-      // 5. Success: drop the backup marker files.
+      // 6. Success: drop the backup marker files.
       await fileStorage.finalizeDocumentSave(artifacts);
 
       return {
@@ -1016,6 +1068,7 @@ export class DocumentService {
         visibility,
         status,
         pinned: Boolean(pinned),
+        author,
         versionCount,
         wordCount: stats.wordCount,
         readingTime: stats.readingTime,
@@ -1261,7 +1314,7 @@ export class DocumentService {
           visibility: visibility as any,
           status: status as any,
           pinned,
-          author: frontmatter.author || 'Owner',
+          author: typeof frontmatter.author === 'string' ? frontmatter.author : undefined,
         },
         ownerId,
         '从磁盘文件自动重建索引',
@@ -1339,7 +1392,7 @@ export class DocumentService {
         tags: Array.isArray(frontmatter.tags) ? frontmatter.tags : [],
         visibility: (frontmatter.visibility || docRow.visibility) as any,
         pinned: Boolean(frontmatter.pinned !== undefined ? frontmatter.pinned : docRow.pinned),
-        author: frontmatter.author || 'Hecker',
+        author: typeof frontmatter.author === 'string' ? frontmatter.author : undefined,
         // Rollback is an intentional overwrite, but still participates in the
         // optimistic lock so a concurrent edit cannot be silently clobbered.
         expectedVersionCount: docRow.version_count,

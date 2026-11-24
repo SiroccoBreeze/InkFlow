@@ -172,7 +172,7 @@ export const Header: React.FC<HeaderProps> = ({
               >
                 {/* User avatar circle */}
                 <div className="w-6 h-6 rounded-full bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900 flex items-center justify-center font-bold text-xs shadow-sm">
-                  {session.username ? session.username.charAt(0).toUpperCase() : 'H'}
+                  {session.username ? session.username.charAt(0).toUpperCase() : 'O'}
                 </div>
                 <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-200 hidden sm:inline-block max-w-[80px] truncate">
                   {session.username || 'Owner'}
@@ -187,7 +187,7 @@ export const Header: React.FC<HeaderProps> = ({
                   {/* User brief card */}
                   <div className="px-4 py-2.5 border-b border-neutral-100 dark:border-neutral-800">
                     <div className="font-bold text-neutral-900 dark:text-neutral-100 flex items-center justify-between">
-                      <span>{session.username || 'Hecker'}</span>
+                      <span>{session.username || '知识库主理人'}</span>
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 font-mono">
                         在线
                       </span>

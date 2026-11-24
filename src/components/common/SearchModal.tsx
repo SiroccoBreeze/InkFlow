@@ -91,7 +91,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({
           visibility: r.visibility,
           rawMarkdown: '',
           tags: [],
-          author: 'Owner',
+          author: '',
           createdAt: r.updated_at,
           updatedAt: r.updated_at,
           wordCount: r.word_count || 0,

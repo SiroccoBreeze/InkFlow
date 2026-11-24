@@ -272,7 +272,7 @@ apiRouter.get('/users/public-author', (req, res) => {
   res.json({
     data: {
       author: {
-        username: profile?.username || 'Hecker',
+        username: profile?.username || '',
         role: 'owner',
       },
     },

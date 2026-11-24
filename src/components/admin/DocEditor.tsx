@@ -107,7 +107,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
         : 'draft') as DocStatus
   );
   const [author, setAuthor] = useState<string>(
-    parsedInitial.author || initialDoc?.author || 'Hecker'
+    parsedInitial.author || initialDoc?.author || storage.getOwnerAccountName()
   );
   const [unlistedKey, setUnlistedKey] = useState(
     initialDoc?.unlistedKey || Math.random().toString(36).slice(2, 10)
@@ -188,7 +188,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
       `tags: ${tagsStr}`,
       `visibility: "${meta.visibility}"`,
       `status: "${meta.status}"`,
-      `author: "${meta.author || 'Hecker'}"`,
+      `author: "${meta.author.replace(/"/g, '\\"')}"`,
       '---',
     ].join('\n');
   };
@@ -308,6 +308,9 @@ export const DocEditor: React.FC<DocEditorProps> = ({
 
     const finalTitle = title.trim() || extractTitle(rawMarkdown, '无标题笔记');
     const finalSlug = slug.trim() || generateSlug(finalTitle);
+    // Default to the signed-in owner's verified name instead of a fabricated
+    // byline. An explicit custom author entered by the owner is still honoured.
+    const effectiveAuthor = author.trim() || storage.getOwnerAccountName();
 
     // Synthesize full canonical Markdown with standard Frontmatter for storage & export
     const fullMarkdown = [
@@ -317,7 +320,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
         tags: selectedTags,
         visibility,
         status,
-        author: author.trim() || 'Hecker',
+        author: effectiveAuthor,
       }),
       '',
       rawMarkdown.trimStart(),
@@ -338,7 +341,7 @@ export const DocEditor: React.FC<DocEditorProps> = ({
           tags: selectedTags,
           visibility,
           status,
-          author: author.trim() || 'Hecker',
+          author: effectiveAuthor,
           unlistedKey: visibility === 'unlisted' ? unlistedKey : undefined,
           pinned,
         },
