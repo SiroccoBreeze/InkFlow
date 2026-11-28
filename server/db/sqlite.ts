@@ -145,7 +145,35 @@ export function getDatabase(): DatabaseSync {
   return dbInstance;
 }
 
+export const SYSTEM_MARKERS = {
+  defaultCategoriesSeeded: 'default_categories_seeded',
+  starterDocsSeeded: 'starter_docs_seeded',
+} as const;
+
+export function hasSystemMarker(db: DatabaseSync, key: string): boolean {
+  try {
+    const row = db.prepare('SELECT value FROM system_settings WHERE key = ?').get(key) as any;
+    return row?.value === '1';
+  } catch {
+    // pre-migration database without the system_settings table
+    return false;
+  }
+}
+
+export function setSystemMarker(db: DatabaseSync, key: string): void {
+  db.prepare(`
+    INSERT INTO system_settings (key, value, updated_at)
+    VALUES (?, '1', ?)
+    ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at
+  `).run(key, new Date().toISOString());
+}
+
 export function seedDefaultCategoriesIfEmpty(db: DatabaseSync, ownerId: string): void {
+  // One-way marker: default categories are a first-run convenience. Once the
+  // owner has received them (or already curated a taxonomy), deleting every
+  // category must not bring the built-in five back on the next startup.
+  if (hasSystemMarker(db, SYSTEM_MARKERS.defaultCategoriesSeeded)) return;
+
   const checkCats = db.prepare('SELECT COUNT(*) as count FROM categories');
   const catCount = (checkCats.get() as any)?.count || 0;
 
@@ -168,6 +196,10 @@ export function seedDefaultCategoriesIfEmpty(db: DatabaseSync, ownerId: string):
       insertCat.run(c.id, ownerId, c.name, c.slug, c.desc, c.color, c.order, now, now);
     }
   }
+
+  // Set the marker whether we seeded now or the installation already had
+  // categories. From this point on, the owner's taxonomy is authoritative.
+  setSystemMarker(db, SYSTEM_MARKERS.defaultCategoriesSeeded);
 }
 
 function seedDefaultDataIfEmpty(db: DatabaseSync): void {

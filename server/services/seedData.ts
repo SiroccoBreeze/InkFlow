@@ -1,6 +1,6 @@
 import { documentService } from './documentService';
 import { fileStorage } from './fileStorageService';
-import { getDatabase } from '../db/sqlite';
+import { getDatabase, hasSystemMarker, setSystemMarker, SYSTEM_MARKERS } from '../db/sqlite';
 import { INITIAL_SEED_DOCS } from './defaultSeedDocs';
 import { consistencyGate } from './consistencyGate';
 
@@ -18,6 +18,17 @@ export async function ensureInitialPhysicalDocs(): Promise<void> {
     // a deleted document cannot be re-imported even if physical removal failed.
     const diskIds = await fileStorage.listAllDiskDocumentIds();
     const pendingDeletions = await fileStorage.listPendingDeletionDocumentIds();
+
+    const starterDocsSeeded = hasSystemMarker(db, SYSTEM_MARKERS.starterDocsSeeded);
+    const hasPriorContent = docCount > 0 || diskIds.length > 0 || pendingDeletions.length > 0;
+
+    // One-way marker: starter docs are a first-run showcase. As soon as the
+    // installation shows any sign of prior content, record that the showcase
+    // opportunity has passed. Deleting every document later must never make the
+    // starter docs reappear on the next restart.
+    if (hasPriorContent && !starterDocsSeeded) {
+      setSystemMarker(db, SYSTEM_MARKERS.starterDocsSeeded);
+    }
 
     if (pendingDeletions.length > 0 && diskIds.length === 0) {
       // The database is empty because deletes were committed; the remaining folders
@@ -46,6 +57,12 @@ export async function ensureInitialPhysicalDocs(): Promise<void> {
     // If both disk and database are empty, seed the public starter docs onto disk and SQLite.
     // Seed documents are always PUBLIC because they are meant to be a public showcase.
     if (diskIds.length === 0 && owner?.id) {
+      if (starterDocsSeeded || hasPriorContent) {
+        // The showcase was already delivered once, or the owner had content and
+        // deliberately removed it. Never resurrect the starter docs on restart.
+        return;
+      }
+
       console.log('[InkFlow Storage] Initializing physical Markdown storage in storage/documents/ ...');
 
       for (const doc of INITIAL_SEED_DOCS) {
@@ -72,6 +89,7 @@ export async function ensureInitialPhysicalDocs(): Promise<void> {
         }
       }
 
+      setSystemMarker(db, SYSTEM_MARKERS.starterDocsSeeded);
       console.log(`[InkFlow Storage] Successfully seeded ${INITIAL_SEED_DOCS.length} documents onto physical disk.`);
     }
   });

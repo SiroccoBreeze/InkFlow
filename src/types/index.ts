@@ -59,6 +59,12 @@ export interface Category {
   color?: string;
   icon?: string;
   order: number;
+  /**
+   * Set on a category that was created locally but has not yet been accepted by
+   * the server. Only these local-only categories survive a backend sync; demo
+   * defaults and other stale local entries are dropped.
+   */
+  pendingSync?: boolean;
 }
 
 export interface UserSession {

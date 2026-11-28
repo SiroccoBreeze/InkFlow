@@ -115,10 +115,13 @@ class ApiClient {
     return res;
   }
 
-  public async login(password: string) {
+  public async login(password: string, username?: string) {
+    const body: { password: string; username?: string } = { password };
+    if (username?.trim()) body.username = username.trim();
+
     const res = await this.request<{ user: any; token: string }>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ password }),
+      body: JSON.stringify(body),
     });
 
     if (res.data?.token) {

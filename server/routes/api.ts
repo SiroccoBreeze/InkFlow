@@ -175,17 +175,20 @@ apiRouter.post('/auth/init', checkAuthRateLimit, (req, res) => {
 });
 
 apiRouter.post('/auth/login', checkAuthRateLimit, (req, res) => {
-  const { password } = req.body || {};
+  const { password, username } = req.body || {};
   if (!password) {
     recordFailedAuthAttempt(req);
-    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: '请输入主理人访问密钥' } });
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: '请输入访问密码' } });
     return;
   }
 
-  const result = authService.verifyOwner(password);
+  const result = authService.verifyOwner(
+    password,
+    typeof username === 'string' ? username : undefined
+  );
   if (!result.success) {
     recordFailedAuthAttempt(req);
-    res.status(401).json({ error: { code: 'AUTH_FAILED', message: result.message || '密码错误，认证失败' } });
+    res.status(401).json({ error: { code: 'AUTH_FAILED', message: result.message || '账号或密码错误，认证失败' } });
     return;
   }
 

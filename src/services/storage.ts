@@ -208,7 +208,12 @@ export class StorageService {
     this.init();
   }
 
-  private init(): void {
+  /**
+   * @param seedDemoCategories true only for the explicit "reset to demo data"
+   * action. Normal startup must never inject built-in categories: the server is
+   * the source of truth and an empty local category list is a valid state.
+   */
+  private init(seedDemoCategories = false): void {
     if (typeof window === 'undefined') return;
 
     if (!localStorage.getItem(STORAGE_KEYS.DOCS)) {
@@ -230,7 +235,7 @@ export class StorageService {
       });
       localStorage.setItem(STORAGE_KEYS.DOCS, JSON.stringify(enrichedDocs));
     }
-    if (!localStorage.getItem(STORAGE_KEYS.CATEGORIES)) {
+    if (seedDemoCategories && !localStorage.getItem(STORAGE_KEYS.CATEGORIES)) {
       localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify(DEFAULT_CATEGORIES));
     }
     if (!localStorage.getItem(STORAGE_KEYS.VERSIONS)) {
@@ -675,7 +680,7 @@ export class StorageService {
       // for category identity, but a color already chosen locally is preserved
       // when the backend row predates the color column.
       const catRes = await apiClient.getCategories();
-      if (catRes.data && Array.isArray(catRes.data) && catRes.data.length > 0) {
+      if (catRes.data && Array.isArray(catRes.data)) {
         const local = this.getCategories();
         const mapped: Category[] = catRes.data.map((c: any) => {
           const localCat = local.find(l => l.id === c.id || l.name === c.name);
@@ -689,16 +694,22 @@ export class StorageService {
           };
         });
 
-        // Keep categories that exist only locally (e.g. created while offline)
-        // instead of silently dropping them on the next sync.
-        local.forEach(localCat => {
-          const alreadyThere = mapped.some(m => m.id === localCat.id || m.name === localCat.name);
-          if (!alreadyThere) {
-            mapped.push({
-              ...localCat,
-              color: normalizeHexColor(localCat.color) || defaultColorForName(localCat.name),
-            });
-          }
+        // The server is the source of truth for the taxonomy. Keep a local
+        // category only while it is explicitly pending upload (created while
+        // offline); built-in demo defaults and other stale local entries are
+        // dropped instead of being resurrected on every load.
+        const pendingLocal = local.filter(
+          localCat =>
+            localCat.pendingSync === true &&
+            !mapped.some(m => m.id === localCat.id || m.name === localCat.name)
+        );
+
+        pendingLocal.forEach(localCat => {
+          mapped.push({
+            ...localCat,
+            color: normalizeHexColor(localCat.color) || defaultColorForName(localCat.name),
+          });
+          this.publishCategory(localCat);
         });
 
         mapped.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
@@ -829,7 +840,7 @@ export class StorageService {
     if (this.categoriesCache) return this.categoriesCache;
     try {
       const data = localStorage.getItem(STORAGE_KEYS.CATEGORIES);
-      const parsed: Category[] = data ? JSON.parse(data) : DEFAULT_CATEGORIES;
+      const parsed: Category[] = data ? JSON.parse(data) : [];
       const normalized = parsed.map(c => ({
         ...c,
         // Legacy installations stored categories without a color. Fill those in
@@ -839,20 +850,45 @@ export class StorageService {
       this.categoriesCache = normalized;
       return normalized;
     } catch {
-      return DEFAULT_CATEGORIES.map(c => ({
-        ...c,
-        color: normalizeHexColor(c.color) || defaultColorForName(c.name),
-      }));
+      return [];
     }
+  }
+
+  /**
+   * Publishes a locally-created category once the server is reachable. On
+   * success the local placeholder adopts the server id and loses `pendingSync`
+   * so later edits hit the canonical row and the next sync converges.
+   */
+  private publishCategory(category: Category): void {
+    apiClient.createCategory({
+      name: category.name,
+      description: category.description,
+      slug: category.slug,
+      color: category.color,
+      sort_order: category.order,
+    }).then(res => {
+      if (!res.data?.id) return;
+      const list = this.getCategories();
+      const target = list.find(c => c.name === category.name);
+      if (!target) return;
+      target.id = res.data.id;
+      delete target.pendingSync;
+      this.categoriesCache = list;
+      localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify(list));
+    }).catch(() => {});
   }
 
   public saveCategory(category: Category): void {
     const list = this.getCategories();
     const idx = list.findIndex(c => c.id === category.id);
     const isExisting = idx >= 0;
+    const existing = isExisting ? list[idx] : undefined;
     const normalized: Category = {
       ...category,
       color: normalizeHexColor(category.color) || defaultColorForName(category.name),
+      // A brand-new category lives locally until the server acknowledges it.
+      // Existing categories keep whatever sync state they already had.
+      pendingSync: isExisting ? existing?.pendingSync : true,
     };
 
     if (isExisting) {
@@ -876,13 +912,13 @@ export class StorageService {
       // duplicate row and throw on UNIQUE(owner_id, name).
       apiClient.updateCategory(normalized.id, payload).then(res => {
         if (res.error?.status === 404) {
-          // Local-only category (legacy seeded default or created offline):
+          // Local-only category (created offline or not yet acknowledged):
           // publish it once, then the next sync reconciles the remote id.
-          apiClient.createCategory(payload).catch(() => {});
+          this.publishCategory(normalized);
         }
       }).catch(() => {});
     } else {
-      apiClient.createCategory(payload).catch(() => {});
+      this.publishCategory(normalized);
     }
   }
 
@@ -1521,7 +1557,9 @@ export class StorageService {
     this.commentsCache = null;
     this.topicsCache = null;
     this.repliesCache = null;
-    this.init();
+    // This is an explicit user-initiated demo reset, so seeding demo
+    // categories here is intentional; normal startup never does it.
+    this.init(true);
   }
 
   // --- Auth / Session ---
@@ -1590,14 +1628,17 @@ export class StorageService {
     return session;
   }
 
-  public async verifyAndLogin(passcode: string): Promise<{ success: boolean; message?: string }> {
+  public async verifyAndLogin(
+    passcode: string,
+    username?: string
+  ): Promise<{ success: boolean; message?: string }> {
     try {
-      const res = await apiClient.login(passcode);
+      const res = await apiClient.login(passcode, username);
       if (res.data?.token) {
         this.loginAsOwner(res.data.token, res.data.user?.username);
         return { success: true };
       }
-      return { success: false, message: res.error?.message || '访问密钥错误，认证失败' };
+      return { success: false, message: res.error?.message || '账号或密码错误，认证失败' };
     } catch (e: any) {
       return { success: false, message: e.message || '网络连接或认证异常' };
     }

@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Lock, X, ShieldCheck, KeyRound, User, RefreshCw, Eye, EyeOff, AlertCircle } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { AlertCircle, Eye, EyeOff, KeyRound, Lock, User, X } from 'lucide-react';
 import { storage } from '../../services/storage';
+import { CaptchaField, useCaptcha } from '../common/CaptchaField';
 
 interface LoginModalProps {
   isOpen: boolean;
@@ -8,274 +9,190 @@ interface LoginModalProps {
   onLoginSuccess: () => void;
 }
 
-export const LoginModal: React.FC<LoginModalProps> = ({
-  isOpen,
-  onClose,
-  onLoginSuccess,
-}) => {
+export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onLoginSuccess }) => {
   const [username, setUsername] = useState('');
   const [passcode, setPasscode] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [captchaInput, setCaptchaInput] = useState('');
-  const [currentCaptcha, setCurrentCaptcha] = useState('');
   const [error, setError] = useState<string | null>(null);
 
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  const generateCaptcha = () => {
-    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-    let code = '';
-    for (let i = 0; i < 4; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    setCurrentCaptcha(code);
-    setCaptchaInput('');
-    setError(null);
-  };
+  const { code, value: captchaInput, setValue: setCaptchaInput, refresh, validate } = useCaptcha();
 
   useEffect(() => {
     if (isOpen) {
-      generateCaptcha();
+      refresh();
       setPasscode('');
+      setUsername('');
       setError(null);
     }
-  }, [isOpen]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !currentCaptcha) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const width = canvas.width;
-    const height = canvas.height;
-
-    const isDark = document.documentElement.classList.contains('dark');
-    ctx.fillStyle = isDark ? '#1e293b' : '#f1f5f9';
-    ctx.fillRect(0, 0, width, height);
-
-    // Random interference lines
-    for (let i = 0; i < 4; i++) {
-      ctx.beginPath();
-      ctx.moveTo(Math.random() * width, Math.random() * height);
-      ctx.lineTo(Math.random() * width, Math.random() * height);
-      ctx.strokeStyle = isDark ? 'rgba(148, 163, 184, 0.4)' : 'rgba(100, 116, 139, 0.4)';
-      ctx.lineWidth = 1.2;
-      ctx.stroke();
-    }
-
-    // Dots
-    for (let i = 0; i < 25; i++) {
-      ctx.beginPath();
-      ctx.arc(Math.random() * width, Math.random() * height, 1, 0, Math.PI * 2);
-      ctx.fillStyle = isDark ? 'rgba(203, 213, 225, 0.5)' : 'rgba(71, 85, 105, 0.4)';
-      ctx.fill();
-    }
-
-    const colors = isDark 
-      ? ['#60a5fa', '#34d399', '#fbbf24', '#f87171']
-      : ['#1d4ed8', '#047857', '#b45309', '#b91c1c'];
-
-    ctx.font = 'bold 22px monospace';
-    ctx.textBaseline = 'middle';
-
-    for (let i = 0; i < currentCaptcha.length; i++) {
-      const char = currentCaptcha[i];
-      const x = 16 + i * 20;
-      const y = height / 2 + (Math.random() * 4 - 2);
-      const angle = (Math.random() * 20 - 10) * (Math.PI / 180);
-
-      ctx.save();
-      ctx.translate(x, y);
-      ctx.rotate(angle);
-      ctx.fillStyle = colors[i % colors.length];
-      ctx.fillText(char, 0, 0);
-      ctx.restore();
-    }
-  }, [currentCaptcha, isOpen]);
+  }, [isOpen, refresh]);
 
   if (!isOpen) return null;
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
     setError(null);
 
+    const account = username.trim();
+    if (!account) {
+      setError('请输入账号');
+      return;
+    }
 
-    // 1. Password minimum length requirement (>= 6 chars)
     if (passcode.length < 6) {
       setError('密码最低长度要求 6 位，请重新输入');
       return;
     }
 
-    // 2. Captcha validation
     if (!captchaInput.trim()) {
       setError('请输入图形验证码');
       return;
     }
 
-    if (captchaInput.trim().toUpperCase() !== currentCaptcha.toUpperCase()) {
-      setError('验证码错误，请重新输入');
-      generateCaptcha();
+    if (!validate()) {
+      setError('验证码不正确，已为你换一张');
+      refresh();
       return;
     }
 
-    // 3. Verify Master Key against backend
-    const result = await storage.verifyAndLogin(passcode);
+    const result = await storage.verifyAndLogin(passcode, account);
     if (result.success) {
       setError(null);
       setPasscode('');
       onLoginSuccess();
       onClose();
     } else {
-      setError(result.message || '访问密钥错误，认证失败');
-      generateCaptcha();
+      setError(result.message || '账号或密码错误，请重试');
+      refresh();
     }
   };
 
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-neutral-900/50 backdrop-blur-xs">
-      <div 
-        className="w-full max-w-md bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl shadow-2xl p-6 relative transition-all"
-        onClick={e => e.stopPropagation()}
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-neutral-900/50 p-4 backdrop-blur-xs">
+      <div
+        className="relative w-full max-w-md rounded-2xl border border-neutral-200 bg-white p-6 shadow-2xl transition-all dark:border-neutral-800 dark:bg-neutral-900"
+        onClick={event => event.stopPropagation()}
       >
         <button
           onClick={onClose}
-          className="absolute top-4 right-4 text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200"
+          aria-label="关闭登录窗口"
+          className="absolute right-4 top-4 rounded-lg p-1 text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-neutral-600 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
         >
-          <X className="w-5 h-5" />
+          <X className="h-5 w-5" />
         </button>
 
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 rounded-xl bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center text-neutral-900 dark:text-neutral-100">
-            <Lock className="w-5 h-5" />
+        <div className="mb-5 flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-neutral-100 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100">
+            <Lock className="h-5 w-5" />
           </div>
           <div>
             <h3 className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
-              Owner 认证登录
+              登录 InkFlow
             </h3>
-            <p className="text-xs text-neutral-500">
-              个人知识库主理人专属管理控制台
-            </p>
+            <p className="text-xs text-neutral-500 dark:text-neutral-400">访问你的个人知识库</p>
           </div>
         </div>
 
         {error && (
-          <div className="mb-4 p-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-900/60 flex items-center gap-2 text-xs text-rose-700 dark:text-rose-300 animate-fade-in">
-            <AlertCircle className="w-4 h-4 shrink-0" />
+          <div
+            role="alert"
+            className="mb-4 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/50 dark:text-rose-300"
+          >
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
             <span>{error}</span>
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4 text-xs">
-          <div>
-            <label className="block font-medium text-neutral-700 dark:text-neutral-300 mb-1">
-              主理人账号
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="space-y-1.5">
+            <label
+              htmlFor="modal-username"
+              className="block text-sm font-medium text-neutral-800 dark:text-neutral-200"
+            >
+              账号
             </label>
             <div className="relative">
+              <User className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-neutral-400" />
               <input
+                id="modal-username"
                 type="text"
                 value={username}
-                onChange={e => setUsername(e.target.value)}
-                placeholder="账号"
-                className="w-full px-3 py-2 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg text-sm text-neutral-900 dark:text-neutral-100 outline-none"
+                onChange={event => {
+                  setUsername(event.target.value);
+                  if (error) setError(null);
+                }}
+                placeholder="请输入账号"
+                className="h-11 w-full rounded-xl border border-neutral-200 bg-white pl-9 pr-3 text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-400 focus:border-neutral-900 focus:ring-4 focus:ring-neutral-900/5 dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-600 dark:focus:border-neutral-100 dark:focus:ring-white/10"
+                autoComplete="username"
                 required
+                autoFocus
               />
-              <User className="w-4 h-4 text-neutral-400 absolute right-3 top-2.5" />
             </div>
           </div>
 
-          <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className="font-medium text-neutral-700 dark:text-neutral-300">
-                主理人访问密钥
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <label
+                htmlFor="modal-password"
+                className="text-sm font-medium text-neutral-800 dark:text-neutral-200"
+              >
+                密码
               </label>
-              <span className="text-[11px] text-neutral-400 font-mono">
+              <span className="font-mono text-[11px] text-neutral-400 dark:text-neutral-500">
                 最低 6 位
               </span>
             </div>
             <div className="relative">
+              <KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-neutral-400" />
               <input
+                id="modal-password"
                 type={showPassword ? 'text' : 'password'}
                 value={passcode}
-                onChange={e => {
-                  setPasscode(e.target.value);
+                onChange={event => {
+                  setPasscode(event.target.value);
                   if (error) setError(null);
                 }}
-                placeholder="请输入访问密钥（至少 6 位）"
-                className="w-full pl-3 pr-10 py-2 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg text-sm text-neutral-900 dark:text-neutral-100 outline-none font-mono"
-                required
+                placeholder="请输入访问密码"
+                className="h-11 w-full rounded-xl border border-neutral-200 bg-white pl-9 pr-11 text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-400 focus:border-neutral-900 focus:ring-4 focus:ring-neutral-900/5 dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-600 dark:focus:border-neutral-100 dark:focus:ring-white/10"
+                autoComplete="current-password"
                 minLength={6}
-                autoFocus
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3 top-2.5 text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200"
-              >
-                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            </div>
-          </div>
-
-          {/* Captcha */}
-          <div>
-            <label className="block font-medium text-neutral-700 dark:text-neutral-300 mb-1">
-              安全验证码
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={captchaInput}
-                onChange={e => {
-                  setCaptchaInput(e.target.value);
-                  if (error) setError(null);
-                }}
-                placeholder="输入 4 位字符"
-                maxLength={4}
-                className="flex-1 px-3 py-2 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg text-sm text-neutral-900 dark:text-neutral-100 font-mono uppercase tracking-widest text-center outline-none"
                 required
               />
-
-              <div
-                onClick={generateCaptcha}
-                className="cursor-pointer rounded-lg overflow-hidden border border-neutral-200 dark:border-neutral-800 shrink-0"
-                title="点击刷新验证码"
-              >
-                <canvas
-                  ref={canvasRef}
-                  width={100}
-                  height={38}
-                  className="block"
-                />
-              </div>
-
               <button
                 type="button"
-                onClick={generateCaptcha}
-                className="p-2 rounded-lg border border-neutral-200 dark:border-neutral-800 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-500 shrink-0"
-                title="刷新验证码"
+                onClick={() => setShowPassword(visible => !visible)}
+                aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                className="absolute right-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-lg text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
               >
-                <RefreshCw className="w-4 h-4" />
+                {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
               </button>
             </div>
           </div>
 
+          <CaptchaField
+            id="modal-captcha"
+            code={code}
+            value={captchaInput}
+            onChange={value => {
+              setCaptchaInput(value);
+              if (error) setError(null);
+            }}
+            onRefresh={refresh}
+          />
 
           <div className="flex items-center justify-end gap-2 pt-2">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-white transition-colors"
+              className="h-11 rounded-xl px-4 text-sm font-medium text-neutral-600 transition-colors hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-neutral-800 dark:hover:text-white"
             >
               取消
             </button>
             <button
               type="submit"
-              className="px-4 py-2 text-xs font-medium text-white bg-neutral-900 dark:bg-neutral-100 dark:text-neutral-900 rounded-lg hover:bg-neutral-800 dark:hover:bg-neutral-200 transition-colors flex items-center gap-1.5 shadow-sm"
+              className="flex h-11 items-center gap-1.5 rounded-xl bg-neutral-900 px-4 text-sm font-medium text-white shadow-sm transition-colors hover:bg-neutral-800 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200"
             >
-              <ShieldCheck className="w-4 h-4" />
-              <span>验证并登录</span>
+              <Lock className="h-4 w-4" />
+              <span>登录</span>
             </button>
           </div>
         </form>

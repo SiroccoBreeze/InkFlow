@@ -62,6 +62,46 @@ describe('InkFlow Security & Access Control Verification', () => {
     }
   });
 
+  describe('0. Account-aware Login', () => {
+    it('accepts the matching owner account and password', async () => {
+      const res = await request(app).post('/api/v1/auth/login').send({
+        username: 'security_audit_owner',
+        password: 'AuditOwnerPassword2026!',
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.data?.token).toBeTruthy();
+      expect(res.body.data?.user?.username).toBe('security_audit_owner');
+    });
+
+    it('accepts the account name case-insensitively', async () => {
+      const res = await request(app).post('/api/v1/auth/login').send({
+        username: 'SECURITY_AUDIT_OWNER',
+        password: 'AuditOwnerPassword2026!',
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.data?.token).toBeTruthy();
+    });
+
+    it('rejects a mismatched account even with the correct password', async () => {
+      const res = await request(app).post('/api/v1/auth/login').send({
+        username: 'someone_else',
+        password: 'AuditOwnerPassword2026!',
+      });
+      expect(res.status).toBe(401);
+      expect(res.body.error?.code).toBe('AUTH_FAILED');
+      // Must not reveal whether the account or the password was wrong
+      expect(res.body.error?.message).toMatch(/账号或密码错误/);
+    });
+
+    it('still accepts password-only login for backward compatibility', async () => {
+      const res = await request(app).post('/api/v1/auth/login').send({
+        password: 'AuditOwnerPassword2026!',
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.data?.token).toBeTruthy();
+    });
+  });
+
   describe('1. Admin API Authentication Boundaries', () => {
     it('returns 401 when requesting admin APIs without Authorization header', async () => {
       const res = await request(app).post('/api/v1/documents').send({ title: 'Test' });

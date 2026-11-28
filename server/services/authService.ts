@@ -197,7 +197,7 @@ export class AuthService {
   /**
    * Verifies owner credentials using salted scrypt, with automatic migration from legacy SHA-256.
    */
-  public verifyOwner(password: string): { success: boolean; user?: any; token?: string; message?: string } {
+  public verifyOwner(password: string, username?: string): { success: boolean; user?: any; token?: string; message?: string } {
     const db = this.getDb();
     const user = db.prepare('SELECT id, username, password_hash, role, is_active FROM users WHERE role = ? LIMIT 1').get('owner') as any;
 
@@ -207,7 +207,15 @@ export class AuthService {
 
     const { isValid, needsRehash } = verifyPassword(password, user.password_hash);
     if (!isValid) {
-      return { success: false, message: '访问密码错误，认证失败' };
+      return { success: false, message: '账号或密码错误，认证失败' };
+    }
+
+    // When the client supplies an account name it must match the owner account.
+    // The check runs after password verification so a wrong username and a
+    // wrong password are indistinguishable in message and roughly in timing.
+    const account = typeof username === 'string' ? username.trim() : '';
+    if (account && user.username.trim().toLowerCase() !== account.toLowerCase()) {
+      return { success: false, message: '账号或密码错误，认证失败' };
     }
 
     // Transparently upgrade legacy SHA-256 hash to salted scrypt
