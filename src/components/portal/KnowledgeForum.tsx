@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   MessageSquare,
   Plus,
@@ -19,6 +19,7 @@ import {
 import { ForumReply, ForumTopic, UserSession } from '../../types';
 import { storage } from '../../services/storage';
 import { renderMarkdown } from '../../services/markdown';
+import { attachCodeBlockCopy } from '../../services/codeBlockCopy';
 
 interface KnowledgeForumProps {
   session: UserSession;
@@ -40,6 +41,12 @@ export const KnowledgeForum: React.FC<KnowledgeForumProps> = ({ session }) => {
 
   // Reply form
   const [replyContent, setReplyContent] = useState('');
+
+  // Copy buttons are injected by renderMarkdown; delegate clicks from the topic body.
+  const topicBodyRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    return attachCodeBlockCopy(topicBodyRef.current);
+  }, [selectedTopic?.id, selectedTopic?.content]);
 
   const refreshTopics = () => {
     setTopics([...storage.getForumTopics()]);
@@ -186,6 +193,7 @@ export const KnowledgeForum: React.FC<KnowledgeForumProps> = ({ session }) => {
 
             {/* Markdown Body */}
             <div
+              ref={topicBodyRef}
               className="markdown-body pt-2"
               dangerouslySetInnerHTML={{ __html: renderMarkdown(selectedTopic.content) }}
             />

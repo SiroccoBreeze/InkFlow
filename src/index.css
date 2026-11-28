@@ -328,6 +328,28 @@
   color: inherit !important;
 }
 
+/* Transient feedback for the copy button injected into each code block header.
+   `!important` beats the button's own utility text/border colours. */
+.code-copy-btn.is-copied {
+  color: #047857 !important;
+  border-color: #a7f3d0 !important;
+}
+
+.dark .code-copy-btn.is-copied {
+  color: #34d399 !important;
+  border-color: #065f46 !important;
+}
+
+.code-copy-btn.is-copy-failed {
+  color: #b91c1c !important;
+  border-color: #fecaca !important;
+}
+
+.dark .code-copy-btn.is-copy-failed {
+  color: #f87171 !important;
+  border-color: #7f1d1d !important;
+}
+
 .markdown-body code:not(pre code) {
   background-color: rgba(0, 0, 0, 0.06);
   color: inherit;

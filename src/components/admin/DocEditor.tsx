@@ -53,6 +53,8 @@ import {
 import { VersionHistoryModal } from './VersionHistoryModal';
 import { AttachmentManager } from './AttachmentManager';
 import { hydrateAuthedImages } from '../../services/assetImages';
+import { attachCodeBlockCopy } from '../../services/codeBlockCopy';
+import { copyTextToClipboard } from '../../services/clipboard';
 
 interface DocEditorProps {
   initialDoc?: KnowledgeDoc | null;
@@ -400,9 +402,11 @@ export const DocEditor: React.FC<DocEditorProps> = ({
     const url = new URL(window.location.href);
     url.searchParams.set('share', unlistedKey);
     url.searchParams.delete('doc');
-    navigator.clipboard.writeText(url.toString());
-    setCopiedShareLink(true);
-    setTimeout(() => setCopiedShareLink(false), 2000);
+    void copyTextToClipboard(url.toString()).then(ok => {
+      if (!ok) return;
+      setCopiedShareLink(true);
+      setTimeout(() => setCopiedShareLink(false), 2000);
+    });
   };
 
   // Upload file and insert Markdown link/image at cursor
@@ -491,7 +495,14 @@ export const DocEditor: React.FC<DocEditorProps> = ({
   // After each preview render, swap those sources for authenticated object URLs so
   // a freshly pasted screenshot shows up in the right-hand preview immediately.
   useEffect(() => {
-    const cleanups = [hydrateAuthedImages(previewRef.current), hydrateAuthedImages(fullscreenPreviewRef.current)];
+    const cleanups = [
+      hydrateAuthedImages(previewRef.current),
+      hydrateAuthedImages(fullscreenPreviewRef.current),
+      // The preview HTML is replaced on every keystroke, so the copy buttons are
+      // delegated from the preview containers instead of bound individually.
+      attachCodeBlockCopy(previewRef.current),
+      attachCodeBlockCopy(fullscreenPreviewRef.current),
+    ];
     return () => cleanups.forEach(fn => fn());
   }, [rawMarkdown, editorMode, isFullscreen]);
 

@@ -29,6 +29,8 @@ import {
 import { Attachment, KnowledgeDoc, UserSession, WikiBacklink } from '../../types';
 import { storage } from '../../services/storage';
 import { hydrateAuthedImages, isLocalAssetUrl, loadAuthedAssetUrl } from '../../services/assetImages';
+import { attachCodeBlockCopy } from '../../services/codeBlockCopy';
+import { copyTextToClipboard } from '../../services/clipboard';
 import {
   extractTableOfContents,
   parseFrontmatter,
@@ -323,40 +325,16 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
     return () => document.removeEventListener('click', handleDocClick);
   }, [allDocs, onSelectDocBySlug, onSelectDoc]);
 
-  // Handle click on copy buttons inside rendered code blocks
+  // Handle clicks on copy buttons inside rendered code blocks. A container-level
+  // listener keeps working when the Markdown re-renders and rebuilds the buttons.
   useEffect(() => {
-    if (!contentRef.current) return;
-    const copyButtons = contentRef.current.querySelectorAll<HTMLButtonElement>('.code-copy-btn');
-
-    const cleanups: (() => void)[] = [];
-
-    copyButtons.forEach(btn => {
-      const container = btn.closest('.code-block-container') || btn.closest('pre');
-      const codeEl = container?.querySelector('code') || container?.querySelector('pre');
-      if (!codeEl) return;
-
-      const handleClick = (e: MouseEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const codeText = codeEl.textContent || '';
-        navigator.clipboard.writeText(codeText);
-        const originalText = btn.innerText;
-        btn.innerText = '已复制!';
-        btn.classList.add('text-emerald-400');
-        setTimeout(() => {
-          btn.innerText = originalText || '复制';
-          btn.classList.remove('text-emerald-400');
-        }, 2000);
-      };
-
-      btn.addEventListener('click', handleClick);
-      cleanups.push(() => btn.removeEventListener('click', handleClick));
-    });
-
-    return () => {
-      cleanups.forEach(c => c());
-    };
+    return attachCodeBlockCopy(contentRef.current);
   }, [renderedHtml]);
+
+  const notifyCopyFailure = () => {
+    setToastNotice('复制未成功，请手动选择文本复制');
+    setTimeout(() => setToastNotice(null), 3500);
+  };
 
   // Copy share URL
   const handleCopyShareLink = () => {
@@ -368,26 +346,32 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
       url.searchParams.set('doc', doc.slug);
       url.searchParams.delete('share');
     }
-    navigator.clipboard.writeText(url.toString());
-    setCopiedLink(true);
-    setTimeout(() => setCopiedLink(false), 2000);
+    void copyTextToClipboard(url.toString()).then(ok => {
+      if (!ok) return notifyCopyFailure();
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2000);
+    });
   };
 
   // Copy raw markdown
   const handleCopyRawMarkdown = () => {
     const canonical = serializeToMarkdown(doc);
-    navigator.clipboard.writeText(canonical);
-    setCopiedRaw(true);
-    setTimeout(() => setCopiedRaw(false), 2000);
+    void copyTextToClipboard(canonical).then(ok => {
+      if (!ok) return notifyCopyFailure();
+      setCopiedRaw(true);
+      setTimeout(() => setCopiedRaw(false), 2000);
+    });
   };
 
   // Copy Citation
   const handleCopyCitation = () => {
     const year = new Date(doc.createdAt).getFullYear();
     const citation = `${doc.author}. (${year}). ${doc.title}. InkFlow 个人知识库. ${window.location.href}`;
-    navigator.clipboard.writeText(citation);
-    setCopiedCitation(true);
-    setTimeout(() => setCopiedCitation(false), 2000);
+    void copyTextToClipboard(citation).then(ok => {
+      if (!ok) return notifyCopyFailure();
+      setCopiedCitation(true);
+      setTimeout(() => setCopiedCitation(false), 2000);
+    });
   };
 
   // Download .md
