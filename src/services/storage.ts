@@ -23,6 +23,7 @@ import {
   serializeToMarkdown,
 } from './markdown';
 import { apiClient } from './apiClient';
+import { defaultColorForName, normalizeHexColor } from './categoryColors';
 
 const STORAGE_KEYS = {
   DOCS: 'inkflow_docs_v1',
@@ -670,16 +671,37 @@ export class StorageService {
         this.persistDocs(backendDocs);
       }
 
-      // Sync categories from SQLite backend
+      // Sync categories from SQLite backend. The server is the source of truth
+      // for category identity, but a color already chosen locally is preserved
+      // when the backend row predates the color column.
       const catRes = await apiClient.getCategories();
       if (catRes.data && Array.isArray(catRes.data) && catRes.data.length > 0) {
-        const mapped = catRes.data.map((c: any) => ({
-          id: c.id,
-          name: c.name,
-          slug: c.slug || c.name.toLowerCase(),
-          description: c.description || '',
-          order: c.sort_order || 0,
-        }));
+        const local = this.getCategories();
+        const mapped: Category[] = catRes.data.map((c: any) => {
+          const localCat = local.find(l => l.id === c.id || l.name === c.name);
+          return {
+            id: c.id,
+            name: c.name,
+            slug: c.slug || c.name.toLowerCase(),
+            description: c.description || '',
+            color: normalizeHexColor(c.color) || normalizeHexColor(localCat?.color) || defaultColorForName(c.name),
+            order: Number(c.sort_order) || localCat?.order || 0,
+          };
+        });
+
+        // Keep categories that exist only locally (e.g. created while offline)
+        // instead of silently dropping them on the next sync.
+        local.forEach(localCat => {
+          const alreadyThere = mapped.some(m => m.id === localCat.id || m.name === localCat.name);
+          if (!alreadyThere) {
+            mapped.push({
+              ...localCat,
+              color: normalizeHexColor(localCat.color) || defaultColorForName(localCat.name),
+            });
+          }
+        });
+
+        mapped.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
         this.categoriesCache = mapped;
         localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify(mapped));
       }
@@ -807,28 +829,61 @@ export class StorageService {
     if (this.categoriesCache) return this.categoriesCache;
     try {
       const data = localStorage.getItem(STORAGE_KEYS.CATEGORIES);
-      this.categoriesCache = data ? JSON.parse(data) : DEFAULT_CATEGORIES;
-      return this.categoriesCache || [];
+      const parsed: Category[] = data ? JSON.parse(data) : DEFAULT_CATEGORIES;
+      const normalized = parsed.map(c => ({
+        ...c,
+        // Legacy installations stored categories without a color. Fill those in
+        // deterministically so every consumer (graph, sidebar, admin) agrees.
+        color: normalizeHexColor(c.color) || defaultColorForName(c.name),
+      }));
+      this.categoriesCache = normalized;
+      return normalized;
     } catch {
-      return DEFAULT_CATEGORIES;
+      return DEFAULT_CATEGORIES.map(c => ({
+        ...c,
+        color: normalizeHexColor(c.color) || defaultColorForName(c.name),
+      }));
     }
   }
 
   public saveCategory(category: Category): void {
     const list = this.getCategories();
     const idx = list.findIndex(c => c.id === category.id);
-    if (idx >= 0) {
-      list[idx] = category;
+    const isExisting = idx >= 0;
+    const normalized: Category = {
+      ...category,
+      color: normalizeHexColor(category.color) || defaultColorForName(category.name),
+    };
+
+    if (isExisting) {
+      list[idx] = normalized;
     } else {
-      list.push(category);
+      list.push(normalized);
     }
     this.categoriesCache = list;
     localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify(list));
-    apiClient.createCategory({
-      name: category.name,
-      description: category.description,
-      slug: category.slug,
-    }).catch(() => {});
+
+    const payload = {
+      name: normalized.name,
+      description: normalized.description,
+      slug: normalized.slug,
+      color: normalized.color,
+      sort_order: normalized.order,
+    };
+
+    if (isExisting) {
+      // Update in place. POSTing an existing category again would insert a
+      // duplicate row and throw on UNIQUE(owner_id, name).
+      apiClient.updateCategory(normalized.id, payload).then(res => {
+        if (res.error?.status === 404) {
+          // Local-only category (legacy seeded default or created offline):
+          // publish it once, then the next sync reconciles the remote id.
+          apiClient.createCategory(payload).catch(() => {});
+        }
+      }).catch(() => {});
+    } else {
+      apiClient.createCategory(payload).catch(() => {});
+    }
   }
 
   public deleteCategory(idOrName: string): void {

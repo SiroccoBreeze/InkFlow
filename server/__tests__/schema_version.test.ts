@@ -95,14 +95,19 @@ describe('Database schema versioning', () => {
     expect(migrations.map(row => row.version)).toEqual([
       BASELINE_SCHEMA_VERSION,
       2,
+      3,
       CURRENT_SCHEMA_VERSION,
     ]);
     expect(migrations.map(row => row.name)).toContain('baseline');
     expect(migrations.map(row => row.name)).toContain('normalize-storage-paths');
     expect(migrations.map(row => row.name)).toContain('create-asset-deletions');
+    expect(migrations.map(row => row.name)).toContain('add-category-color');
 
     const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]).map(row => row.name);
     expect(tables).toContain('asset_deletions');
+
+    const categoryColumns = (db.prepare('PRAGMA table_info(categories)').all() as any[]).map(c => c.name);
+    expect(categoryColumns).toContain('color');
 
     // Re-running startup must be a no-op.
     initDatabaseSchema(db);
@@ -139,6 +144,38 @@ describe('Database schema versioning', () => {
     // document_hash migration still ran.
     const columns = (db.prepare('PRAGMA table_info(documents)').all() as any[]).map(c => c.name);
     expect(columns).toContain('document_hash');
+    db.close();
+  });
+
+  it('adds category colors when upgrading a v3 database', () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec(`
+      CREATE TABLE categories (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        slug TEXT NOT NULL,
+        description TEXT,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO categories (id, owner_id, name, slug, description, sort_order, created_at, updated_at)
+      VALUES ('cat_arch', 'usr_owner', '架构与系统', 'architecture', '', 1, 'now', 'now');
+      INSERT INTO categories (id, owner_id, name, slug, description, sort_order, created_at, updated_at)
+      VALUES ('cat_custom', 'usr_owner', '自定义领域', 'custom', '', 2, 'now', 'now');
+    `);
+    db.exec('PRAGMA user_version = 3');
+
+    initDatabaseSchema(db);
+
+    expect(getUserVersion(db)).toBe(CURRENT_SCHEMA_VERSION);
+    expect(
+      (db.prepare('SELECT color FROM categories WHERE id = ?').get('cat_arch') as any).color
+    ).toBe('#0284c7');
+    expect(
+      (db.prepare('SELECT color FROM categories WHERE id = ?').get('cat_custom') as any).color
+    ).toMatch(/^#[0-9a-f]{6}$/);
     db.close();
   });
 

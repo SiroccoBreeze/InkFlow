@@ -260,7 +260,7 @@ export default function App() {
             onSelectTag={setSelectedTag}
           />
         ) : currentTab === 'graph' ? (
-          <KnowledgeGraph onSelectDoc={handleOpenDoc} />
+          <KnowledgeGraph categories={categories} onSelectDoc={handleOpenDoc} />
         ) : currentTab === 'forum' ? (
           <KnowledgeForum session={session} />
         ) : currentTab === 'categories' ? (

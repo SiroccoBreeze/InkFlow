@@ -347,11 +347,36 @@ class ApiClient {
     return this.request<any[]>('/categories');
   }
 
-  public async createCategory(category: { name: string; description?: string; slug?: string }) {
-    return this.request<{ id: string; name: string }>('/categories', {
+  public async createCategory(category: {
+    name: string;
+    description?: string;
+    slug?: string;
+    color?: string;
+    sort_order?: number;
+  }) {
+    return this.request<{ id: string; name: string; color?: string }>('/categories', {
       method: 'POST',
       body: JSON.stringify(category),
     });
+  }
+
+  public async updateCategory(
+    id: string,
+    category: {
+      name: string;
+      description?: string;
+      slug?: string;
+      color?: string;
+      sort_order?: number;
+    }
+  ) {
+    return this.request<{ id: string; name: string; color?: string }>(
+      `/categories/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(category),
+      }
+    );
   }
 
   public async deleteCategory(idOrName: string) {

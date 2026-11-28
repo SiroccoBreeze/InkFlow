@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { Category, KnowledgeDoc } from '../../types';
 import { storage } from '../../services/storage';
+import { resolveCategoryColor } from '../../services/categoryColors';
 import { Pagination } from '../common/Pagination';
 
 interface PublicPortalProps {
@@ -23,14 +24,6 @@ interface PublicPortalProps {
   selectedTag: string | null;
   onSelectTag: (tag: string | null) => void;
 }
-
-const CATEGORY_COLORS: Record<string, string> = {
-  '架构与系统': '#0284c7', // Sky Blue
-  '前端与工程': '#16a34a', // Emerald Green
-  '认知与方法论': '#d97706', // Amber Gold
-  '商业与战略': '#7c3aed', // Violet Purple
-  '个人复盘': '#e11d48', // Rose Red
-};
 
 export const PublicPortal: React.FC<PublicPortalProps> = ({
   docs,
@@ -178,7 +171,7 @@ export const PublicPortal: React.FC<PublicPortalProps> = ({
               {categories.map(cat => {
                 const isSelected = selectedCategory === cat.name;
                 const count = publicDocs.filter(d => d.category === cat.name).length;
-                const dotColor = CATEGORY_COLORS[cat.name] || '#64748b';
+                const dotColor = resolveCategoryColor(categories, cat.name);
 
                 return (
                   <button
@@ -343,7 +336,7 @@ export const PublicPortal: React.FC<PublicPortalProps> = ({
             <>
               <div className="space-y-3.5">
                 {paginatedDocs.map(doc => {
-                  const dotColor = CATEGORY_COLORS[doc.category] || '#64748b';
+                  const dotColor = resolveCategoryColor(categories, doc.category);
                   const commentsCount = commentsCountMap[doc.id] || 0;
 
                   // Clean text snippet for reading preview

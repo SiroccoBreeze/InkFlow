@@ -36,6 +36,13 @@ import {
 import { Category, DocStatus, DocVisibility, KnowledgeDoc } from '../../types';
 import { storage } from '../../services/storage';
 import { apiClient } from '../../services/apiClient';
+import {
+  CATEGORY_PALETTE,
+  normalizeHexColor,
+  pickCategoryColor,
+  resolveCategoryColor,
+} from '../../services/categoryColors';
+import { CategoryColorPicker } from '../common/CategoryColorPicker';
 import { DocEditor } from './DocEditor';
 import { VersionHistoryModal } from './VersionHistoryModal';
 import { Pagination } from '../common/Pagination';
@@ -55,14 +62,6 @@ const DOC_STATUS_LABELS: Record<DocStatus, string> = {
   draft: '草稿',
   published: '已发布',
   archived: '已归档',
-};
-
-const CATEGORY_COLORS: Record<string, string> = {
-  '架构与系统': '#0284c7', // Sky Blue
-  '前端与工程': '#16a34a', // Emerald Green
-  '认知与方法论': '#d97706', // Amber Gold
-  '商业与战略': '#7c3aed', // Violet Purple
-  '个人复盘': '#e11d48', // Rose Red
 };
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
@@ -107,9 +106,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Category management form states
   const [newCatName, setNewCatName] = useState('');
   const [newCatDesc, setNewCatDesc] = useState('');
+  const [newCatColor, setNewCatColor] = useState<string>(CATEGORY_PALETTE[0]);
   const [editingCatId, setEditingCatId] = useState<string | null>(null);
   const [editingCatName, setEditingCatName] = useState('');
   const [editingCatDesc, setEditingCatDesc] = useState('');
+  const [editingCatColor, setEditingCatColor] = useState('');
 
   // Tag management states
   const [newTagName, setNewTagName] = useState('');
@@ -671,15 +672,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleAddCategory = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCatName.trim()) return;
+    const name = newCatName.trim();
     storage.saveCategory({
       id: `cat-${Date.now().toString(36)}`,
-      name: newCatName.trim(),
-      slug: newCatName.trim().toLowerCase().replace(/\s+/g, '-'),
+      name,
+      slug: name.toLowerCase().replace(/\s+/g, '-'),
       description: newCatDesc.trim() || '自主管理的知识领域',
+      color: normalizeHexColor(newCatColor) || pickCategoryColor(name, categories),
       order: categories.length + 1,
     });
     setNewCatName('');
     setNewCatDesc('');
+    setNewCatColor(CATEGORY_PALETTE[(categories.length + 1) % CATEGORY_PALETTE.length]);
     onRefreshData();
     showStatus('知识分类已创建');
   };
@@ -692,6 +696,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         ...cat,
         name: editingCatName.trim(),
         description: editingCatDesc.trim(),
+        color: normalizeHexColor(editingCatColor) || resolveCategoryColor(categories, cat.name),
       });
       setEditingCatId(null);
       onRefreshData();
@@ -1304,7 +1309,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     ) : (
                       paginatedDocs.map(doc => {
                         const isSelected = selectedDocIds.includes(doc.id);
-                        const dotColor = CATEGORY_COLORS[doc.category] || '#64748b';
+                        const dotColor = resolveCategoryColor(categories, doc.category);
 
                         return (
                           <tr
@@ -1503,7 +1508,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                 {paginatedDocs.map(doc => {
                   const isSelected = selectedDocIds.includes(doc.id);
-                  const dotColor = CATEGORY_COLORS[doc.category] || '#64748b';
+                  const dotColor = resolveCategoryColor(categories, doc.category);
                   const cleanText = (doc.rawMarkdown || '')
                     .replace(/^---[\s\S]*?---/, '')
                     .replace(/^#+.*$/gm, '')
@@ -1804,27 +1809,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
 
             {/* Create category */}
-            <form onSubmit={handleAddCategory} className="flex gap-2 flex-wrap">
-              <input
-                type="text"
-                value={newCatName}
-                onChange={e => setNewCatName(e.target.value)}
-                placeholder="新分类名称 (如 人工智能)..."
-                className="px-3 py-1.5 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg text-xs outline-none"
-              />
-              <input
-                type="text"
-                value={newCatDesc}
-                onChange={e => setNewCatDesc(e.target.value)}
-                placeholder="分类简要说明..."
-                className="px-3 py-1.5 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg text-xs outline-none min-w-[160px]"
-              />
-              <button
-                type="submit"
-                className="px-3 py-1.5 bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 rounded-lg text-xs font-semibold"
-              >
-                新建分类
-              </button>
+            <form onSubmit={handleAddCategory} className="flex flex-col gap-2">
+              <div className="flex gap-2 flex-wrap">
+                <input
+                  type="text"
+                  value={newCatName}
+                  onChange={e => setNewCatName(e.target.value)}
+                  placeholder="新分类名称 (如 人工智能)..."
+                  className="px-3 py-1.5 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg text-xs outline-none"
+                />
+                <input
+                  type="text"
+                  value={newCatDesc}
+                  onChange={e => setNewCatDesc(e.target.value)}
+                  placeholder="分类简要说明..."
+                  className="px-3 py-1.5 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg text-xs outline-none min-w-[160px]"
+                />
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 rounded-lg text-xs font-semibold"
+                >
+                  新建分类
+                </button>
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-neutral-500">
+                <span className="shrink-0">分类颜色</span>
+                <CategoryColorPicker value={newCatColor} onChange={setNewCatColor} />
+              </div>
             </form>
           </div>
 
@@ -1832,7 +1843,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             {categories.map(c => {
               const docCount = docs.filter(d => d.category === c.name).length;
               const isEditing = editingCatId === c.id;
-              const dotColor = CATEGORY_COLORS[c.name] || '#64748b';
+              const dotColor = resolveCategoryColor(categories, c.name);
 
               return (
                 <div
@@ -1840,31 +1851,37 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   className="p-3 bg-neutral-50 dark:bg-neutral-950/60 border border-neutral-200/80 dark:border-neutral-800 rounded-lg flex items-center justify-between gap-3 text-xs"
                 >
                   {isEditing ? (
-                    <div className="flex items-center gap-2 flex-1">
-                      <input
-                        type="text"
-                        value={editingCatName}
-                        onChange={e => setEditingCatName(e.target.value)}
-                        className="px-2 py-1 bg-white dark:bg-neutral-900 border rounded text-xs outline-none w-36"
-                      />
-                      <input
-                        type="text"
-                        value={editingCatDesc}
-                        onChange={e => setEditingCatDesc(e.target.value)}
-                        className="flex-1 px-2 py-1 bg-white dark:bg-neutral-900 border rounded text-xs outline-none"
-                      />
-                      <button
-                        onClick={() => handleSaveEditCategory(c.id)}
-                        className="px-2.5 py-1 bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 rounded font-semibold text-xs"
-                      >
-                        保存
-                      </button>
-                      <button
-                        onClick={() => setEditingCatId(null)}
-                        className="p-1 text-neutral-400"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
+                    <div className="flex-1 space-y-2">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={editingCatName}
+                          onChange={e => setEditingCatName(e.target.value)}
+                          className="px-2 py-1 bg-white dark:bg-neutral-900 border rounded text-xs outline-none w-36"
+                        />
+                        <input
+                          type="text"
+                          value={editingCatDesc}
+                          onChange={e => setEditingCatDesc(e.target.value)}
+                          className="flex-1 px-2 py-1 bg-white dark:bg-neutral-900 border rounded text-xs outline-none"
+                        />
+                        <button
+                          onClick={() => handleSaveEditCategory(c.id)}
+                          className="px-2.5 py-1 bg-neutral-900 text-white dark:bg-white dark:text-neutral-900 rounded font-semibold text-xs"
+                        >
+                          保存
+                        </button>
+                        <button
+                          onClick={() => setEditingCatId(null)}
+                          className="p-1 text-neutral-400"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <div className="flex items-center gap-2 text-[11px] text-neutral-500">
+                        <span className="shrink-0">分类颜色</span>
+                        <CategoryColorPicker value={editingCatColor} onChange={setEditingCatColor} />
+                      </div>
                     </div>
                   ) : (
                     <>
@@ -1890,6 +1907,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             setEditingCatId(c.id);
                             setEditingCatName(c.name);
                             setEditingCatDesc(c.description);
+                            setEditingCatColor(resolveCategoryColor(categories, c.name));
                           }}
                           className="px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-800 text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white"
                         >

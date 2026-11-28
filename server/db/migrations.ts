@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { normalizeStorageRelativePath } from '../utils/storagePaths';
+import { defaultCategoryColor } from '../utils/categoryColor';
 
 /**
  * Database schema versioning.
@@ -23,8 +24,9 @@ export const BASELINE_SCHEMA_VERSION = 1;
  * v1: baseline schema (includes documents.document_hash, handled by schema.ts).
  * v2: canonical POSIX storage paths (Windows backslashes → '/').
  * v3: asset deletion tombstones (crash-safe attachment deletion + reconcile guard).
+ * v4: categories.color (user-editable category colors, no longer hard-coded in the UI).
  */
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export interface SchemaMigration {
   version: number;
@@ -127,6 +129,40 @@ function createAssetDeletionsTable(db: DatabaseSync): void {
   `);
 }
 
+function addCategoryColorColumn(db: DatabaseSync): void {
+  const columns = (db.prepare('PRAGMA table_info(categories)').all() as Array<{ name: string }>).map(
+    c => c.name
+  );
+
+  if (!columns.includes('color')) {
+    db.exec('ALTER TABLE categories ADD COLUMN color TEXT');
+  }
+
+  // Backfill every existing category so the graph never paints a category grey
+  // just because it predates user-editable colors. The seeded defaults keep the
+  // colors the old hard-coded UI used; everything else gets the same stable
+  // palette-derived color the frontend would fall back to.
+  const legacyColors: Record<string, string> = {
+    架构与系统: '#0284c7',
+    前端与工程: '#16a34a',
+    认知与方法论: '#d97706',
+    商业与战略: '#7c3aed',
+    个人复盘: '#e11d48',
+    AI与前沿工程: '#7c3aed',
+    前端与跨端: '#16a34a',
+    安全与数据主权: '#e11d48',
+  };
+
+  const rows = db
+    .prepare("SELECT id, name FROM categories WHERE color IS NULL OR color = ''")
+    .all() as Array<{ id: string; name: string }>;
+  const update = db.prepare('UPDATE categories SET color = ? WHERE id = ?');
+
+  for (const row of rows) {
+    update.run(legacyColors[row.name] || defaultCategoryColor(row.name), row.id);
+  }
+}
+
 const MIGRATIONS: SchemaMigration[] = [
   {
     version: 2,
@@ -137,6 +173,11 @@ const MIGRATIONS: SchemaMigration[] = [
     version: 3,
     name: 'create-asset-deletions',
     up: createAssetDeletionsTable,
+  },
+  {
+    version: 4,
+    name: 'add-category-color',
+    up: addCategoryColorColumn,
   },
 ];
 

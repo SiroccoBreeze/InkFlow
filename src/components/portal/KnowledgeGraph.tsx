@@ -1,13 +1,15 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { Share2, ZoomIn, ZoomOut, RotateCcw, Filter, Eye, ArrowRight, BookOpen } from 'lucide-react';
-import { GraphLink, GraphNode, KnowledgeDoc } from '../../types';
+import { Category, GraphLink, GraphNode, KnowledgeDoc } from '../../types';
 import { storage } from '../../services/storage';
+import { resolveCategoryColor, TAG_NODE_COLOR } from '../../services/categoryColors';
 
 interface KnowledgeGraphProps {
+  categories: Category[];
   onSelectDoc: (doc: KnowledgeDoc) => void;
 }
 
-export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ onSelectDoc }) => {
+export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ categories, onSelectDoc }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hoveredNode, setHoveredNode] = useState<GraphNode | null>(null);
   const [showTags, setShowTags] = useState(true);
@@ -23,15 +25,19 @@ export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ onSelectDoc }) =
   const draggedNodeRef = useRef<(GraphNode & { x: number; y: number; vx: number; vy: number }) | null>(null);
   const lastMousePosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
-  // Color mapping by category
-  const categoryColors: Record<string, string> = {
-    '架构与系统': '#0284c7',
-    '前端与工程': '#16a34a',
-    '认知与方法论': '#d97706',
-    '商业与战略': '#7c3aed',
-    '个人复盘': '#e11d48',
-    'Tag': '#64748b',
-  };
+  // Document nodes are painted with their category's own color. Tag nodes are a
+  // separate node kind and never borrow a category color. The map is rebuilt on
+  // every render and read by the animation loop through a ref, so editing a
+  // color takes effect without restarting the force simulation.
+  const categoryColorMapRef = useRef<Record<string, string>>({});
+  categoryColorMapRef.current = {};
+  categories.forEach(c => {
+    categoryColorMapRef.current[c.name] = resolveCategoryColor(categories, c.name);
+  });
+
+  const sortedCategories = [...categories].sort(
+    (a, b) => a.order - b.order || a.name.localeCompare(b.name)
+  );
 
   useEffect(() => {
     const raw = storage.getGraphData();
@@ -225,7 +231,10 @@ export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ onSelectDoc }) =
       // Draw nodes
       activeNodes.forEach(node => {
         const isHovered = activeHoveredId === node.id;
-        const color = categoryColors[node.category] || '#64748b';
+        const color =
+          node.type === 'tag'
+            ? TAG_NODE_COLOR
+            : categoryColorMapRef.current[node.category] || TAG_NODE_COLOR;
         const radius = node.type === 'doc' ? node.val : 5.5;
 
         // Hover halo / glow (High contrast in both light & dark modes)
@@ -441,8 +450,6 @@ export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ onSelectDoc }) =
     transformRef.current = { x: 0, y: 0, k: 1 };
   };
 
-  const categories = storage.getCategories();
-
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-6">
       
@@ -467,7 +474,7 @@ export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ onSelectDoc }) =
             className="px-2.5 py-1.5 text-xs bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-lg outline-none"
           >
             <option value="all">全领域节点</option>
-            {categories.map(c => (
+            {sortedCategories.map(c => (
               <option key={c.id} value={c.name}>
                 {c.name}
               </option>
@@ -535,12 +542,19 @@ export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ onSelectDoc }) =
           <div className="font-semibold text-neutral-500 uppercase tracking-wider text-[10px] mb-1">
             图谱图例
           </div>
-          {Object.entries(categoryColors).map(([cat, col]) => (
-            <div key={cat} className="flex items-center gap-2 text-neutral-700 dark:text-neutral-300">
-              <span className="w-2.5 h-2.5 rounded-full shrink-0 shadow-2xs" style={{ backgroundColor: col }} />
-              <span>{cat}</span>
+          {sortedCategories.map(cat => (
+            <div key={cat.id} className="flex items-center gap-2 text-neutral-700 dark:text-neutral-300">
+              <span
+                className="w-2.5 h-2.5 rounded-full shrink-0 shadow-2xs"
+                style={{ backgroundColor: resolveCategoryColor(categories, cat.name) }}
+              />
+              <span>{cat.name}</span>
             </div>
           ))}
+          <div className="flex items-center gap-2 text-neutral-700 dark:text-neutral-300">
+            <span className="w-2.5 h-2.5 rounded-full shrink-0 shadow-2xs" style={{ backgroundColor: TAG_NODE_COLOR }} />
+            <span>标签</span>
+          </div>
         </div>
 
         {/* Hover Tooltip Overlay (Deep contrast in both light and dark modes) */}
@@ -550,17 +564,24 @@ export const KnowledgeGraph: React.FC<KnowledgeGraphProps> = ({ onSelectDoc }) =
               <span className="text-[10px] font-mono uppercase tracking-wider text-neutral-400">
                 {hoveredNode.type === 'doc' ? '知识文献' : '关联标签'}
               </span>
-              <span 
-                className="w-2.5 h-2.5 rounded-full shrink-0" 
-                style={{ backgroundColor: categoryColors[hoveredNode.category] || '#64748b' }} 
+              <span
+                className="w-2.5 h-2.5 rounded-full shrink-0"
+                style={{
+                  backgroundColor:
+                    hoveredNode.type === 'tag'
+                      ? TAG_NODE_COLOR
+                      : resolveCategoryColor(categories, hoveredNode.category),
+                }}
               />
             </div>
             <h4 className="font-bold text-white text-sm leading-snug">
               {hoveredNode.label}
             </h4>
             <div className="text-[11px] text-neutral-400 flex items-center gap-1.5">
-              <span>所属领域：</span>
-              <span className="text-neutral-200 font-medium">{hoveredNode.category}</span>
+              <span>{hoveredNode.type === 'doc' ? '所属领域：' : '连接方式：'}</span>
+              <span className="text-neutral-200 font-medium">
+                {hoveredNode.type === 'doc' ? hoveredNode.category : '跨领域知识标签'}
+              </span>
             </div>
             {hoveredNode.type === 'doc' && (
               <p className="text-[11px] text-blue-400 pt-1 font-medium flex items-center gap-1">

@@ -5,6 +5,7 @@ import { getDatabase, generateId, runInTransaction } from '../db/sqlite';
 import { fileStorage } from './fileStorageService';
 import { assetService } from './assetService';
 import { consistencyGate } from './consistencyGate';
+import { defaultCategoryColor } from '../utils/categoryColor';
 
 export interface DocumentInput {
   id?: string;
@@ -945,9 +946,9 @@ export class DocumentService {
         if (!categoryId) {
           categoryId = generateId('cat');
           db.prepare(`
-            INSERT OR IGNORE INTO categories (id, owner_id, name, slug, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).run(categoryId, ownerId, category, slug, now, now);
+            INSERT OR IGNORE INTO categories (id, owner_id, name, slug, description, color, sort_order, created_at, updated_at)
+            VALUES (?, ?, ?, ?, '', ?, 0, ?, ?)
+          `).run(categoryId, ownerId, category, slug, defaultCategoryColor(category), now, now);
         }
 
         if (existing) {

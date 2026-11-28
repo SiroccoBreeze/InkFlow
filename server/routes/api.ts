@@ -682,28 +682,164 @@ apiRouter.post('/assets/cleanup-orphans', requireOwner, async (req, res) => {
 });
 
 // ---------------- CATEGORIES & TAGS ROUTES ----------------
+const CATEGORY_NAME_MAX_LENGTH = 120;
+const CATEGORY_COLOR_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+
+/**
+ * Validates a category color from a request body.
+ * Returns `{}` when the field is absent (leave the stored value untouched),
+ * `{ value: '' }` when the caller explicitly clears it.
+ */
+function parseCategoryColor(raw: unknown): { value?: string; error?: string } {
+  if (raw === undefined) return {};
+  if (raw === null || raw === '') return { value: '' };
+  if (typeof raw !== 'string') {
+    return { error: '分类颜色必须为 #RGB 或 #RRGGBB 格式' };
+  }
+  const trimmed = raw.trim();
+  if (!CATEGORY_COLOR_RE.test(trimmed)) {
+    return { error: '分类颜色必须为 #RGB 或 #RRGGBB 格式' };
+  }
+  const lower = trimmed.toLowerCase();
+  if (lower.length === 4) {
+    const [r, g, b] = lower.slice(1);
+    return { value: `#${r}${r}${g}${g}${b}${b}` };
+  }
+  return { value: lower };
+}
+
+function parseCategoryName(raw: unknown): { value?: string; error?: string } {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { error: '分类名称不能为空' };
+  }
+  const value = raw.trim();
+  if (value.length > CATEGORY_NAME_MAX_LENGTH) {
+    return { error: `分类名称必须为不超过 ${CATEGORY_NAME_MAX_LENGTH} 字符的字符串` };
+  }
+  return { value };
+}
+
+function parseSortOrder(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 apiRouter.get('/categories', (req, res) => {
   const db = getDatabase();
-  const rows = db.prepare('SELECT id, name, slug, description, sort_order FROM categories ORDER BY sort_order ASC, name ASC').all();
+  const rows = db.prepare('SELECT id, name, slug, description, color, sort_order FROM categories ORDER BY sort_order ASC, name ASC').all();
   res.json({ data: rows });
 });
 
 apiRouter.post('/categories', requireOwner, (req, res) => {
   const user = (req as any).user;
-  const { name, description, slug } = req.body;
-  if (!name?.trim()) {
-    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: '分类名称不能为空' } });
+  const { name, description, slug, color, sort_order } = req.body;
+
+  const parsedName = parseCategoryName(name);
+  if (parsedName.error) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: parsedName.error } });
     return;
   }
+  const parsedColor = parseCategoryColor(color);
+  if (parsedColor.error) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: parsedColor.error } });
+    return;
+  }
+
+  const trimmedName = parsedName.value as string;
   const db = getDatabase();
   const id = generateId('cat');
   const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO categories (id, owner_id, name, slug, description, sort_order, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-  `).run(id, user.id, name.trim(), slug || name.trim().toLowerCase(), description || '', now, now);
+  const nextColor = parsedColor.value || '';
+  const nextOrder = parseSortOrder(sort_order, 0);
 
-  res.status(201).json({ data: { id, name: name.trim() } });
+  try {
+    db.prepare(`
+      INSERT INTO categories (id, owner_id, name, slug, description, color, sort_order, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      user.id,
+      trimmedName,
+      slug || trimmedName.toLowerCase(),
+      description || '',
+      nextColor,
+      nextOrder,
+      now,
+      now
+    );
+  } catch (err: any) {
+    if (/UNIQUE constraint/i.test(err?.message || '')) {
+      res.status(409).json({ error: { code: 'CATEGORY_EXISTS', message: '同名分类已存在' } });
+      return;
+    }
+    throw err;
+  }
+
+  res.status(201).json({ data: { id, name: trimmedName, color: nextColor } });
+});
+
+apiRouter.put('/categories/:id', requireOwner, async (req, res) => {
+  const db = getDatabase();
+  const existing = db
+    .prepare('SELECT id, name, slug, description, color, sort_order FROM categories WHERE id = ?')
+    .get(req.params.id) as any;
+
+  if (!existing) {
+    res.status(404).json({ error: { code: 'CATEGORY_NOT_FOUND', message: '分类不存在' } });
+    return;
+  }
+
+  const { name, description, slug, color, sort_order } = req.body;
+
+  const parsedName = parseCategoryName(name);
+  if (parsedName.error) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: parsedName.error } });
+    return;
+  }
+  const parsedColor = parseCategoryColor(color);
+  if (parsedColor.error) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: parsedColor.error } });
+    return;
+  }
+
+  const nextName = parsedName.value as string;
+  const nextSlug = typeof slug === 'string' && slug.trim() ? slug.trim() : existing.slug;
+  const nextDescription = typeof description === 'string' ? description : existing.description || '';
+  const nextColor = parsedColor.value !== undefined ? parsedColor.value : existing.color || '';
+  const nextOrder = parseSortOrder(sort_order, Number(existing.sort_order) || 0);
+
+  try {
+    // Renaming a category rewrites documents.category_name, which belongs to the
+    // Markdown-backed document state. Take the shared consistency lease so a
+    // backup snapshot never observes the DB half-way through the rename.
+    const data = await consistencyGate.withShared(async () => {
+      const now = new Date().toISOString();
+      db.prepare(`
+        UPDATE categories
+        SET name = ?, slug = ?, description = ?, color = ?, sort_order = ?, updated_at = ?
+        WHERE id = ?
+      `).run(nextName, nextSlug, nextDescription, nextColor, nextOrder, now, existing.id);
+
+      if (nextName !== existing.name) {
+        db.prepare('UPDATE documents SET category_name = ?, category_id = ? WHERE category_name = ?').run(
+          nextName,
+          existing.id,
+          existing.name
+        );
+      }
+
+      return { id: existing.id, name: nextName, color: nextColor, sort_order: nextOrder };
+    });
+    res.json({ data });
+  } catch (err: any) {
+    if (/UNIQUE constraint/i.test(err?.message || '')) {
+      res.status(409).json({ error: { code: 'CATEGORY_EXISTS', message: '同名分类已存在' } });
+      return;
+    }
+    console.error('[InkFlow Categories] Failed updating category:', err);
+    res.status(500).json({ error: { code: 'CATEGORY_UPDATE_FAILED', message: err?.message || '更新分类失败' } });
+  }
 });
 
 apiRouter.delete('/categories/:id', requireOwner, async (req, res) => {

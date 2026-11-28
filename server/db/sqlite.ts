@@ -152,20 +152,20 @@ export function seedDefaultCategoriesIfEmpty(db: DatabaseSync, ownerId: string):
   if (catCount === 0) {
     const now = new Date().toISOString();
     const defaultCategories = [
-      { id: 'cat_arch', name: '架构与系统', slug: 'architecture', desc: '全栈架构演进、高可用设计与分布式基础设施', order: 1 },
-      { id: 'cat_cog', name: '认知与方法论', slug: 'cognitive', desc: '心智模型、卡片盒笔记法、个人知识管理与第二大脑体系', order: 2 },
-      { id: 'cat_ai', name: 'AI与前沿工程', slug: 'ai-engineering', desc: '大语言模型应用、Prompt工程、智能体Agent与知识库检索增强', order: 3 },
-      { id: 'cat_web', name: '前端与跨端', slug: 'frontend', desc: '现代前端工程化、组件库架构与性能优化实践', order: 4 },
-      { id: 'cat_sec', name: '安全与数据主权', slug: 'security', desc: '本地优先架构、数据主权、加密分享与防数据丢失防护机制', order: 5 },
+      { id: 'cat_arch', name: '架构与系统', slug: 'architecture', desc: '全栈架构演进、高可用设计与分布式基础设施', color: '#0284c7', order: 1 },
+      { id: 'cat_cog', name: '认知与方法论', slug: 'cognitive', desc: '心智模型、卡片盒笔记法、个人知识管理与第二大脑体系', color: '#d97706', order: 2 },
+      { id: 'cat_ai', name: 'AI与前沿工程', slug: 'ai-engineering', desc: '大语言模型应用、Prompt工程、智能体Agent与知识库检索增强', color: '#7c3aed', order: 3 },
+      { id: 'cat_web', name: '前端与跨端', slug: 'frontend', desc: '现代前端工程化、组件库架构与性能优化实践', color: '#16a34a', order: 4 },
+      { id: 'cat_sec', name: '安全与数据主权', slug: 'security', desc: '本地优先架构、数据主权、加密分享与防数据丢失防护机制', color: '#e11d48', order: 5 },
     ];
 
     const insertCat = db.prepare(`
-      INSERT INTO categories (id, owner_id, name, slug, description, sort_order, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO categories (id, owner_id, name, slug, description, color, sort_order, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     for (const c of defaultCategories) {
-      insertCat.run(c.id, ownerId, c.name, c.slug, c.desc, c.order, now, now);
+      insertCat.run(c.id, ownerId, c.name, c.slug, c.desc, c.color, c.order, now, now);
     }
   }
 }
