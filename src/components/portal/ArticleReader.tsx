@@ -398,9 +398,18 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  // Zen mode always uses the wide viewport layout (the card expands to fit it);
-  // the "正文版宽" preference now tunes the prose measure inside that card so
-  // code blocks, tables and images can use the full width without long lines.
+  // Normal reading mode: the preference scales the whole reading area (the
+  // article and the sticky sidebar shrink or grow together). Zen mode always
+  // uses the wide viewport layout; there the same preference tunes the prose
+  // measure inside the card so code blocks, tables and images can use the full
+  // width without long lines.
+  const containerWidthClass =
+    {
+      cozy: 'max-w-5xl',
+      standard: 'max-w-7xl',
+      wide: 'max-w-[96rem]',
+    }[containerWidth] || 'max-w-7xl';
+
   const zenProseClass =
     {
       cozy: 'reader-zen-prose--cozy',
@@ -555,8 +564,11 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
                     </div>
 
                     <div>
-                      <div className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
-                        正文版宽
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+                          正文版宽
+                        </span>
+                        <span className="text-[10px] font-normal text-neutral-400">宽屏下生效</span>
                       </div>
                       <div className="grid grid-cols-3 gap-1 p-1 bg-neutral-100 dark:bg-neutral-800 rounded-lg text-center text-[11px]">
                         <button
@@ -680,7 +692,7 @@ export const ArticleReader: React.FC<ArticleReaderProps> = ({
       )}
 
       {/* Main Container */}
-      <div className={`mx-auto px-4 sm:px-6 pt-8 ${zenMode ? '' : 'max-w-7xl'}`}>
+      <div className={`mx-auto px-4 sm:px-6 pt-8 ${zenMode ? '' : containerWidthClass}`}>
         <div className={`grid grid-cols-1 ${zenMode ? 'grid-cols-1' : 'lg:grid-cols-12'} gap-8 lg:gap-12`}>
 
           {/* Main Article Content Column (Left, Span 8) */}

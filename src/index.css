@@ -314,6 +314,12 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
+/* Reader code blocks follow the reading font-size preference. `em` keeps code
+   slightly smaller than prose while still scaling with the chosen size. */
+.markdown-body--zoomable .code-block-container pre {
+  font-size: 0.875em;
+}
+
 .code-block-container pre {
   background-color: transparent !important;
   color: #1e293b !important;
@@ -374,6 +380,25 @@
   margin-top: 1.25rem;
   margin-bottom: 1.25rem;
   font-size: 0.875rem;
+}
+
+/* Reader typography follows the reading font-size preference. `em` matches the
+   previous rem sizes at the default 16px measure and scales proportionally when
+   the reader chooses 14/18/20px. */
+.markdown-body.markdown-body--zoomable h1 {
+  font-size: 2.2em;
+}
+
+.markdown-body.markdown-body--zoomable h2 {
+  font-size: 1.6em;
+}
+
+.markdown-body.markdown-body--zoomable h3 {
+  font-size: 1.25em;
+}
+
+.markdown-body.markdown-body--zoomable table {
+  font-size: 0.875em;
 }
 
 .markdown-body th, .markdown-body td {
